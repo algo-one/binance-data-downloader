@@ -1,9 +1,9 @@
 # Architecture
 
-> **Status:** design document. Stages 0 (scaffolding), 1 (domain types) and
-> 2 (time and availability) are complete; the packages described below arrive
-> stage by stage. Sections marked *planned* describe code that does not exist
-> yet.
+> **Status:** design document. Stages 0 (scaffolding), 1 (domain types),
+> 2 (time and availability) and 3 (parsing) are complete; the packages described
+> below arrive stage by stage. Sections marked *planned* describe code that does
+> not exist yet.
 
 ## What the library does
 
@@ -113,6 +113,89 @@ while doing nothing. One queue of uniform work units cannot have that problem.
 **Reduce** — chunks arrive already sorted; merge, deduplicate on `open_time`,
 and trim to the requested range.
 
+## Parsing
+
+`codec.go` is where the format Binance publishes meets the types this package
+defines. An archive is a ZIP holding one CSV member with twelve columns and, for
+spot, no header row. Reading that is easy; three things about it are not, and
+each was a bug in the implementation this replaces.
+
+**The header is sniffed, per file.** Spot archives carry none and futures
+archives do. The test examines two fields rather than one: a first field that is
+not an integer suggests a header, but it equally describes a data row with a
+corrupt timestamp, and dropping that as a "header" would lose a candle in
+silence. A genuine header has names in every column, so the price field settles
+it. A first row where nothing parses at all is read as a header — a file of
+column names is plausible, a row corrupt in twelve places is not.
+
+**The timestamp unit is detected per row.** Binance switched these files from
+milliseconds to microseconds at 2025-01-01T00:00Z, verified against the real
+archives for 2024-12-31 and 2025-01-01, which are the last and first days of
+each era and are committed as fixtures. The threshold is 1e14, and it cannot be
+approached from either side by real data: read as milliseconds that value is the
+year 5138, read as microseconds it is March 1973, and Binance began trading in
+2017. The ported implementation read the unit from a file's final row and
+applied it to every row.
+
+**Every candle is checked against the file it came from.** The decoder is told
+which interval and which period the archive claims to cover, and rejects a
+candle that falls outside the period, sits off the interval's grid, closes
+outside its own interval, or does not strictly follow the previous row. This is
+what makes a unit misdetection loud: microseconds read as milliseconds land in
+1970, which is not inside any archive period.
+
+The eight decimal fields are checked against the relationships that hold between
+them by definition — low is the lowest of the four prices, nothing is negative,
+and a taker-buy volume cannot exceed the total it is part of. These exist to
+catch the one corruption per-field parsing cannot: a column index off by one
+produces values that parse perfectly and are simply wrong. Each rule was
+verified against 132,506 real rows first, because a false positive here rejects
+a whole archive.
+
+The grid test is done in **microseconds**, not milliseconds. Since 2025 the
+files are written in microseconds, so a millisecond-granularity comparison is
+coarser than the data it validates and would wave through a timestamp off the
+grid by less than 1 ms.
+
+Decoding takes a `context.Context`, like everything else in this package that
+touches a file. A consumer ranging over the iterator can stop it with `break`,
+but the collecting form's loop belongs to the library, and a 1s month is several
+seconds of work a cancelled backtest should not wait for. The check runs every
+1024 rows, and a cancellation is reported as `context.Canceled` — never as
+`ErrCorruptArchive`, since nothing is wrong with the bytes.
+
+The check is deliberately one-directional. Every candle must be inside the
+period; the period need not be full of candles. `SHIBUSDT-1d-2021-05` holds 22
+rows for a 31-day month because the pair was listed on the 10th, and demanding
+completeness here would reject real data. Whether a *range* is covered is the
+planner's question, asked about chunks rather than rows.
+
+### Alignment grids
+
+Candle open times sit on a grid, and three intervals anchor theirs somewhere
+other than the Unix epoch:
+
+| Interval | Grid | How it is known |
+| --- | --- | --- |
+| `1s` … `1d` | Multiples of the interval from the epoch | They divide 24 h evenly and the epoch is midnight UTC |
+| `3d` | Three-day multiples from **1970-01-02** | Measured against live archives for 2018-01, 2021-06, 2024-03/04/05 and 2025-02. The grid does not restart monthly: March 2024's last candle opens on the 31st, April's first on the 3rd |
+| `1w` | Monday 00:00 UTC | The epoch was a Thursday, so "multiples of seven days" rejects every real weekly candle |
+| `1mo` | The 1st, 00:00 UTC | Calendar months are 28–31 days and have no fixed duration |
+
+### `CodecVersion`
+
+A compile-time constant, bumped in the same commit as any change to what the
+decoder produces from given bytes. The cache stamps it into every derived file;
+see `docs/caching.md` for why a checksum alone cannot detect a parser fix.
+
+### Cost
+
+Measured at 1.39 µs per row (Apple M1 Pro, Go 1.26.5, one allocation per row —
+the CSV record string), so a 44,640-row month of `1m` candles decodes in about
+62 ms. That lands inside the 60–70 ms figure `docs/caching.md` predicted before
+the code existed, and it is the number the two-tier cache exists to avoid
+paying on every backtest run.
+
 ## Package layout
 
 ```
@@ -126,7 +209,7 @@ and trim to the requested range.
 ├── errors.go         sentinel errors
 ├── request.go        Request, validation, per-call resolution of End
 ├── availability.go   bucket paths, archive names, the archive index
-├── codec.go          zip → csv → []Kline; CodecVersion lives here            (planned)
+├── codec.go          zip → csv → []Kline; CodecVersion lives here
 ├── cache.go          tier 1 (zip) + tier 2 (parquet) + memory                (planned)
 ├── restapi.go        data-api.binance.vision klines                          (planned)
 ├── options.go        functional options for NewLoader                        (planned)
@@ -137,7 +220,7 @@ and trim to the requested range.
 │   └── vision/       data.binance.vision downloader + S3 listing
 │
 ├── cmd/bmd/          the CLI binary
-├── testdata/         committed fixture archives                              (planned)
+├── testdata/         real archives, byte-untouched (see its README)
 └── docs/
 ```
 
@@ -289,8 +372,8 @@ because they are easy to get subtly wrong and silent when they are.
 | 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 ✅ |
 | 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns | 4 |
 | 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 7 |
-| 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 |
-| 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 |
+| 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 ✅ |
+| 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 ✅ |
 | 8 | One `http.Client` is shared for the process, so connections are reused rather than reopened per request | 4 |
 | 9 | Checksums are **verified**, not merely stored — at download time, and on demand via `bmd verify` | 5 |
 | 10 | Cache writes are atomic: temp file in the destination directory, then `rename`. A crash never leaves a torn file | 5 |
@@ -307,7 +390,7 @@ setting is a defect, not a stub.
 | 0 | Scaffolding and tooling — mise, go.mod, linting, CI, docs skeleton | **done** |
 | 1 | Domain types — `Interval`, `Market`, `DataType`, symbol normalisation, `Kline`, `errors.go` | **done** |
 | 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | **done** |
-| 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | |
+| 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | **done** |
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | |
 | 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | |
 | 6 | REST fetcher — pagination for the recent tail, rate limiting | |
@@ -336,9 +419,12 @@ and cross-compilation.
 - **Table-driven tests** throughout.
 - **`httptest.Server`** for every network path, so the suite runs offline and
   deterministically. No test touches Binance.
-- **Committed fixtures** in `testdata/`: one pre-2025 millisecond archive and one
-  post-2025 microsecond archive, so both parser paths are covered by spot alone.
-  Trimmed to a few hundred rows.
+- **Committed fixtures** in `testdata/`: five real archives, stored byte for byte
+  as Binance served them, with the `.CHECKSUM` sidecars they were published
+  with. They are deliberately *not* trimmed — re-zipping would invalidate those
+  checksums, and Stage 4 onward verifies against the genuine values. Rows no
+  real archive contains, such as a file that changes timestamp unit halfway
+  through, are synthesised in the test itself.
 - **`t.TempDir()`** for all cache tests.
 - **Golden files** for CLI output and for reproducible Parquet.
 - **`-race`** on every run.

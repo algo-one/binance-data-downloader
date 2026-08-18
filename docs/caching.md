@@ -1,6 +1,7 @@
 # Caching
 
-> **Status:** design document. The cache lands in Stage 5.
+> **Status:** design document. The cache lands in Stage 5. `CodecVersion`, the
+> constant this design leans on, exists as of Stage 3 and lives in `codec.go`.
 
 ## The problem
 
@@ -17,6 +18,11 @@ range is read on every run. Measured on a real `BTCUSDT-1m-2024-01.zip`
 A realistic Go implementation lands around **60–70 ms per symbol-month**. That
 is ~4 s per symbol for five years of one-minute data, or **~40 s of startup for
 ten symbols — on every single backtest run.**
+
+**Measured, now that the decoder exists (Stage 3):** 1.39 µs per row on the same
+machine, so a 44,640-row month decodes in **~62 ms**. The estimate above was made
+before the code was written and the code landed inside it, so the rest of this
+document rests on a measurement rather than a projection.
 
 Downloading is not the problem; re-parsing is.
 
@@ -70,7 +76,7 @@ are recorded in the Parquet footer at build time
 ```
 bmd.source.sha256  = <SHA-256 of the source ZIP, i.e. Binance's own checksum>
 bmd.source.file    = BTCUSDT-1h-2024-01.zip
-bmd.codec.version  = 3
+bmd.codec.version  = 1
 bmd.rows           = 44640
 ```
 
