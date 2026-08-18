@@ -1,8 +1,8 @@
 # Architecture
 
-> **Status:** design document. Stage 0 (scaffolding) is complete; the packages
-> described below arrive stage by stage. Sections marked *planned* describe code
-> that does not exist yet.
+> **Status:** design document. Stages 0 (scaffolding) and 1 (domain types) are
+> complete; the packages described below arrive stage by stage. Sections marked
+> *planned* describe code that does not exist yet.
 
 ## What the library does
 
@@ -43,6 +43,16 @@ calendar heuristic ("is it past the first Tuesday of the month?"), but Binance
 is not contractually bound to any such schedule, and a heuristic that is wrong
 for one month drops days without saying so. Asking the bucket what it actually
 contains removes the guess entirely.
+
+Two findings from probing it directly on 2026-08-18 show why no heuristic would
+have worked:
+
+- **The archives have holes.** `BTCUSDT-1mo-2024-03.zip` does not exist, while
+  `2024-02` and `2024-04` both do. No date arithmetic predicts a missing month
+  in the middle of a published range; only the listing reveals it.
+- **The interval availability tables in the Python source are wrong.** They
+  declare `1s` daily-only. Binance publishes `1s` monthly archives too —
+  `BTCUSDT-1s-2024-03.zip` is 93 MB of real data. See `interval.go`.
 
 ## The pipeline
 
@@ -101,13 +111,16 @@ under `internal/`, which the Go compiler forbids any other module from
 importing. That is a real, enforced API boundary — the internals can be
 restructured freely between stages without breaking a single consumer.
 
-## Public API (planned)
+## Public API
+
+The domain types below exist as of Stage 1. `Request`, `Loader` and the options
+are still *planned*.
 
 ```go
 type Request struct {
     Symbol   string    // "BTC/USDT", "BTC-USDT" or "BTCUSDT" — all normalised
     Interval Interval
-    Market   Market    // MarketSpot is the only implemented value today
+    Market   Market    // required; MarketSpot is the only implemented value
     Start    time.Time // must be UTC
     End      time.Time // must be UTC; defaults to now at call time
 }
@@ -124,8 +137,10 @@ only reason to split those phases is to deduplicate work across requests, and
 `singleflight` provides that for free — so the API keeps the capability without
 the stateful step.
 
-`Stream` exists because five years of one-minute candles is roughly 670 MB held
-at once. A backtest can consume candles without materialising the range.
+`Stream` exists because a `Kline` measures 312 bytes (measured in Stage 1: two
+24-byte `time.Time`, eight 32-byte `udecimal.Decimal`, one `int64`, no padding),
+so five years of one-minute candles is roughly 820 MB held at once. A backtest
+can consume candles without materialising the range.
 
 ## Scope
 
@@ -145,6 +160,8 @@ Other data types — aggTrades, trades, bookTicker, fundingRate — are out of
 scope. Each has a distinct CSV schema and belongs in its own later stage.
 
 ## Error model
+
+Live as of Stage 1, in `errors.go`.
 
 ```go
 var (
@@ -190,7 +207,7 @@ setting is a defect, not a stub.
 | # | Stage | Status |
 | --- | --- | --- |
 | 0 | Scaffolding and tooling — mise, go.mod, linting, CI, docs skeleton | **done** |
-| 1 | Domain types — `Interval`, `Market`, `DataType`, symbol normalisation, `Kline`, `errors.go` | |
+| 1 | Domain types — `Interval`, `Market`, `DataType`, symbol normalisation, `Kline`, `errors.go` | **done** |
 | 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | |
 | 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | |
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | |

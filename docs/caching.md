@@ -55,7 +55,7 @@ Every decimal column is written as a **fixed `decimal128(38, 8)`** — one schem
 for every market and every symbol.
 
 The measured worst case across BTC, PEPE, SHIB, BONK, FLOKI, DOGE and both
-futures markets is 19 significant digits and 8 decimal places, so 38 digits of
+futures markets is 20 significant digits and 8 decimal places, so 38 digits of
 precision leaves large headroom. Fixing the schema matters: an inferred
 per-file precision lets two cached files disagree about the same column, and
 every reader then has to reconcile them.

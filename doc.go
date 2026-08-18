@@ -36,9 +36,9 @@
 // # A note on numbers
 //
 // Prices and volumes are [github.com/quagmt/udecimal.Decimal], not float64.
-// Binance quote volumes reach 19 significant digits, which float64 (15.95
+// Binance quote volumes reach 20 significant digits, which float64 (15.95
 // digits) cannot represent exactly, and no int64 fixed-point scale covers the
-// range either — real PEPE daily volume overflows int64 at 1e8 scaling. The
+// range either — real meme-coin volumes overflow int64 at 1e8 scaling. The
 // archives are text, the values in them are exact, and this package preserves
 // them digit for digit.
 //
@@ -49,6 +49,7 @@
 //
 // The docs directory carries the longer-form material: architecture.md for how
 // the pieces fit together, caching.md for the cache design and its invariants,
+// numbers.md for why prices are decimals and what the alternatives measured,
 // cli.md for the bmd tool, and go-notes.md, which explains the Go idioms this
 // codebase leans on.
 package binancedata

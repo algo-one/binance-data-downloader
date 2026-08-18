@@ -233,16 +233,28 @@ type Request struct {
 klines, err := loader.Fetch(ctx, Request{
     Symbol:   "BTC/USDT",
     Interval: Interval1h,
+    Market:   MarketSpot,
     Start:    start,
     End:      end,
 })
 ```
 
-Fields you omit take their zero value, which recovers most of what defaults
-would give you; field names at the call site recover the rest. A zero
-`time.Time` for `End` is checked for inside the function and replaced with the
-current time **per call** — a default resolved at construction time would go
-stale in a long-running process.
+Fields you omit take their zero value, and deciding what that zero value means
+is part of designing the struct. This codebase splits it deliberately:
+
+- `Symbol`, `Interval` and `Market` have **no** usable zero value. Every enum in
+  the package starts at `iota + 1`, so an unset field is invalid and the
+  constructor rejects it. `Market` is the interesting one: spot is the only
+  market today, so a default could only ever have meant spot — but once futures
+  exists, every request written earlier would silently keep meaning spot, and
+  the compiler's one chance to ask "which market?" is gone. Defaults are easy to
+  add later and impossible to take back.
+- `End` **does** have one. A zero `time.Time` is checked for inside the function
+  and replaced with the current time **per call** — a default resolved at
+  construction time would go stale in a long-running process.
+
+The difference is whether the library can honestly guess. It can guess "now"; it
+cannot guess which market you meant.
 
 ### Functional options
 
@@ -406,7 +418,8 @@ for kline, err := range loader.Stream(ctx, req) {
 ```
 
 `Stream` returns an `iter.Seq2[Kline, error]`. It matters here for a concrete
-reason: five years of one-minute candles is roughly 670 MB held at once, and a
+reason: a `Kline` measures 312 bytes, so five years of one-minute candles is
+roughly 820 MB held at once, and a
 backtest usually wants to consume them one at a time rather than materialise the
 whole range.
 

@@ -24,3 +24,18 @@ module github.com/algo-one/binance-data-downloader
 // even when a newer toolchain is doing the compiling. That is the point — it
 // stops us accidentally breaking the promise.
 go 1.24
+
+// The one third-party dependency so far. `go mod tidy` writes this block from
+// the imports in the source, so it is a report rather than a wish list — the
+// way to add a dependency is to import it and re-run tidy.
+//
+// udecimal carries the prices and volumes in binancedata.Kline. Binance quote
+// volumes reach 20 significant digits, which float64 cannot hold and no int64
+// fixed-point scale covers; udecimal keeps a 128-bit coefficient inline in the
+// value, so it is exact without allocating. See kline.go for the measurements
+// and docs/numbers.md for the comparison against the alternatives.
+//
+// Dependencies are a liability for a published library — every one of them
+// becomes a constraint on everybody who imports us — so this list is meant to
+// stay short. Everything else here is the standard library.
+require github.com/quagmt/udecimal v1.10.1
