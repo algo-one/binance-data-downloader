@@ -1,8 +1,9 @@
 # Architecture
 
-> **Status:** design document. Stages 0 (scaffolding) and 1 (domain types) are
-> complete; the packages described below arrive stage by stage. Sections marked
-> *planned* describe code that does not exist yet.
+> **Status:** design document. Stages 0 (scaffolding), 1 (domain types) and
+> 2 (time and availability) are complete; the packages described below arrive
+> stage by stage. Sections marked *planned* describe code that does not exist
+> yet.
 
 ## What the library does
 
@@ -44,8 +45,7 @@ is not contractually bound to any such schedule, and a heuristic that is wrong
 for one month drops days without saying so. Asking the bucket what it actually
 contains removes the guess entirely.
 
-Two findings from probing it directly on 2026-08-18 show why no heuristic would
-have worked:
+Findings from probing it directly on 2026-08-18, all of which shape the code:
 
 - **The archives have holes.** `BTCUSDT-1mo-2024-03.zip` does not exist, while
   `2024-02` and `2024-04` both do. No date arithmetic predicts a missing month
@@ -53,6 +53,32 @@ have worked:
 - **The interval availability tables in the Python source are wrong.** They
   declare `1s` daily-only. Binance publishes `1s` monthly archives too —
   `BTCUSDT-1s-2024-03.zip` is 93 MB of real data. See `interval.go`.
+- **The S3 hostname is unavoidable.** Sending the listing query to
+  `data.binance.vision` returns the HTML file-browser page — a static page that
+  calls this same S3 API from JavaScript — with HTTP 200 and content-type
+  `text/html`. Only the regional S3 endpoint answers with XML. Listing therefore
+  depends on the provider, the region and the bucket name, none of which Binance
+  promises to keep; see "Listing is an optimisation" below.
+- **An unknown symbol is not a 404.** A prefix matching nothing answers HTTP 200
+  with a well-formed, empty `ListBucketResult`. "This symbol never existed",
+  "this interval has no archives yet" and "the prefix is misspelt" are one
+  indistinguishable answer, and it looks exactly like success.
+- **Listings paginate sooner than they look.** S3 caps a response at 1000 keys,
+  and every `.zip` has a `.zip.CHECKSUM` beside it, so one page holds 500 days.
+  BTCUSDT's daily history runs to seven pages. Passing a `marker` seeks straight
+  into the range — keys sort lexicographically and the dates in them are ISO, so
+  lexicographic order is chronological order — which makes the cost proportional
+  to the range requested rather than to how long the symbol has traded.
+
+### Listing is an optimisation, never the source of truth
+
+Because the listing endpoint bakes in three facts about AWS that Binance could
+change without notice, no correctness property may rest on it. The rule the code
+enforces: a **failed** listing is never read as an **empty** one. `List` returns
+`(objects, nil)` when the bucket answered — possibly with nothing — and
+`(nil, err)` when it did not, and the planner refuses to emit a plan on error.
+Conflating the two is precisely how the ported implementation returned ranges
+with days missing and no error to show for it.
 
 ## The pipeline
 
@@ -62,10 +88,18 @@ Request ──► PLAN ──────► []chunk ──► EXECUTE ───
             no I/O                   + singleflight               filter)
 ```
 
-**Plan** *(planned: `internal/plan`)* — pure functions, no I/O. Expands a
-`Request` into chunks, each one of `monthlyArchive`, `dailyArchive` or
-`restRange`. All calendar logic lives here, so it is unit-testable against a
-frozen clock with no network at all.
+**Plan** (`internal/plan`) — pure functions, no I/O. `Expand` turns a resolved
+`Request` into chunks, each one of `KindMonthlyArchive`, `KindDailyArchive` or
+`KindRESTRange`; `Substitute` is the pure rule for what to try when an archive
+turns out to be missing (month → days → REST). All calendar logic lives here,
+and the package imports only `errors`, `fmt` and `time` — so it is *incapable*
+of I/O, not merely expected to avoid it.
+
+The chunks are sorted, contiguous and cover the whole requested range, and
+`Expand` verifies that itself on every call rather than trusting the arithmetic.
+The check is one pass over a handful of chunks, and it converts the only failure
+mode nobody would notice — a missing day in the middle of a range, returned with
+no error — into a loud one.
 
 **Execute** — one bounded worker pool (`errgroup.SetLimit`) over a flat list of
 chunks. `singleflight` collapses duplicate chunks across overlapping requests.
@@ -85,20 +119,22 @@ and trim to the requested range.
 .
 ├── doc.go            package documentation (the pkg.go.dev landing page)
 ├── version.go        module version, read from the embedded build info
-├── interval.go       Interval + which intervals exist at which aggregation   (planned)
-├── market.go         Market, DataType                                        (planned)
-├── symbol.go         symbol normalisation across three formats               (planned)
-├── kline.go          the Kline struct and column helpers                     (planned)
-├── errors.go         sentinel errors                                         (planned)
+├── interval.go       Interval + which intervals exist at which aggregation
+├── market.go         Market, DataType
+├── symbol.go         symbol normalisation across three formats
+├── kline.go          the Kline struct and column helpers
+├── errors.go         sentinel errors
+├── request.go        Request, validation, per-call resolution of End
+├── availability.go   bucket paths, archive names, the archive index
+├── codec.go          zip → csv → []Kline; CodecVersion lives here            (planned)
+├── cache.go          tier 1 (zip) + tier 2 (parquet) + memory                (planned)
+├── restapi.go        data-api.binance.vision klines                          (planned)
 ├── options.go        functional options for NewLoader                        (planned)
 ├── loader.go         Fetch / FetchAll / Stream                               (planned)
 │
 ├── internal/
-│   ├── plan/         request → []chunk (pure, no I/O)                        (planned)
-│   ├── vision/       data.binance.vision downloader + S3 listing             (planned)
-│   ├── restapi/      data-api.binance.vision klines                          (planned)
-│   ├── codec/        zip → csv → []Kline; CodecVersion lives here            (planned)
-│   └── cache/        tier 1 (zip) + tier 2 (parquet) + memory                (planned)
+│   ├── plan/         range → []Chunk (pure; imports only errors, fmt, time)
+│   └── vision/       data.binance.vision downloader + S3 listing
 │
 ├── cmd/bmd/          the CLI binary
 ├── testdata/         committed fixture archives                              (planned)
@@ -106,24 +142,74 @@ and trim to the requested range.
 ```
 
 The public API sits in the **root package**, so consumers write
-`binancedata.NewLoader(...)` with no sub-package imports. Everything else lives
-under `internal/`, which the Go compiler forbids any other module from
-importing. That is a real, enforced API boundary — the internals can be
-restructured freely between stages without breaking a single consumer.
+`binancedata.NewLoader(...)` with no sub-package imports.
+
+### Why `codec`, `cache` and `restapi` are not under `internal/`
+
+The layout originally drawn for this project put all five of those directories
+under `internal/`. It cannot compile. Go forbids import cycles at package
+granularity, and the split as drawn requires one:
+
+```
+root ──────► internal/plan        loader.go must call the planner
+  ▲                │
+  └────────────────┘              the planner needs binancedata.Interval
+```
+
+Three ways out were weighed, and the cost of each was measured rather than
+argued:
+
+1. **Move the domain types to `internal/core` and re-export them from the root
+   as type aliases.** The textbook fix, and the one this project rejected. A
+   `type Kline = core.Kline` renders on pkg.go.dev as exactly that one line:
+   no fields, no methods, no `Equal`, because the documentation tool will not
+   describe an internal package. Confirmed with `go doc` on a scratch module.
+   Documentation is a deliverable here, so losing every public type's body is
+   not a trade worth making.
+2. **Have internal packages exchange their own row types.** `internal/codec`
+   returning `[]codec.Row` means copying every candle at the package boundary —
+   millions of struct copies per request, to buy nothing.
+3. **Split on whether a package needs domain types at all.** Adopted.
+
+The rule is one question asked per package: *can this package do its job using
+only standard-library types?*
+
+| Package | Needs `Kline` / `Interval`? | Where it lives |
+| --- | --- | --- |
+| `plan` | No — [`plan.Spec`](../internal/plan/plan.go) carries two booleans instead | `internal/plan` |
+| `vision` | No — URL strings in, keys and bytes out | `internal/vision` |
+| `codec` | Yes; its entire output is `[]Kline` | root, unexported |
+| `cache` | Yes; it stores `[]Kline` | root, unexported |
+| `restapi` | Yes; it returns `[]Kline` | root, unexported |
+
+Unexported identifiers in the root package hide just as thoroughly from
+consumers as `internal/` does, so the public API is identical either way. What
+the split buys is narrower and worth naming precisely: **`internal/plan` imports
+only `errors`, `fmt` and `time`, so it cannot perform I/O.** The claim "all
+calendar logic is pure and testable with no network" stops being a convention
+maintained by code review and becomes something the compiler refuses to let
+anyone break.
+
+What it costs is that the rule is invisible from a directory listing — hence
+this section — and that `plan.Spec` duplicates two facts that `Interval` already
+knows. The decision is also cheap to reverse: collapsing `internal/plan` into
+the root is a mechanical rename, not a redesign.
 
 ## Public API
 
-The domain types below exist as of Stage 1. `Request`, `Loader` and the options
-are still *planned*.
+The domain types exist as of Stage 1 and `Request` as of Stage 2. `Loader` and
+the options are still *planned*.
 
 ```go
 type Request struct {
     Symbol   string    // "BTC/USDT", "BTC-USDT" or "BTCUSDT" — all normalised
     Interval Interval
     Market   Market    // required; MarketSpot is the only implemented value
-    Start    time.Time // must be UTC
-    End      time.Time // must be UTC; defaults to now at call time
+    Start    time.Time // inclusive; must be UTC
+    End      time.Time // exclusive; must be UTC; zero means "now, at call time"
 }
+
+func (r Request) Validate() error
 
 func NewLoader(opts ...Option) (*Loader, error)
 
@@ -131,6 +217,18 @@ func (l *Loader) Fetch(ctx context.Context, req Request) ([]Kline, error)
 func (l *Loader) FetchAll(ctx context.Context, reqs []Request) (map[Request][]Kline, error)
 func (l *Loader) Stream(ctx context.Context, req Request) iter.Seq2[Kline, error]
 ```
+
+**Ranges are half-open**: `Start` is included, `End` is excluded, so a full year
+of 2024 is `Start` 2024-01-01 and `End` 2025-01-01. This is what lets the pieces
+a range is cut into rejoin without arithmetic — `[Jan, Feb) + [Feb, Mar)` is
+`[Jan, Mar)`, with each boundary written exactly once. Inclusive ends need a
+"+1 of something" at every seam, and the something changes at the 2025
+millisecond→microsecond switch; every one of those is a chance to drop or
+duplicate a candle, silently.
+
+A zero `End` means "now, resolved when the request is executed". Prefer it to
+writing `time.Now()`: a stored end date is a snapshot that ages, and the whole
+point of the zero value is that there is nothing stored to go stale.
 
 `FetchAll` is one call rather than a two-phase register-then-start API. The
 only reason to split those phases is to deduplicate work across requests, and
@@ -186,9 +284,9 @@ because they are easy to get subtly wrong and silent when they are.
 
 | # | Requirement | Stage |
 | --- | --- | --- |
-| 1 | The end of a request range is resolved **per call**, never captured once at construction — a long-running process must not drift onto a stale end date | 2 |
-| 2 | Month-boundary comparisons anchor on the 1st of the month. A range such as `2024-12-20` → `2025-01-03` must not be misclassified as "current month", which **silently drops the last days** | 2 |
-| 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 |
+| 1 | The end of a request range is resolved **per call**, never captured once at construction — a long-running process must not drift onto a stale end date | 2 ✅ |
+| 2 | Month-boundary comparisons anchor on the 1st of the month. A range such as `2024-12-20` → `2025-01-03` must not be misclassified as "current month", which **silently drops the last days** | 2 ✅ |
+| 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 ✅ |
 | 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns | 4 |
 | 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 7 |
 | 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 |
@@ -208,7 +306,7 @@ setting is a defect, not a stub.
 | --- | --- | --- |
 | 0 | Scaffolding and tooling — mise, go.mod, linting, CI, docs skeleton | **done** |
 | 1 | Domain types — `Interval`, `Market`, `DataType`, symbol normalisation, `Kline`, `errors.go` | **done** |
-| 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | |
+| 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | **done** |
 | 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | |
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | |
 | 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | |
