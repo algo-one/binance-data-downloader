@@ -1,0 +1,101 @@
+# mise.toml — the single entry point for this project's tooling.
+#
+# mise does three jobs here, which would otherwise be split across a version
+# manager, direnv and make/just:
+#
+#   [tools] — which versions of which binaries this project needs
+#   [env]   — environment variables and PATH entries applied inside the project
+#   [tasks] — named commands, run with `mise run <name>`
+#
+# Run `mise install` once to fetch the tools, then `mise tasks` to list what
+# you can run.
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+# Versions are pinned exactly rather than set to "latest". A floating version
+# means a lint rule can appear overnight and turn a green CI red without anyone
+# changing a line of code. Upgrades should be a deliberate commit you can
+# revert, so bump these by hand.
+#
+# Note the difference between the Go version here and the one in go.mod:
+# this is the compiler we *develop* with; go.mod declares the oldest compiler
+# a consumer may *build* with.
+[tools]
+go = "1.26.5"
+# golangci-lint runs many linters in one pass, with caching. Also does
+# formatting in v2 via `golangci-lint fmt`.
+golangci-lint = "2.12.2"
+# gotestsum wraps `go test` with readable, grouped output. Purely cosmetic —
+# plain `go test ./...` works identically.
+gotestsum = "1.13.0"
+# govulncheck cross-references our dependency graph against the Go vulnerability
+# database. Unlike a generic scanner it uses static analysis to check whether we
+# actually *call* the vulnerable function, so it reports far fewer false alarms.
+# The "go:" backend means mise builds it from source with the Go toolchain above.
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.6.0"
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+[env]
+# Put the project's own ./bin on PATH while you are inside this directory, so
+# that after `mise run build` you can just type `bmd` instead of `./bin/bmd`.
+_.path = ["./bin"]
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+# Each [tasks.x] block becomes `mise run x`. Keep every routine command here
+# rather than in your shell history — it is the project's executable
+# documentation, and CI runs exactly the same tasks you do.
+
+[tasks.build]
+description = "Compile the bmd CLI into ./bin"
+run = "go build -o bin/bmd ./cmd/bmd"
+
+[tasks.test]
+description = "Run all tests with the race detector"
+# -race enables the race detector, which instruments memory access and reports
+#   two goroutines touching the same variable without synchronisation. This
+#   library is concurrent by design, so it is not optional. It makes tests
+#   roughly 2-10x slower, which is a fine trade at this size.
+# -count=1 is Go's documented way to bypass the test result cache. Without it,
+#   an unchanged package reports a cached PASS and never actually runs.
+run = "gotestsum --format testname -- -race -count=1 ./..."
+
+[tasks.cover]
+description = "Run tests and open an HTML coverage report in the browser"
+# -covermode=atomic is required when combining coverage with -race.
+run = [
+  "go test -covermode=atomic -coverprofile=cover.out ./...",
+  "go tool cover -html=cover.out",
+]
+
+[tasks.lint]
+description = "Run golangci-lint over the whole module"
+run = "golangci-lint run"
+
+[tasks.fmt]
+description = "Format all Go code in place"
+# gofmt is not configurable. That is a feature: no project ever argues about
+# brace placement, and every Go codebase you read looks like this one.
+run = "golangci-lint fmt"
+
+[tasks."fmt:check"]
+description = "Fail if any file is unformatted (CI uses this instead of fmt)"
+run = "golangci-lint fmt --diff"
+
+[tasks.tidy]
+description = "Sync go.mod and go.sum with the imports actually used in the code"
+run = "go mod tidy"
+
+[tasks.audit]
+description = "Check dependencies against the Go vulnerability database"
+run = "govulncheck ./..."
+
+[tasks.ci]
+description = "Everything CI runs, in the same order"
+# `depends` runs other tasks first. Listing them here means CI and your laptop
+# can never drift apart: both run `mise run ci`.
+depends = ["fmt:check", "lint", "test", "build"]

@@ -1,0 +1,80 @@
+# Continuous integration.
+#
+# The guiding rule here is that CI must not know anything the repository does
+# not. Every job below delegates to a mise task, so `mise run ci` on your laptop
+# and CI on a pull request execute byte-identical commands with byte-identical
+# tool versions. When CI fails, you can reproduce it locally in one line.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Grant the workflow no more than it needs. GitHub's default token is broader.
+permissions:
+  contents: read
+
+# Cancel an in-progress run when a newer commit is pushed to the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Format check, lint, race-enabled tests and build — on both operating
+  # systems this library is expected to run on. The matrix matters more than it
+  # looks: the cache layer touches paths and file permissions, which is exactly
+  # where platforms diverge.
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      # Installs the exact tool versions pinned in mise.toml and puts them on
+      # PATH. It caches them automatically, and sets MISE_TRUSTED_CONFIG_PATHS
+      # so the config is trusted without a prompt.
+      - uses: jdx/mise-action@v4
+
+      - run: mise run ci
+
+  # go.mod promises this module builds on Go 1.24, while we develop on 1.26.
+  # A promise nobody tests is a promise that quietly breaks, so this job builds
+  # and tests with the oldest supported toolchain.
+  oldest-go:
+    name: build with the minimum supported Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      # GOTOOLCHAIN=local stops Go from silently downloading a newer toolchain
+      # when it thinks it needs one — which would defeat the entire purpose of
+      # this job.
+      - run: go build ./...
+        env:
+          GOTOOLCHAIN: local
+
+      - run: go test ./...
+        env:
+          GOTOOLCHAIN: local
+
+  # Cross-references the dependency graph against the Go vulnerability database.
+  # Kept as its own job because a newly published advisory can turn this red
+  # without any code change, and that should not block an unrelated pull
+  # request's test signal.
+  audit:
+    name: vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise run audit

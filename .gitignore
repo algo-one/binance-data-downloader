@@ -1,0 +1,24 @@
+# Compiled output. `mise run build` writes here; nothing in it belongs in git.
+/bin/
+
+# Test and coverage artefacts.
+cover.out
+coverage.html
+*.test
+*.out
+
+# Go workspace files are per-developer, never shared.
+go.work
+go.work.sum
+
+# mise's per-developer overrides. mise.toml is committed; these are not.
+mise.local.toml
+.mise.local.toml
+
+# Downloaded market data. Cache directories can reach many gigabytes, and
+# every byte is reproducible from Binance.
+/data/
+/.cache/
+
+# macOS.
+.DS_Store

@@ -1,0 +1,108 @@
+# .golangci.yml — configuration for golangci-lint, which runs many independent
+# Go linters in one cached, parallel pass. Each linter below is a separate
+# upstream project; golangci-lint is the runner that schedules and caches them.
+#
+# Run it with `mise run lint`. Verify this file itself with
+# `golangci-lint config verify`.
+
+# Schema version. golangci-lint v2 restructured its config (formatters moved
+# out of `linters`), and this key is how it knows which layout to expect.
+version: "2"
+
+linters:
+  # `standard` is golangci-lint's default set: errcheck, govet, ineffassign,
+  # staticcheck and unused. Everything below is added on top of that.
+  default: standard
+
+  enable:
+    # --- correctness -------------------------------------------------------
+    # Catches HTTP response bodies that are never closed. Every unclosed body
+    # leaks a connection from the pool; in a downloader that eventually stalls
+    # the whole program. This is the single most valuable linter for us.
+    - bodyclose
+    # Flags HTTP requests built without a context.Context. Our entire API takes
+    # a ctx so that a cancelled backtest actually stops downloading.
+    - noctx
+    # Enforces errors.Is / errors.As instead of == and type assertions when
+    # comparing errors. Our error model (errors.go) is built on wrapped
+    # sentinels, and `err == ErrNotAvailable` silently fails once an error is
+    # wrapped — this linter is what keeps that model honest.
+    - errorlint
+    # Requires sentinel error variables to be named ErrFoo and error types
+    # FooError. Naming conventions the compiler cannot check.
+    - errname
+    # Requires every case of an enum-like type to be handled in a switch.
+    # We have several closed sets (Market, Interval, chunk kind); adding a new
+    # market should produce compile-time-ish errors at every switch that
+    # forgot it, rather than a silent fallthrough.
+    - exhaustive
+
+    # --- clarity -----------------------------------------------------------
+    # A large grab-bag of style and performance suggestions. Well curated.
+    - gocritic
+    # Style rules in the spirit of the (retired) golint, including the rule
+    # that every exported symbol carries a doc comment — see settings below.
+    - revive
+    # Unnecessary type conversions, e.g. int64(x) where x is already int64.
+    - unconvert
+    # Function parameters and results that are always the same value or never
+    # used. Good at finding leftovers from a refactor.
+    - unparam
+    # Misspellings in comments and strings. Documentation is a deliverable
+    # here, so typos are worth catching mechanically.
+    - misspell
+    # Modern testing idioms: t.Setenv over os.Setenv, t.TempDir over manual
+    # cleanup, t.Context over context.Background in tests.
+    - usetesting
+
+    # --- security ----------------------------------------------------------
+    # Common security mistakes. See the exclusions below for the two rules
+    # that a downloader inherently trips.
+    - gosec
+
+  settings:
+    revive:
+      rules:
+        # Require a doc comment on every exported identifier, in Go's standard
+        # form ("Foo does ..."). Thorough documentation is an explicit goal of
+        # this project, so we let a machine enforce the floor.
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+            - disableStutteringCheck # binancedata.Kline is fine; not stuttering
+
+    gosec:
+      excludes:
+        # G107: "url provided to HTTP request as taint input". Fetching from a
+        # computed URL is the entire purpose of this library. Safety comes from
+        # building URLs only from a fixed host plus validated symbol/interval
+        # values, never from raw user strings.
+        - G107
+        # G304: "file inclusion via variable". Same story for the cache: paths
+        # are constructed from a configured base directory plus validated
+        # components, never from unsanitised input.
+        - G304
+
+  exclusions:
+    rules:
+      # Test files get more latitude: table-driven tests are legitimately long,
+      # and repeated literals in fixtures are clearer than named constants.
+      - path: '(.+)_test\.go'
+        linters:
+          - gosec
+          - unparam
+
+# In v2, formatters are configured separately from linters and are applied by
+# `golangci-lint fmt` (mise run fmt).
+formatters:
+  enable:
+    # The canonical Go formatter. Not configurable, by design.
+    - gofmt
+    # Adds and removes imports, and sorts them into groups.
+    - goimports
+  settings:
+    goimports:
+      # Sort our own packages into a third group, after stdlib and after
+      # third-party. Makes it obvious at a glance what is ours.
+      local-prefixes:
+        - github.com/algo-one/binance-data-downloader
