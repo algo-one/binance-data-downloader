@@ -126,3 +126,34 @@ func NormalizeSymbol(s string) (string, error) {
 
 	return normalized, nil
 }
+
+// checkNormalizedSymbol reports whether s is already exactly what
+// [NormalizeSymbol] would produce, and is what the path builders assert rather
+// than normalising for themselves.
+//
+// The distinction between checking and normalising is the whole point. A
+// function that quietly normalised would accept "BTC/USDT" here and "BTCUSDT"
+// there, and the two spellings would go on to produce two cache entries for one
+// pair — the exact outcome [NormalizeSymbol]'s own doc comment says normalising
+// early exists to prevent. Normalising happens once, at the edge, in
+// [Request.resolve]; everything downstream states that it has already happened
+// and fails loudly if it has not.
+//
+// The check earns its place because the failure it catches is silent. path.Join
+// drops empty segments and cleans away "..", so an unchecked symbol does not
+// produce a malformed key — it produces a well-formed key naming a *different*
+// object, which 404s and is then reported as "Binance has not published this",
+// a claim about the calendar standing in for a bug in the caller.
+func checkNormalizedSymbol(s string) error {
+	normalized, err := NormalizeSymbol(s)
+	if err != nil {
+		return err // already wraps ErrInvalidRequest and names the symbol
+	}
+
+	if normalized != s {
+		return fmt.Errorf(
+			"symbol %q is not normalised (want %q): %w", s, normalized, ErrInvalidRequest)
+	}
+
+	return nil
+}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -54,7 +55,10 @@ func newTestLister(t *testing.T, handler http.HandlerFunc) *Lister {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	return NewLister(srv.URL, srv.Client())
+	// testPolicy (retry_test.go) retries exactly as production does but with a
+	// timer that fires immediately, so a test covering four attempts costs no
+	// wall-clock time.
+	return NewLister(srv.URL, srv.Client(), testPolicy())
 }
 
 func TestListSinglePage(t *testing.T) {
@@ -429,13 +433,199 @@ func TestListHonoursContextCancellation(t *testing.T) {
 func TestNewListerDefaults(t *testing.T) {
 	t.Parallel()
 
-	lister := NewLister("", nil)
+	lister := NewLister("", nil, Policy{})
 
 	if lister.baseURL != DefaultBaseURL {
 		t.Errorf("baseURL = %q, want %q", lister.baseURL, DefaultBaseURL)
 	}
 
-	if lister.client != http.DefaultClient {
-		t.Error("client should default to http.DefaultClient")
+	if lister.client == http.DefaultClient {
+		t.Fatal("client defaulted to http.DefaultClient, whose MaxIdleConnsPerHost is 2 — that is bug 8")
+	}
+
+	if lister.client != defaultClient() {
+		t.Error("client should default to the process-wide client from NewHTTPClient")
+	}
+
+	// One client, not one per constructor. Several correct-looking clients each
+	// holding their own connection pool is the same fragmentation as none at
+	// all, in a form that passes every test asserting on transport settings.
+	if NewDownloader("", nil, Policy{}).client != lister.client {
+		t.Error("Lister and Downloader defaulted to different clients; the pool is per-client")
+	}
+}
+
+// TestListRejectsAnythingThatIsNotAListing is the regression test for the
+// quietest failure this package can have.
+//
+// A struct without an XMLName field accepts *any* well-formed XML: encoding/xml
+// matches child elements by name and ignores the root entirely, so a document
+// with none of the expected children unmarshals successfully into a zero value.
+// A zero listBucketResult is a listing that is not truncated and holds no keys
+// — which is to say, "Binance has published no archives here", returned with a
+// nil error and an HTTP 200 to vouch for it.
+//
+// That is exactly the "a failed listing read as an empty one" conflation the
+// package comment forbids, and it is how the ported implementation returned
+// ranges with days missing and nothing to show for it. One struct field turns
+// every case below into a parse error, which is the honest answer: we do not
+// know what is there.
+func TestListRejectsAnythingThatIsNotAListing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			// A proxy or captive portal answering 200 with a login page.
+			name: "an HTML page served as XML",
+			body: `<html><head><title>Sign in</title></head><body>Please log in</body></html>`,
+		},
+		{
+			// An S3 error document that arrived with the wrong status.
+			name: "an error document with a 200",
+			body: `<?xml version="1.0"?><Error><Code>NoSuchBucket</Code></Error>`,
+		},
+		{
+			// The shape that makes this dangerous: every child element the
+			// decoder wants, under a root that is not a listing. Without the
+			// XMLName check this parses into a perfectly plausible listing.
+			name: "the right children under the wrong root",
+			body: `<?xml version="1.0"?><SomethingElse><IsTruncated>false</IsTruncated>` +
+				`<Contents><Key>data/spot/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2024-01.zip</Key>` +
+				`<Size>1</Size></Contents></SomethingElse>`,
+		},
+		{
+			name: "an empty document",
+			body: `<?xml version="1.0"?><nothing/>`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lister := newTestLister(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(tt.body))
+			})
+
+			objects, err := lister.List(t.Context(), "data/spot/monthly/klines/BTCUSDT/1h/", "")
+			if err == nil {
+				t.Fatalf("got %d objects and no error; a body that is not a listing must not read as an empty one", len(objects))
+			}
+
+			if objects != nil {
+				t.Errorf("got %d objects alongside the error, want nil", len(objects))
+			}
+		})
+	}
+}
+
+// TestListBoundsTheResponseItBuffers is the resource half of the test above.
+//
+// The XMLName check rejects a body that is not a listing — but it can only run
+// once the whole body is in memory, so until the read was bounded the rejection
+// came *after* the cost it was meant to avoid. A misconfigured baseURL aimed at
+// a host answering 200 with something large (a CDN mirror, a proxy streaming a
+// file, a bucket replaced by something else) was buffered in full before
+// anything got the chance to say it was not a listing.
+//
+// Every other body read in this package is capped — 8 KiB in s3StatusError,
+// 64 KiB in drain, 4 KiB in Checksum. This was the one that was not, and it is
+// the one that runs twice per symbol now that the two granularities are
+// concurrent, and once per worker at Stage 7.
+func TestListBoundsTheResponseItBuffers(t *testing.T) {
+	t.Parallel()
+
+	var served atomic.Int64
+
+	lister := newTestLister(t, func(w http.ResponseWriter, _ *http.Request) {
+		// Well-formed XML that never ends: the failure has to be the size, not
+		// a parse error, or the test would pass for the wrong reason.
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><ListBucketResult><IsTruncated>false</IsTruncated>`))
+
+		chunk := []byte(`<Contents><Key>` + strings.Repeat("k", 1024) + `</Key><Size>1</Size></Contents>`)
+		for range (maxListingPage / len(chunk)) + 64 {
+			n, err := w.Write(chunk)
+			served.Add(int64(n))
+
+			if err != nil {
+				return // the client gave up, which is the outcome under test
+			}
+		}
+	})
+
+	objects, err := lister.List(t.Context(), "data/spot/monthly/klines/BTCUSDT/1h/", "")
+	if err == nil {
+		t.Fatalf("got %d objects and no error; an unbounded body must not read as a listing", len(objects))
+	}
+
+	if objects != nil {
+		t.Errorf("got %d objects alongside the error, want nil", len(objects))
+	}
+
+	if !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("error %q does not name the size as the problem", err)
+	}
+}
+
+// TestListAcceptsTheRealNamespacedRoot is the other half of the test above: the
+// XMLName tag carries no namespace, and S3's real root element does
+// (xmlns="http://s3.amazonaws.com/doc/2006-03-01/").
+//
+// encoding/xml compares only the local name when the tag names no namespace, so
+// the real thing still parses — but that is a property of the standard library
+// worth pinning rather than remembering, since tightening the tag to include
+// the namespace would reject every genuine listing.
+func TestListAcceptsTheRealNamespacedRoot(t *testing.T) {
+	t.Parallel()
+
+	lister := newTestLister(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(readFixture(t, fixtureEmpty))
+	})
+
+	objects, err := lister.List(t.Context(), "data/spot/monthly/klines/NOSUCHSYM/1h/", "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if len(objects) != 0 {
+		t.Errorf("got %d objects, want none", len(objects))
+	}
+}
+
+// TestListRetriesATransientFailure covers why listings share the downloader's
+// retry policy. A listing that fails is a listing that must not be read as
+// empty, so a 503 nobody retried turns a half-second hiccup into a failed
+// request for the whole range.
+func TestListRetriesATransientFailure(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+
+	lister := newTestLister(t, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+			return
+		}
+
+		_, _ = w.Write(readFixture(t, fixtureHole))
+	})
+
+	objects, err := lister.List(t.Context(), "data/spot/monthly/klines/BTCUSDT/1mo/", "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if len(objects) != 22 {
+		t.Errorf("got %d objects, want 22", len(objects))
+	}
+
+	if got := calls.Load(); got != 3 {
+		t.Errorf("server saw %d requests, want 3", got)
 	}
 }

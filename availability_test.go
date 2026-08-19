@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -267,14 +269,36 @@ func listingOf(prefix string, names ...string) string {
 
 // newIndexServer serves one listing per aggregation, chosen by the prefix in
 // the request, and records the queries it received.
-func newIndexServer(t *testing.T, bodies map[aggregation]string) (*vision.Lister, *[]string) {
+//
+// The recorder is mutex-guarded because fetchArchiveIndex issues its two
+// listings concurrently, so net/http runs this handler in two goroutines at
+// once. An unguarded append is a genuine data race, and -race fails the suite
+// on it — which is the race detector doing exactly what it is for: the change
+// that made the listings parallel is what made this test helper unsafe, and
+// nothing else would have said so.
+//
+// The guard is returned as a snapshot function rather than as a *[]string, so
+// that reading is locked too. Handing back the slice made the protection
+// one-sided: writes took the mutex, reads did not, and the tests were left
+// leaning on net/http happening to establish a happens-before edge between the
+// handler's append and the client's read of the response. It does, today,
+// through the transport's own internal synchronisation — which is a fact about
+// an implementation nothing promises, not a guarantee this test holds. A
+// snapshot taken under the same mutex needs no such argument.
+func newIndexServer(t *testing.T, bodies map[aggregation]string) (*vision.Lister, func() []string) {
 	t.Helper()
 
-	var queries []string
+	var (
+		mu      sync.Mutex
+		queries []string
+	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prefix := r.URL.Query().Get("prefix")
+
+		mu.Lock()
 		queries = append(queries, r.URL.RawQuery)
+		mu.Unlock()
 
 		agg := aggMonthly
 		if strings.Contains(prefix, "/daily/") {
@@ -291,7 +315,21 @@ func newIndexServer(t *testing.T, bodies map[aggregation]string) (*vision.Lister
 	}))
 	t.Cleanup(srv.Close)
 
-	return vision.NewLister(srv.URL, srv.Client()), &queries
+	// fastPolicy (download_test.go) retries exactly as production does but
+	// without spending the wall-clock time — TestFetchArchiveIndexPropagatesErrors
+	// serves a 500, which is a status the policy retries.
+	//
+	// slices.Clone rather than returning queries itself: the caller would
+	// otherwise hold the same backing array the handler appends to, and the
+	// mutex would have guarded the copy while the caller read the original.
+	snapshot := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return slices.Clone(queries)
+	}
+
+	return vision.NewLister(srv.URL, srv.Client(), fastPolicy()), snapshot
 }
 
 func TestFetchArchiveIndex(t *testing.T) {
@@ -312,8 +350,8 @@ func TestFetchArchiveIndex(t *testing.T) {
 		t.Fatalf("fetchArchiveIndex: %v", err)
 	}
 
-	if len(*queries) != 2 {
-		t.Errorf("made %d listings, want 2 (one per granularity)", len(*queries))
+	if len(queries()) != 2 {
+		t.Errorf("made %d listings, want 2 (one per granularity)", len(queries()))
 	}
 
 	for _, m := range []time.Time{utc(2026, 5, 1), utc(2026, 6, 1), utc(2026, 7, 1)} {
@@ -367,8 +405,8 @@ func TestFetchArchiveIndexRecordsHoles(t *testing.T) {
 	// 1mo has no daily archives, so only one listing should have been made.
 	// Asking for a directory that cannot exist is a wasted round trip on every
 	// request for these three intervals.
-	if len(*queries) != 1 {
-		t.Errorf("made %d listings for a monthly-only interval, want 1", len(*queries))
+	if len(queries()) != 1 {
+		t.Errorf("made %d listings for a monthly-only interval, want 1", len(queries()))
 	}
 
 	if ix.has(aggMonthly, utc(2024, 3, 1)) {
@@ -432,7 +470,7 @@ func TestFetchArchiveIndexSeeks(t *testing.T) {
 
 	var monthlyQuery, dailyQuery string
 
-	for _, q := range *queries {
+	for _, q := range queries() {
 		if strings.Contains(q, "monthly") {
 			monthlyQuery = q
 		} else {
@@ -473,7 +511,7 @@ func TestFetchArchiveIndexPropagatesErrors(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	lister := vision.NewLister(srv.URL, srv.Client())
+	lister := vision.NewLister(srv.URL, srv.Client(), fastPolicy())
 
 	_, err := fetchArchiveIndex(t.Context(), lister, MarketSpot, "BTCUSDT", Interval1h, time.Time{})
 	if err == nil {
@@ -515,5 +553,195 @@ func TestAggregationString(t *testing.T) {
 		if got := tt.agg.String(); got != tt.want {
 			t.Errorf("aggregation(%d).String() = %q, want %q", uint8(tt.agg), got, tt.want)
 		}
+	}
+}
+
+// TestFetchArchiveIndexFrontierSurvivesAnEmptyDailyListing is the regression
+// test for a frontier taken from the daily map alone.
+//
+// The daily listing being empty while the monthly one is full looks impossible
+// until it happens: Binance pruning old dailies, the daily prefix moving, or a
+// marker seek landing past the end all produce it. Reading the frontier from
+// the empty map alone yields the zero time, which means "no archives exist at
+// all" — and a multi-year request then goes to the REST API one page at a time,
+// slowly and correctly enough that nobody notices for a while.
+//
+// The frontier is the later of the two, so the monthly answer stands when the
+// daily one has nothing to say.
+func TestFetchArchiveIndexFrontierSurvivesAnEmptyDailyListing(t *testing.T) {
+	t.Parallel()
+
+	monthlyPrefix := "data/spot/monthly/klines/BTCUSDT/1h/"
+
+	lister, _ := newIndexServer(t, map[aggregation]string{
+		aggMonthly: listingOf(monthlyPrefix,
+			"BTCUSDT-1h-2026-05.zip", "BTCUSDT-1h-2026-06.zip", "BTCUSDT-1h-2026-07.zip"),
+		// aggDaily is absent, so the server answers with a well-formed empty
+		// listing — the bucket saying "nothing here", not an error.
+	})
+
+	ix, err := fetchArchiveIndex(t.Context(), lister, MarketSpot, "BTCUSDT", Interval1h, time.Time{})
+	if err != nil {
+		t.Fatalf("fetchArchiveIndex: %v", err)
+	}
+
+	if want := utc(2026, 8, 1); !ix.through.Equal(want) {
+		t.Errorf("through = %s, want %s (the month after the newest monthly archive)", ix.through, want)
+	}
+
+	if ix.through.IsZero() {
+		t.Error("a zero frontier would send the whole range to the REST API")
+	}
+}
+
+// TestFetchArchiveIndexPrefersTheDailyFrontier is the other side of the same
+// rule: in the ordinary case dailies reach closer to the present, and the
+// monthly frontier must not drag the answer backwards.
+func TestFetchArchiveIndexPrefersTheDailyFrontier(t *testing.T) {
+	t.Parallel()
+
+	lister, _ := newIndexServer(t, map[aggregation]string{
+		aggMonthly: listingOf("data/spot/monthly/klines/BTCUSDT/1h/",
+			"BTCUSDT-1h-2026-06.zip", "BTCUSDT-1h-2026-07.zip"),
+		aggDaily: listingOf("data/spot/daily/klines/BTCUSDT/1h/",
+			"BTCUSDT-1h-2026-08-15.zip", "BTCUSDT-1h-2026-08-16.zip"),
+	})
+
+	ix, err := fetchArchiveIndex(t.Context(), lister, MarketSpot, "BTCUSDT", Interval1h, time.Time{})
+	if err != nil {
+		t.Fatalf("fetchArchiveIndex: %v", err)
+	}
+
+	// August 1st (monthly) vs August 17th (daily): taking the earlier would
+	// discard sixteen days of published archives.
+	if want := utc(2026, 8, 17); !ix.through.Equal(want) {
+		t.Errorf("through = %s, want %s", ix.through, want)
+	}
+}
+
+// TestArchivePrefixRejectsAnUnsetAggregation covers a validation gap whose
+// failure mode is a successful request that returns nothing.
+//
+// fmt.Stringer's fallback renders an unset aggregation as "aggregation(0)",
+// which is a perfectly valid path segment. The prefix it produces lists
+// successfully and matches no keys — indistinguishable, from the planner's
+// side, from a symbol that never traded.
+func TestArchivePrefixRejectsAnUnsetAggregation(t *testing.T) {
+	t.Parallel()
+
+	for _, agg := range []aggregation{0, aggregation(99)} {
+		got, err := archivePrefix(MarketSpot, "BTCUSDT", Interval1h, agg)
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("archivePrefix(agg=%d) = %q, %v; want an error wrapping ErrInvalidRequest", agg, got, err)
+		}
+	}
+
+	// Its neighbour validates the same value via the layout lookup. Both are
+	// checked here so the pair cannot drift apart again.
+	if _, err := archiveName("BTCUSDT", Interval1h, 0, utc(2024, 1, 1)); !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("archiveName with an unset aggregation: got %v, want ErrInvalidRequest", err)
+	}
+}
+
+// TestArchivePrefixValidatesEveryParameter is the aggregation check above
+// generalised to the two parameters it originally left out.
+//
+// Each of these formats into something that looks like a legal path segment, so
+// none of them produces an error from path.Join. They produce a *different*
+// well-formed key, which 404s, which the root package then reports as
+// ErrNotAvailable — Binance's calendar taking the blame for a caller's bug.
+func TestArchivePrefixValidatesEveryParameter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		symbol   string
+		interval Interval
+		// why records what the unvalidated value would have produced, so that
+		// the test states the failure it prevents rather than only the error it
+		// now expects.
+		why string
+	}{
+		{
+			name: "an unset interval", symbol: "BTCUSDT", interval: 0,
+			why: `fmt.Stringer's fallback gives .../BTCUSDT/Interval(0)/`,
+		},
+		{
+			name: "an out-of-range interval", symbol: "BTCUSDT", interval: Interval(200),
+			why: `likewise .../BTCUSDT/Interval(200)/`,
+		},
+		{
+			name: "an empty symbol", symbol: "", interval: Interval1h,
+			why: `path.Join drops the empty segment, so the interval slides into the symbol's slot: data/spot/daily/klines/1h/`,
+		},
+		{
+			name: "a symbol that escapes its directory", symbol: "../ETHUSDT", interval: Interval1h,
+			why: `path.Clean eats the klines segment: data/spot/daily/ETHUSDT/1h/`,
+		},
+		{
+			// NormalizeSymbol accepts this and returns "BTCUSDT" — but the path
+			// builders assert rather than normalise, because a value normalised
+			// in two places is a value that gets normalised in one of them.
+			// Two spellings reaching the cache are two entries for one pair.
+			name: "an unnormalised symbol", symbol: "BTC/USDT", interval: Interval1h,
+			why: `the caller skipped Request.resolve; normalising here would hide that`,
+		},
+		{
+			name: "a lowercase symbol", symbol: "btcusdt", interval: Interval1h,
+			why: `S3 keys are case-sensitive, so this lists nothing at all`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := archivePrefix(MarketSpot, tt.symbol, tt.interval, aggDaily)
+			if !errors.Is(err, ErrInvalidRequest) {
+				t.Errorf("archivePrefix(%q, %s) = %q, %v; want an error wrapping ErrInvalidRequest (%s)",
+					tt.symbol, tt.interval, got, err, tt.why)
+			}
+		})
+	}
+}
+
+// TestFetchArchiveIndexRejectsAnIntervalWithNoArchives covers the one input
+// that made this function answer without asking anything.
+//
+// Both HasMonthlyArchives and HasDailyArchives begin with i.IsValid(), so an
+// interval that fails validation reported false to both, launched zero
+// goroutines, and let g.Wait return nil over an empty errgroup. The result was
+// an empty index and a nil error — "Binance has published nothing for this
+// symbol" — produced without a single request being made.
+//
+// That is the "failed lookup read as an empty one" conflation the whole package
+// is arranged around, and it is the reason the guard is on the granularities
+// rather than on IsValid: the day an interval exists that Binance publishes at
+// neither, this must still say so instead of reporting silence.
+func TestFetchArchiveIndexRejectsAnIntervalWithNoArchives(t *testing.T) {
+	t.Parallel()
+
+	for _, iv := range []Interval{0, Interval(200)} {
+		lister, queries := newIndexServer(t, nil)
+
+		ix, err := fetchArchiveIndex(t.Context(), lister, MarketSpot, "BTCUSDT", iv, time.Time{})
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("fetchArchiveIndex(iv=%d) = %+v, %v; want an error wrapping ErrInvalidRequest", iv, ix, err)
+		}
+
+		// The failure must be reported before anything is asked, not inferred
+		// from an empty answer.
+		if n := len(queries()); n != 0 {
+			t.Errorf("made %d listings for an interval that has none, want 0", n)
+		}
+	}
+
+	// The contrast that makes the point: a valid interval over an empty bucket
+	// is the same empty index with a nil error, and that one is a fact worth
+	// acting on. The two must never be spelled the same way.
+	lister, _ := newIndexServer(t, nil)
+
+	if _, err := fetchArchiveIndex(t.Context(), lister, MarketSpot, "NOSUCHSYM", Interval1h, time.Time{}); err != nil {
+		t.Errorf("an empty bucket must not be an error: %v", err)
 	}
 }

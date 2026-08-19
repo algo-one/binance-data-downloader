@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/algo-one/binance-data-downloader/internal/vision"
 )
 
@@ -67,6 +69,42 @@ func archivePrefix(m Market, symbol string, iv Interval, agg aggregation) (strin
 		return "", err
 	}
 
+	// The aggregation is validated for the same reason the market is, and it
+	// was missed here originally while its neighbour archiveName validated it
+	// via the layout lookup. The failure mode is quiet: an unset aggregation
+	// formats through fmt.Stringer's fallback as "aggregation(0)", producing
+	// the syntactically valid prefix data/spot/aggregation(0)/klines/BTCUSDT/1h/,
+	// which lists successfully and returns nothing — indistinguishable from a
+	// symbol that never traded.
+	if !agg.valid() {
+		return "", fmt.Errorf("aggregation %s: %w", agg, ErrInvalidRequest)
+	}
+
+	// The interval and the symbol are checked for the same reason, and they are
+	// the two that were still missing when the aggregation check above was
+	// added. Every parameter this function interpolates into a path must be
+	// validated here, because every one of them formats into something that
+	// looks like a legal path segment and therefore fails silently rather than
+	// loudly:
+	//
+	//	Interval(0)   fmt.Stringer's fallback, a perfectly valid directory name
+	//	""            path.Join drops an empty segment, so the interval slides
+	//	              into the symbol's slot and the key names another object
+	//	"../ETHUSDT"  path.Clean eats the preceding segment, likewise
+	//
+	// None of these produce an error from path.Join. They produce a key that
+	// 404s, which translateVisionError then labels ErrNotAvailable — "Binance
+	// has not published this" reported for what is a caller's bug. Validation
+	// upstream in Request.Validate does catch all of them today; this is the
+	// belt to that braces, at the boundary where the values become a URL.
+	if !iv.IsValid() {
+		return "", fmt.Errorf("interval %s: %w", iv, ErrInvalidRequest)
+	}
+
+	if err := checkNormalizedSymbol(symbol); err != nil {
+		return "", err
+	}
+
 	// path.Join, not filepath.Join. These are URL paths and always use forward
 	// slashes; filepath uses the host separator, which would silently produce
 	// backslashes on Windows and a 404 that only reproduces there.
@@ -85,6 +123,17 @@ func archivePrefix(m Market, symbol string, iv Interval, agg aggregation) (strin
 var archiveDateLayouts = map[aggregation]string{
 	aggMonthly: "2006-01",
 	aggDaily:   "2006-01-02",
+}
+
+// valid reports whether a is one of the two aggregations that exist.
+//
+// It consults archiveDateLayouts rather than listing the constants again, so
+// that the map is the single registry of what an aggregation can be: adding a
+// third granularity means adding one entry, not finding every switch.
+func (a aggregation) valid() bool {
+	_, ok := archiveDateLayouts[a]
+
+	return ok
 }
 
 // archiveName is the file name of one archive, without any directory:
@@ -198,6 +247,11 @@ func (ix archiveIndex) has(agg aggregation, t time.Time) bool {
 // honest answer: the bucket said there is nothing here. It is the caller's job
 // not to turn it into an empty candle slice without also saying why — see the
 // three-outcome note on [vision.Lister.List].
+//
+// An empty index therefore always means the bucket answered. An interval that
+// cannot be served from archives at all is rejected before any request is made,
+// because "we never asked" and "we asked and there is nothing" must not arrive
+// looking identical.
 func fetchArchiveIndex(
 	ctx context.Context,
 	lister *vision.Lister,
@@ -206,36 +260,93 @@ func fetchArchiveIndex(
 	iv Interval,
 	since time.Time,
 ) (archiveIndex, error) {
+	// Neither granularity means no goroutine below runs, g.Wait returns nil,
+	// and this function would hand back an empty index and a nil error — the
+	// "failed lookup read as an empty one" conflation the whole package is
+	// arranged to prevent, arriving without even a request having been made.
+	//
+	// The check is written on the granularities rather than on iv.IsValid
+	// because the two are not quite the same question, and this is the one that
+	// matters. Every interval in the table today publishes monthly archives, so
+	// in practice zero granularities *is* an invalid interval — but the day an
+	// interval is added that Binance publishes at neither, this still says so
+	// instead of reporting a symbol that never traded.
+	//
+	// Note the asymmetry it removes: a bad market or aggregation already fails
+	// loudly, because load reaches archivePrefix and archivePrefix rejects
+	// them. Three of the four parameters were reported; the fourth returned
+	// silence that reads as a fact.
+	if !iv.HasMonthlyArchives() && !iv.HasDailyArchives() {
+		return archiveIndex{}, fmt.Errorf(
+			"interval %s: published at no archive granularity: %w", iv, ErrInvalidRequest)
+	}
+
 	ix := archiveIndex{
 		months: map[time.Time]bool{},
 		days:   map[time.Time]bool{},
 	}
 
+	// errgroup.WithContext gives a WaitGroup that also collects the first
+	// error and cancels the other goroutines when one fails. The two listings
+	// are independent round trips to the same host, so running them
+	// concurrently halves the latency of building an index for the thirteen
+	// intervals that have both granularities — one round trip's worth of
+	// waiting instead of two, at the cost of nothing but this call.
+	//
+	// The context it returns must be the one the goroutines use, or a failed
+	// monthly listing would leave the daily one running to completion for an
+	// answer nobody will read.
+	g, gctx := errgroup.WithContext(ctx)
+
 	if iv.HasMonthlyArchives() {
-		if err := ix.load(ctx, lister, m, symbol, iv, aggMonthly, since); err != nil {
-			return archiveIndex{}, err
-		}
+		// g.Go takes a func() error and runs it in a new goroutine. The
+		// closure captures ix, and the two goroutines then write to the same
+		// struct concurrently — which is safe here, and only here, because
+		// each writes to a different map inside it and neither writes the
+		// struct's own fields. Add a third granularity that shares a map and
+		// this becomes a data race the -race detector would catch.
+		g.Go(func() error {
+			return ix.load(gctx, lister, m, symbol, iv, aggMonthly, since)
+		})
 	}
 
 	if iv.HasDailyArchives() {
-		if err := ix.load(ctx, lister, m, symbol, iv, aggDaily, since); err != nil {
-			return archiveIndex{}, err
-		}
+		g.Go(func() error {
+			return ix.load(gctx, lister, m, symbol, iv, aggDaily, since)
+		})
 	}
 
-	// The frontier is set by the finest granularity available, because that is
-	// the one that reaches closest to the present: daily archives lag real
-	// time by about a day, monthly ones by as much as a month plus that day.
-	// Using the monthly frontier for an interval that has dailies would push
-	// weeks of perfectly good archives onto the REST path.
+	// Wait blocks until every goroutine has returned and yields the first
+	// error any of them reported. Returning the zero archiveIndex alongside it
+	// matters: a partially loaded index is exactly the "failed listing read as
+	// an empty one" that the design forbids, and handing one back would let a
+	// caller ignoring the error plan around half a bucket.
+	if err := g.Wait(); err != nil {
+		return archiveIndex{}, err
+	}
+
+	// The frontier is the later of the two granularities' frontiers.
+	//
+	// In the ordinary case that is the daily one, because dailies reach
+	// closest to the present: they lag real time by about a day, monthly
+	// archives by as much as a month plus that day. Taking the later of the
+	// two rather than the daily one outright is what handles the case that
+	// looks impossible until it happens — a populated monthly listing beside
+	// an empty daily one, whether because Binance pruned old dailies, because
+	// the daily prefix moved, or because the marker seek landed past the end.
+	// Reading the frontier from the empty map alone yields the zero time,
+	// which means "no archives at all" and sends a multi-year range to the
+	// REST API one page at a time.
 	//
 	// Holes deliberately play no part in this. through is the frontier, not a
 	// claim that everything before it exists; a missing month in the middle is
 	// found when it is fetched and handled by plan.Substitute.
-	if iv.HasDailyArchives() {
-		ix.through = nextAfterLatest(ix.days, func(t time.Time) time.Time { return t.AddDate(0, 0, 1) })
-	} else {
-		ix.through = nextAfterLatest(ix.months, func(t time.Time) time.Time { return t.AddDate(0, 1, 0) })
+	monthlyThrough := nextAfterLatest(ix.months, func(t time.Time) time.Time { return t.AddDate(0, 1, 0) })
+	dailyThrough := nextAfterLatest(ix.days, func(t time.Time) time.Time { return t.AddDate(0, 0, 1) })
+
+	ix.through = monthlyThrough
+	if dailyThrough.After(ix.through) {
+		ix.through = dailyThrough
 	}
 
 	return ix, nil

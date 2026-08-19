@@ -1,9 +1,9 @@
 # Architecture
 
 > **Status:** design document. Stages 0 (scaffolding), 1 (domain types),
-> 2 (time and availability) and 3 (parsing) are complete; the packages described
-> below arrive stage by stage. Sections marked *planned* describe code that does
-> not exist yet.
+> 2 (time and availability), 3 (parsing) and 4 (downloader) are complete; the
+> packages described below arrive stage by stage. Sections marked *planned*
+> describe code that does not exist yet.
 
 ## What the library does
 
@@ -80,6 +80,34 @@ enforces: a **failed** listing is never read as an **empty** one. `List` returns
 Conflating the two is precisely how the ported implementation returned ranges
 with days missing and no error to show for it.
 
+The rule needs one line of enforcement that is easy to miss. `encoding/xml`
+matches child elements by name and ignores the document's root, so a struct
+without an `XMLName` field accepts *any* well-formed XML and leaves every field
+at its zero value — which is to say, a listing that is not truncated and holds
+no keys. A proxy's login page or a CDN error document answered with HTTP 200
+would decode into "Binance has published nothing here", with a nil error to
+vouch for it. `listBucketResult` therefore pins its root element, and anything
+else is a parse error: the honest answer is that we do not know what is there.
+
+The same rule has a second edge, on the way *in* rather than out. Every value
+interpolated into a bucket path formats into something that looks like a legal
+path segment, so none of them fails loudly on its own: `fmt.Stringer`'s fallback
+renders an unset interval as `Interval(0)`, `path.Join` drops an empty symbol so
+the interval slides into its slot, and `path.Clean` resolves a `..` away. Each
+produces a well-formed key naming a *different* object, which 404s, which the
+root package then reports as `ErrNotAvailable` — a statement about Binance's
+calendar standing in for a bug in the caller. `archivePrefix` therefore
+validates all four of market, aggregation, interval and symbol, and asserts the
+symbol is already normalised rather than normalising it, since a value
+normalised in two places is one that gets normalised in only one of them.
+
+`fetchArchiveIndex` closes the same gap one level up. `HasMonthlyArchives` and
+`HasDailyArchives` both begin with `IsValid()`, so an interval that fails
+validation reported false to both, launched zero goroutines, and let `g.Wait`
+return nil over an empty `errgroup` — an empty index and a nil error, produced
+without a request being made. It is guarded on the granularities rather than on
+`IsValid` so that an interval Binance publishes at neither still says so.
+
 ## The pipeline
 
 ```
@@ -112,6 +140,117 @@ while doing nothing. One queue of uniform work units cannot have that problem.
 
 **Reduce** — chunks arrive already sorted; merge, deduplicate on `open_time`,
 and trim to the requested range.
+
+## Downloading
+
+`internal/vision` is the only package that speaks HTTP, and `download.go` in the
+root is the seam where its answers become this package's vocabulary. Four things
+about it were decided rather than defaulted.
+
+**One `http.Client` for the process.** An `http.Client` is not a connection; it
+is a handle onto a `Transport`, and the `Transport` holds the pool. A client per
+request therefore builds a pool, uses one connection from it and throws it away
+— 100–200 ms of TCP and TLS handshaking before a byte of payload, on every
+archive. `NewHTTPClient` clones `http.DefaultTransport` (keeping proxy support
+and HTTP/2 negotiation, which a hand-built `&http.Transport{}` silently drops)
+and raises `MaxIdleConnsPerHost` from its default of **2** to 64, since every
+request in this library goes to the same host.
+
+It is also the *default*, not merely the recommendation. `NewLister` and
+`NewDownloader` accept a nil client, and defaulting that to `http.DefaultClient`
+would hand anyone who took the documented default a transport keeping two idle
+connections per host — this requirement's own failure, from the constructor
+advertising it. A package-level `sync.OnceValue(NewHTTPClient)` supplies one
+shared client instead, built lazily so that merely importing the package does
+not read the proxy environment and start a dialer. Listing and downloading share
+it deliberately: a `Transport` pools per host, so one client keeps separate pools
+for S3 and for `data.binance.vision` rather than mixing them.
+
+`Client.Timeout` is deliberately left unset. It bounds the *entire* exchange
+including the body read, so any value large enough to let a 93 MB `1s` archive
+finish on a slow link is far too large to catch a hung connection, and any value
+small enough to catch a hang kills a transfer that was streaming perfectly well.
+The two jobs are split instead: `ResponseHeaderTimeout` catches a server that
+accepts a connection and says nothing, and the per-call `context.Context` bounds
+the operation — which is the better tool anyway, because the caller owns it.
+
+**Every response body is drained, not merely closed.** `net/http` returns a
+connection to the idle pool only once its body has been read to EOF, so
+`Close()` on a partly-read body closes the TCP connection instead of pooling it.
+That is invisible while everything succeeds and fires exactly when it hurts: a
+burst of 503s, or a month of 404s for archives that do not exist, would
+re-handshake for every one. `TestRetriesReuseOneConnection` counts connections
+rather than requests, and measures 1 instead of 4.
+
+**Retries are a function, not a `RoundTripper`.** Wrapping the transport would
+give every request retries for free, but a transport sees bytes rather than
+meaning — it cannot know that a 404 on an archive is routine while a 404 on a
+listing is a misconfiguration — and retries hidden inside it cannot be pinned by
+counting calls at the call site. `doWithRetry` is shared by the lister and the
+downloader:
+
+| | |
+| --- | --- |
+| Attempts | 4 — 500 ms, doubling, capped at 8 s (≈3.5 s of waiting in total) |
+| Jitter | Full: a uniform draw from `[0, ceiling)`, so forty workers that all receive a 503 do not retry in lockstep |
+| Retried | Transport errors, 408, 425, 429, 500, 502, 503, 504 |
+| Never retried | **404** above all — the most common non-200 here, and a fact rather than a hiccup — plus every other 4xx |
+| `Retry-After` | Honoured in both RFC 9110 forms (delta-seconds and HTTP-date), as a **floor** — clamped to `[BaseDelay, 30 s]`, then jittered on top |
+| Cancellation | The backoff is a `select` on `ctx.Done()`, so an interrupted run stops mid-wait rather than sitting out the delay |
+| Request bodies | Rewound via `GetBody` on every retry. `http.Request.Clone` copies the `Body` field rather than the reader, so a retried request would otherwise send nothing |
+
+`Retry-After` is a floor rather than a replacement because taking it literally
+undoes both of the properties above it in that table. A header is the one input
+that makes every worker's delay *identical by construction* — forty workers each
+told to wait 1 s re-fire on the same millisecond, which is the thundering herd
+the jitter row exists to prevent, reassembled by the code deferring to the
+server. And `retryAfter` reports zero both for a literal `Retry-After: 0` and
+for any HTTP-date already elapsed, which a clock two seconds fast produces from
+an ordinary "two seconds from now"; `Policy.wait` treats anything at or below
+zero as no wait at all, so every remaining attempt would fire back-to-back at a
+server that had just said it was overloaded. Clamping low and adding jitter on
+top means nobody retries earlier than the server asked and nobody retries in
+lockstep.
+
+Exhausting the attempts returns the last *response*, not an error: the caller
+decides what a status means, and synthesising an error would discard the body,
+which is the only diagnostic there is.
+
+A 429 that survives every attempt is the exception worth naming, because it is
+not a fact about one request — it says the pipeline as a whole is going too
+fast, and only the layer owning the worker pool can act on that. `statusError`
+therefore returns a `*vision.RateLimitError` carrying the server's `Retry-After`
+verbatim, unclamped: the 30 s cap bounds what this package will wait *inside*
+one request, while how long a whole pipeline should pause is Stage 7's policy to
+set. `errors.Is(err, ErrRateLimited)` still works through the type's `Unwrap`,
+so a caller that only wants the condition never learns the struct exists.
+
+**Archives are hashed as they stream.** `Download` writes through an
+`io.MultiWriter` into both the destination and a `sha256.Hash`, so a 93 MB
+archive is verified for the price of the copy that was happening anyway — no
+buffering, no reading the file back, one 32 KiB copy buffer regardless of size.
+That is what makes verifying *every* download affordable enough to be
+non-optional, where the ported implementation stored checksums it never compared
+against anything.
+
+The sidecar is fetched first, before the archive. It is 91 bytes, so an
+unpublished month costs one tiny request rather than a large transfer that ends
+in a 404, and every archive that does arrive is compared against a hash already
+in hand — there is no path where bytes are written, the sidecar then fails to
+load, and the caller is left holding an unverified file that looks finished.
+
+The parse of that sidecar is liberal about whitespace and strict about the hash:
+64 characters, hexadecimal, or it is rejected. It also checks that the sidecar
+names the archive it was fetched for, because a mirror serving the wrong
+directory's sidecar otherwise fails later as a checksum mismatch, sending
+whoever investigates hunting for a corruption that never happened.
+
+**Errors cross the boundary by translation.** `internal/vision` cannot import
+the root package — the dependency runs the other way — so it returns its own
+`ErrNotFound` and `ErrRateLimited`, and `translateVisionError` re-labels them as
+`ErrNotAvailable` and `ErrRateLimited`. It uses two `%w` verbs in one
+`fmt.Errorf`, which `errors.Is` walks to either: the transport's message (naming
+the key and the status) survives alongside the sentinel callers branch on.
 
 ## Parsing
 
@@ -210,6 +349,7 @@ paying on every backtest run.
 ├── request.go        Request, validation, per-call resolution of End
 ├── availability.go   bucket paths, archive names, the archive index
 ├── codec.go          zip → csv → []Kline; CodecVersion lives here
+├── download.go       archive key → verified bytes; vision errors → sentinels
 ├── cache.go          tier 1 (zip) + tier 2 (parquet) + memory                (planned)
 ├── restapi.go        data-api.binance.vision klines                          (planned)
 ├── options.go        functional options for NewLoader                        (planned)
@@ -217,7 +357,12 @@ paying on every backtest run.
 │
 ├── internal/
 │   ├── plan/         range → []Chunk (pure; imports only errors, fmt, time)
-│   └── vision/       data.binance.vision downloader + S3 listing
+│   └── vision/       the bucket: one shared client, retries, listing, download
+│       ├── client.go    the process-wide http.Client and its Transport
+│       ├── retry.go     Policy, doWithRetry, Retry-After
+│       ├── body.go      draining and quoting response bodies
+│       ├── listing.go   S3 ListObjects with marker pagination
+│       └── download.go  one object, streamed and hashed in a single pass
 │
 ├── cmd/bmd/          the CLI binary
 ├── testdata/         real archives, byte-untouched (see its README)
@@ -370,12 +515,12 @@ because they are easy to get subtly wrong and silent when they are.
 | 1 | The end of a request range is resolved **per call**, never captured once at construction — a long-running process must not drift onto a stale end date | 2 ✅ |
 | 2 | Month-boundary comparisons anchor on the 1st of the month. A range such as `2024-12-20` → `2025-01-03` must not be misclassified as "current month", which **silently drops the last days** | 2 ✅ |
 | 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 ✅ |
-| 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns | 4 |
+| 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns | 4 (typed error) → 7 (policy) |
 | 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 7 |
 | 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 ✅ |
 | 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 ✅ |
-| 8 | One `http.Client` is shared for the process, so connections are reused rather than reopened per request | 4 |
-| 9 | Checksums are **verified**, not merely stored — at download time, and on demand via `bmd verify` | 5 |
+| 8 | One `http.Client` is shared for the process, so connections are reused rather than reopened per request | 4 ✅ |
+| 9 | Checksums are **verified**, not merely stored — at download time, and on demand via `bmd verify` | 4 ✅ (download) → 8 (`bmd verify`) |
 | 10 | Cache writes are atomic: temp file in the destination directory, then `rename`. A crash never leaves a torn file | 5 |
 
 Two rules that apply everywhere rather than to one stage: validation lives in a
@@ -391,7 +536,7 @@ setting is a defect, not a stub.
 | 1 | Domain types — `Interval`, `Market`, `DataType`, symbol normalisation, `Kline`, `errors.go` | **done** |
 | 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | **done** |
 | 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | **done** |
-| 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | |
+| 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | **done** |
 | 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | |
 | 6 | REST fetcher — pagination for the recent tail, rate limiting | |
 | 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | |
@@ -403,7 +548,7 @@ setting is a defect, not a stub.
 | Dependency | Purpose | Stage |
 | --- | --- | --- |
 | `github.com/quagmt/udecimal` | Exact prices and volumes | 1 |
-| `golang.org/x/sync` | `errgroup` (bounded pool), `singleflight` (dedup) | 5 |
+| `golang.org/x/sync` | `errgroup` (the two availability listings in parallel, then the Stage 7 bounded pool), `singleflight` (dedup) | 4 |
 | `github.com/parquet-go/parquet-go` | Tier-2 cache and CLI export; pure Go | 5 |
 
 Everything else is standard library: `net/http`, `archive/zip`, `encoding/csv`,
@@ -429,4 +574,9 @@ and cross-compilation.
 - **Golden files** for CLI output and for reproducible Parquet.
 - **`-race`** on every run.
 - **A frozen clock** — time is injected, never read from `time.Now()` inside
-  logic, so calendar rules are testable.
+  logic, so calendar rules are testable. The retry policy carries its timer and
+  its clock as fields for the same reason: the suite asserts on the delays that
+  were *requested* rather than sleeping through 3.5 s of backoff per test.
+- **Connections are counted, not just requests.** `httptest.Server`'s
+  `ConnState` hook is what makes "the body was drained so the connection was
+  reused" a testable claim rather than a hopeful comment.

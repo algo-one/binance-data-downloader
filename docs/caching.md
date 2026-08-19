@@ -142,6 +142,12 @@ re-downloading if `CodecVersion` ever bumps. A flag, never the default.
 Tier 1 is verified against its `.CHECKSUM` **at download time**, and on demand
 via `bmd verify`. It is not re-hashed on every read.
 
+The download half is live as of Stage 4: `fetchArchive` fetches the sidecar
+first, streams the archive through a `sha256.Hash` in the same pass that writes
+it, and returns `ErrChecksum` on a mismatch — so unverified bytes never reach
+the cache, and the hash the cache stamps into the Parquet footer is one that was
+computed and checked rather than copied from the sidecar on faith.
+
 All cache writes go to a temporary file in the destination directory and are
 then renamed into place. `rename(2)` within a filesystem is atomic, so a crash
 mid-write leaves either the old file or the new one, never a truncated one.

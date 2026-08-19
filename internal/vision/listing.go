@@ -42,7 +42,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 )
 
 // DefaultBaseURL is the S3 REST endpoint for the bucket Binance publishes to.
@@ -62,6 +61,16 @@ const DefaultBaseURL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vis
 // that kept answering "there is more" would otherwise loop forever.
 const maxPages = 20
 
+// maxListingPage bounds how large a single ListObjects response may be before
+// it is rejected as not being one.
+//
+// A full page is 1000 entries. Each is a key of roughly 75 characters wrapped
+// in the Contents element S3 sends — Key, Size, LastModified, ETag,
+// StorageClass — for about 250 bytes, so a real maximal page is around 250 KB.
+// A mebibyte is four times that: comfortable headroom for a key layout that
+// grows, and still a bound rather than a hope.
+const maxListingPage = 1 << 20 // 1 MiB
+
 // Lister reads object listings from the bucket.
 //
 // It holds an *http.Client rather than creating one, because connection reuse
@@ -71,23 +80,34 @@ const maxPages = 20
 type Lister struct {
 	baseURL string
 	client  *http.Client
+	policy  Policy
 }
 
 // NewLister returns a Lister reading from baseURL using client.
 //
-// An empty baseURL means [DefaultBaseURL]; a nil client means
-// http.DefaultClient. Accepting zero values for both keeps tests short while
-// leaving the production wiring explicit.
-func NewLister(baseURL string, client *http.Client) *Lister {
+// An empty baseURL means [DefaultBaseURL], a nil client means the process-wide
+// client from [NewHTTPClient], and the zero Policy means [DefaultPolicy].
+// Accepting zero values for all three keeps tests short while leaving the
+// production wiring explicit.
+//
+// The nil client deliberately does not mean http.DefaultClient — see
+// [defaultClient] for why that default would quietly reintroduce the connection
+// churn this package exists to remove.
+//
+// Listings are retried on the same policy as downloads, and it matters more
+// here than it looks: a listing that fails is a listing that cannot be read as
+// empty, so every transient 503 that is not retried becomes a request that
+// fails outright rather than one that costs an extra half second.
+func NewLister(baseURL string, client *http.Client, p Policy) *Lister {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
 
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultClient()
 	}
 
-	return &Lister{baseURL: baseURL, client: client}
+	return &Lister{baseURL: baseURL, client: client, policy: p.withDefaults()}
 }
 
 // listBucketResult is the subset of S3's ListObjects response this package
@@ -99,6 +119,23 @@ func NewLister(baseURL string, client *http.Client) *Lister {
 // read at runtime through reflection. They are how the standard library's
 // encoders learn the wire name of a field without a code generator.
 type listBucketResult struct {
+	// XMLName pins the name of the root element. A field of type xml.Name
+	// makes encoding/xml check the document's root against the tag and fail
+	// the unmarshal when it differs, instead of the default behaviour of
+	// accepting any root and filling in whichever children happen to match.
+	//
+	// Without it this struct accepts *any* well-formed XML. Every field would
+	// simply stay at its zero value, which is a listing that is not truncated
+	// and contains nothing — and that is precisely the "a failed listing read
+	// as an empty one" conflation the package comment says must never happen,
+	// arriving with a nil error and an HTTP 200 to vouch for it. A proxy login
+	// page, an error document from a CDN or a bucket replaced by something
+	// else would all be reported as "Binance has published no archives".
+	//
+	// One field turns all of those into a parse error, which is the honest
+	// answer: we do not know what is there.
+	XMLName xml.Name `xml:"ListBucketResult"`
+
 	// IsTruncated is S3 saying "there are more keys than fit in this
 	// response". encoding/xml parses "true"/"false" text into a bool.
 	IsTruncated bool `xml:"IsTruncated"`
@@ -252,7 +289,12 @@ func (l *Lister) fetchPage(ctx context.Context, prefix, marker string) (*listBuc
 		return nil, fmt.Errorf("listing %q: building request: %w", prefix, err)
 	}
 
-	resp, err := l.client.Do(req)
+	// doWithRetry rather than client.Do: a listing is one request whose failure
+	// costs the whole plan, so a transient 503 is worth half a second to ride
+	// out. What it does not do is decide what a status means — a 404 here is a
+	// misconfigured base URL and is reported as such below, where a 404 on an
+	// archive is routine.
+	resp, err := doWithRetry(ctx, l.client, req, l.policy)
 	if err != nil {
 		// A transport error is already wrapped with the URL by net/http, and
 		// it is the one place a context cancellation surfaces, so it is passed
@@ -270,15 +312,34 @@ func (l *Lister) fetchPage(ctx context.Context, prefix, marker string) (*listBuc
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, l.statusError(prefix, resp)
+		return nil, s3StatusError(prefix, resp)
 	}
 
 	// io.ReadAll rather than streaming into the decoder, because the body has
 	// to be read to completion for the connection to be reusable anyway, and a
 	// listing page is bounded at 1000 entries — a few hundred kilobytes.
-	body, err := io.ReadAll(resp.Body)
+	//
+	// That bound is enforced rather than assumed. It holds for S3, and this is
+	// the one read in the package that reaches a body nothing has yet
+	// established came from S3: the XMLName check that rejects a proxy login
+	// page or a CDN error document runs on the bytes *after* they are all in
+	// memory. A misconfigured baseURL aimed at a host that answers 200 with a
+	// large payload — the case TestListRejectsAnythingThatIsNotAListing exists
+	// because it happens — would otherwise be buffered whole before anything
+	// got the chance to say it was not a listing, twice per symbol now that the
+	// two granularities run concurrently, and once per pool worker at Stage 7.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxListingPage+1))
 	if err != nil {
 		return nil, fmt.Errorf("listing %q: reading response: %w", prefix, err)
+	}
+
+	// Reading one byte past the cap is what makes "too large" detectable at
+	// all: a read stopping exactly at the limit cannot tell a body of exactly
+	// that size from one that was cut short, and silently truncated XML is the
+	// worst of the available failures — it parses as a short listing.
+	if len(body) > maxListingPage {
+		return nil, fmt.Errorf(
+			"listing %q: response is larger than %d bytes, which is not a listing", prefix, maxListingPage)
 	}
 
 	var result listBucketResult
@@ -289,11 +350,36 @@ func (l *Lister) fetchPage(ctx context.Context, prefix, marker string) (*listBuc
 	return &result, nil
 }
 
-// statusError turns a non-200 response into an error that says what to do about
-// it. The response body is XML describing the failure, and S3's diagnostics are
-// genuinely good — worth the twenty lines to surface rather than discard.
-func (l *Lister) statusError(prefix string, resp *http.Response) error {
+// s3StatusError turns a non-200 listing response into an error that says what
+// to do about it. The response body is XML describing the failure, and S3's
+// diagnostics are genuinely good — worth the twenty lines to surface rather
+// than discard.
+//
+// # It drains but does not close
+//
+// The caller's deferred Close owns that half. This is the opposite of
+// [Downloader.statusError], which drains *and* closes because its own callers
+// have no defer to rely on — and the two contracts being opposite is exactly
+// why this function no longer shares that name.
+//
+// It was previously a method on *Lister that never touched its receiver, so two
+// functions called statusError sat in one package, distinguished only by
+// whether a call site wrote a dot. A reader could not tell which body contract
+// applied without going to look, and moving a call from one to the other would
+// have leaked a connection or closed one twice, in silence, on the error path
+// that runs during an outage. Different jobs get different names.
+func s3StatusError(prefix string, resp *http.Response) error {
+	// The body is read whole rather than through bodySnippet, because it has to
+	// be parsed as XML before it can be judged unreadable. The read is bounded
+	// at 8 KiB, so drain takes care of an error document larger than that:
+	// without it, net/http closes the connection instead of pooling it, and
+	// every non-200 answer costs a fresh TCP and TLS handshake — during an
+	// outage, which is when they arrive in bursts.
+	//
+	// Closing is the caller's deferred job, not this function's.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	drain(resp)
+
 	if err != nil {
 		return fmt.Errorf("listing %q: unexpected status %s", prefix, resp.Status)
 	}
@@ -301,11 +387,14 @@ func (l *Lister) statusError(prefix string, resp *http.Response) error {
 	var s3e s3Error
 	if err := xml.Unmarshal(body, &s3e); err != nil || s3e.Code == "" {
 		// Not an S3 error document. The likeliest cause is that baseURL points
-		// somewhere that is not S3 at all, so the first line of the body is
-		// far more useful than the status alone.
-		snippet := strings.TrimSpace(string(body))
-		if len(snippet) > 200 {
-			snippet = snippet[:200] + "..."
+		// somewhere that is not S3 at all, so the first line of the body is far
+		// more useful than the status alone. snippetOf returns it quoted and
+		// escaped, which is what keeps a body that is not text at all — and a
+		// body that is not an S3 error document is exactly the candidate — from
+		// putting raw control bytes on someone's terminal.
+		snippet := snippetOf(body)
+		if snippet == "" {
+			return fmt.Errorf("listing %q: unexpected status %s", prefix, resp.Status)
 		}
 
 		return fmt.Errorf("listing %q: unexpected status %s: %s", prefix, resp.Status, snippet)

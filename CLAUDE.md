@@ -39,8 +39,10 @@ update that table *and* the one in the plan file.
 - Public API in the root package; everything else under `internal/`, which the
   compiler forbids other modules from importing.
 - **Prices and volumes are `udecimal.Decimal`, never `float64`.** Binance quote
-  volumes reach 19 significant digits. This was measured, not assumed — see the
-  plan file before revisiting.
+  volumes reach 20 significant digits (worst real value:
+  `118661604939.99255335`, BTCUSDT `1mo` quote volume). This was measured over
+  1,751,352 real values, not assumed — see `docs/numbers.md` and the plan file
+  before revisiting.
 - Errors are sentinels in `errors.go`, wrapped with `%w`, compared with
   `errors.Is`. Never `==`.
 - Every function that does I/O takes `ctx context.Context` first.

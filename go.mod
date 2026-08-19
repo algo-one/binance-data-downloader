@@ -23,19 +23,35 @@ module github.com/algo-one/binance-data-downloader
 // The compiler enforces this: language features newer than 1.24 are rejected
 // even when a newer toolchain is doing the compiling. That is the point — it
 // stops us accidentally breaking the promise.
-go 1.24
+go 1.24.0
 
-// The one third-party dependency so far. `go mod tidy` writes this block from
-// the imports in the source, so it is a report rather than a wish list — the
-// way to add a dependency is to import it and re-run tidy.
-//
-// udecimal carries the prices and volumes in binancedata.Kline. Binance quote
-// volumes reach 20 significant digits, which float64 cannot hold and no int64
-// fixed-point scale covers; udecimal keeps a 128-bit coefficient inline in the
-// value, so it is exact without allocating. See kline.go for the measurements
-// and docs/numbers.md for the comparison against the alternatives.
+// `go mod tidy` writes these blocks from the imports in the source, so they are
+// a report rather than a wish list — the way to add a dependency is to import
+// it and re-run tidy.
 //
 // Dependencies are a liability for a published library — every one of them
 // becomes a constraint on everybody who imports us — so this list is meant to
-// stay short. Everything else here is the standard library.
-require github.com/quagmt/udecimal v1.10.1
+// stay short. Everything not named here is the standard library.
+require (
+	// udecimal carries the prices and volumes in binancedata.Kline. Binance
+	// quote volumes reach 20 significant digits, which float64 cannot hold and
+	// no int64 fixed-point scale covers; udecimal keeps a 128-bit coefficient
+	// inline in the value, so it is exact without allocating. See kline.go for
+	// the measurements and docs/numbers.md for the comparison against the
+	// alternatives.
+	github.com/quagmt/udecimal v1.10.1
+
+	// x/sync is the Go team's own module, versioned separately from the
+	// standard library. errgroup is a WaitGroup that also propagates the first
+	// error and cancels a shared context; availability.go uses it to run two
+	// listings at once, and Stage 7 uses its SetLimit as the bounded worker
+	// pool. singleflight, in the same module, collapses duplicate in-flight
+	// requests in Stage 5.
+	//
+	// Pinned to v0.18.0 rather than latest on purpose: from v0.20.0 the module
+	// requires Go 1.25, and adopting it would silently drag this module's floor
+	// up with it — breaking the promise the `go` line above makes to consumers
+	// still on 1.24. `go get golang.org/x/sync@latest` does exactly that, with
+	// nothing but a line in its output to say so.
+	golang.org/x/sync v0.18.0
+)
