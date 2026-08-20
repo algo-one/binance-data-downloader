@@ -22,3 +22,7 @@ mise.local.toml
 
 # macOS.
 .DS_Store
+
+# Claude Code local settings are gitignored globally (~/.gitignore_global),
+# but this project commits them so the questions.md deny rule is shared.
+!.claude/settings.local.json
