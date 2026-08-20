@@ -4,18 +4,29 @@ Download and cache historical Binance market data — as a Go library and as a
 command-line tool.
 
 ```go
-loader, err := binancedata.NewLoader(binancedata.WithCacheDir("~/.cache/bmd"))
+// No options needed: the cache lands in the OS cache directory.
+loader, err := binancedata.NewLoader()
+
 klines, err := loader.Fetch(ctx, binancedata.Request{
     Symbol:   "BTC/USDT",
     Interval: binancedata.Interval1h,
+    Market:   binancedata.MarketSpot,
     Start:    start,
-    End:      end,
+    End:      end, // leave zero for "now, at call time"
 })
 ```
 
-> **Status: under construction.** Stage 0 (scaffolding and tooling) is complete.
-> The API above is the target, not yet the reality — see
-> [docs/architecture.md](docs/architecture.md) for the staged plan.
+Ranges are half-open — `Start` included, `End` excluded — so a full year of 2024
+is `Start` 2024-01-01 and `End` 2025-01-01.
+
+For a range too large to hold in memory, `loader.Stream(ctx, req)` yields the
+same candles one at a time; `loader.FetchAll(ctx, reqs)` runs several requests
+under one concurrency budget and deduplicates the archives they share.
+
+> **Status: under construction.** Stages 0–7 are complete: the library API above
+> works today. The `bmd` command-line tool is Stage 8 and its subcommands are
+> still stubs — see [docs/architecture.md](docs/architecture.md) for the staged
+> plan.
 
 ## Why
 
@@ -34,7 +45,7 @@ That is what this does.
 
 **Exact numbers.** Prices and volumes are
 [`udecimal.Decimal`](https://github.com/quagmt/udecimal), not `float64`.
-Binance quote volumes reach 19 significant digits; `float64` carries 15.95, and
+Binance quote volumes reach 20 significant digits; `float64` carries 15.95, and
 no `int64` fixed-point scale spans the range either — real PEPE daily volume
 overflows `int64` at 1e8 scaling, silently and negatively. The archives are
 text, the numbers in them are exact, and this library keeps them that way.

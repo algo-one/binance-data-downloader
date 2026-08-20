@@ -1,9 +1,10 @@
 # Architecture
 
 > **Status:** design document. Stages 0 (scaffolding), 1 (domain types),
-> 2 (time and availability), 3 (parsing), 4 (downloader) and 5 (cache) are
-> complete; the packages described below arrive stage by stage. Sections marked
-> *planned* describe code that does not exist yet.
+> 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache),
+> 6 (REST fetcher) and 7 (loader orchestration) are complete; the packages
+> described below arrive stage by stage. Sections marked *planned* describe code
+> that does not exist yet.
 
 ## What the library does
 
@@ -119,9 +120,11 @@ Request ──► PLAN ──────► []chunk ──► EXECUTE ───
 **Plan** (`internal/plan`) — pure functions, no I/O. `Expand` turns a resolved
 `Request` into chunks, each one of `KindMonthlyArchive`, `KindDailyArchive` or
 `KindRESTRange`; `Substitute` is the pure rule for what to try when an archive
-turns out to be missing (month → days → REST). All calendar logic lives here,
-and the package imports only `errors`, `fmt` and `time` — so it is *incapable*
-of I/O, not merely expected to avoid it.
+turns out to be missing (month → days → REST); `Consolidate` is the threshold
+that decides whether a partly-wanted month is cheaper as one archive or as its
+days, and takes availability as a predicate so that it can stay pure. All
+calendar logic lives here, and the package imports only `errors`, `fmt` and
+`time` — so it is *incapable* of I/O, not merely expected to avoid it.
 
 The chunks are sorted, contiguous and cover the whole requested range, and
 `Expand` verifies that itself on every call rather than trusting the arithmetic.
@@ -129,17 +132,22 @@ The check is one pass over a handful of chunks, and it converts the only failure
 mode nobody would notice — a missing day in the middle of a range, returned with
 no error — into a loud one.
 
-**Execute** — one bounded worker pool (`errgroup.SetLimit`) over a flat list of
-chunks. `singleflight` collapses duplicate chunks across overlapping requests.
-Context cancellation reaches every goroutine.
+**Execute** — one bounded worker pool over a flat list of chunks, limited by a
+semaphore held on the `Loader` so the budget spans calls rather than one
+`errgroup`. `singleflight` collapses duplicate chunks across overlapping
+requests. Context cancellation reaches every goroutine.
 
 The flatness is the point. Nested limits — one for months, another for the days
 inside a month — deadlock or starve as soon as an outer unit holds a permit
 while merely *waiting* on its constituent inner units: a task occupying a slot
 while doing nothing. One queue of uniform work units cannot have that problem.
 
-**Reduce** — chunks arrive already sorted; merge, deduplicate on `open_time`,
-and trim to the requested range.
+**Reduce** — chunks arrive already sorted, and in order, so there is no separate
+merge pass: trimming to the requested range and dropping anything that does not
+strictly follow the last candle yielded is the whole of it. Doing it inline means
+a duplicate is dropped before it is yielded rather than after the range has been
+assembled, which is what lets `Stream` bound its memory. See "Orchestration"
+below.
 
 ## Downloading
 
@@ -320,6 +328,14 @@ other than the Unix epoch:
 | `3d` | Three-day multiples from **1970-01-02** | Measured against live archives for 2018-01, 2021-06, 2024-03/04/05 and 2025-02. The grid does not restart monthly: March 2024's last candle opens on the 31st, April's first on the 3rd |
 | `1w` | Monday 00:00 UTC | The epoch was a Thursday, so "multiples of seven days" rejects every real weekly candle |
 | `1mo` | The 1st, 00:00 UTC | Calendar months are 28–31 days and have no fixed duration |
+
+The grid is read in two directions. `aligned` asks whether an instant sits on it,
+which is what validates a decoded candle; `alignUp` computes the next instant
+that does, which is what lets the loader ask whether a candle could have opened
+and closed inside a span. They are kept together in `codec.go` and tested against
+each other rather than against a list of answers, because two functions
+disagreeing about where the grid lines fall is a bug with no symptom — a candle
+quietly treated as missing, or a gap quietly excused.
 
 ### `CodecVersion`
 
@@ -521,6 +537,192 @@ that one difference — it leaves the 404 untyped, where the shared translation
 would make it `ErrNotAvailable` and Stage 7's requirement-4 policy would degrade
 the whole REST tail to nothing and report success.
 
+## Orchestration
+
+`loader.go` is the arrangement everything below it was built for: probe what
+Binance published, decide where each chunk comes from, run them without swamping
+anything, and join the results back into one contiguous range. Six things about
+it were decided rather than defaulted.
+
+**The listing is consulted before anything is fetched.** `Expand` assumes every
+archive it names exists, because it has no network to ask with; the bucket
+listing already knows better, and `archiveIndex.has` was sitting unused since
+Stage 2 for exactly this. `Loader.route` walks the plan and settles it against
+what the bucket actually holds, in both directions.
+
+*Downgrade*: an archive the listing does not have goes down the ladder before a
+request is spent discovering it, which turns the real `BTCUSDT-1mo-2024-03` hole
+from a 404, a fan-out into thirty-one daily chunks that do not exist either, and
+sixty-two more 404s, into a REST range chosen before a request is spent.
+
+*Upgrade*: a run of daily chunks becomes the month covering it when that month
+exists and enough of it is wanted — the threshold below. This runs first, and the
+order is the whole point: consolidating onto a month that turns out to be absent
+is strictly worse than not consolidating, because the downgrade then fans out the
+entire month instead of the days that were asked for.
+
+The index is authoritative for this because of where the listing seeks from. It
+is marked at the 1st of the month the range starts in, which is at or before
+every chunk `Expand` can emit — monthly chunks begin on the 1st, daily ones at a
+midnight inside the range. A marker any later would have `has` answer "not
+listed" for periods it was never asked about, which is the failed-lookup-read-as
+-absent conflation the whole availability design exists to prevent.
+
+**Adjacent REST ranges are joined.** Substitution produces runs of them: a month
+that was never published becomes thirty-one days that were never published
+either, each falling through to its own REST range. Fetching those separately is
+thirty-one paginated calls against the one endpoint in this library with a quota,
+to learn thirty-one times over that Binance has nothing there. Joining is exact
+rather than approximate because the ranges are half-open, so "adjacent" is
+`End.Equal(Start)` and nothing has to be added or subtracted.
+
+**The plan phase runs under a permit too.** The bucket listing is I/O — two
+concurrent requests for most intervals — and it happens before any chunk is
+fetched, so a limit taken only per chunk does not bound it at all. `FetchAll`
+over *N* requests opened 2*N* simultaneous listings whatever `WithConcurrency`
+said, and did it at the one moment of the call when every request is at the same
+stage. That is the shape that earns a 429 and then the 418 the pause is written
+not to wait out. The permit is released before the chunks are fetched, so nothing
+holds one while waiting for another.
+
+What is *not* deduplicated is the listing itself: two requests for the same
+symbol and interval list the bucket twice, because the index is built per call.
+Memoising it would mean caching "this month does not exist yet", which is how a
+process decides at 00:05 that today has no data and believes it until restarted.
+
+**The pool is flat, and permits are taken in chunk order.** One queue of uniform
+work units, one limit, and nothing acquires a permit while holding one — a chunk
+that turns out to be missing is expanded and fetched *inside* the permit it
+already has, sequentially. That is slower in the rare case and incapable of the
+nested-semaphore deadlock in every case.
+
+The ordering is the part that is easy to miss. `Stream` gives each chunk an
+unbuffered channel and consumes them in order, so a worker holds its permit until
+its candles have been taken — which is the backpressure that bounds memory to the
+concurrency limit rather than to the length of the range. That arrangement
+deadlocks if a later chunk can take the last permit while an earlier one is still
+waiting for one, so permits are acquired by a producer goroutine in chunk order,
+before each worker is launched. The chunk the consumer is waiting for is
+therefore always already running.
+
+It is a semaphore on the `Loader` rather than `errgroup.SetLimit` for one reason:
+`SetLimit` bounds a single group, and the limit has to span calls. `FetchAll`
+over twenty requests uses the same budget as one `Fetch`, or the setting would
+mean twenty times what it says.
+
+**Requirement 5 holds by construction, not by ordering.** The requirement is
+worded as "registration happens before the limit is acquired", which describes
+the shape of the bug it came from: the ported implementation checked, then took a
+permit, then registered, so a saturated pool let several tasks through the gap.
+Here the check, the registration and the work are all inside `singleflight`,
+which holds its own lock across them — so nothing can come between them and the
+permit's position does not matter. `TestConcurrentRequestsFetchAnArchiveOnce`
+saturates the pool deliberately, holding the first archive request open in the
+server until all eight callers have queued behind it, because a test that merely
+starts eight goroutines passes just as happily when the deduplication is missing.
+
+**A rate limit pauses the pipeline; a ban stops it.** By the time an error
+reaches this layer, `internal/vision` has already retried four times with
+backoff, so a 429 that survives is not a statement about one request — it says
+the pool is too wide or the range too large, and only the layer holding the pool
+can act on that. A shared gate closes for the server's own `Retry-After`, clamped
+to `[1 s, 60 s]` and never shortened by a second worker hitting the same 429, and
+the chunk is retried at most twice. HTTP 418 is the exception: the address is
+barred for two minutes to three days, so waiting is not a strategy and retrying
+earns the next, longer one. It is reported immediately.
+
+The clamp exists on both sides. `RateLimitError.RetryAfter` is reported verbatim
+and can be zero — Binance sending none, or an HTTP-date a fast clock reads as
+already elapsed — and a zero pause is no pause, which has every worker re-fire at
+a server that just said it was overloaded. The ceiling is there because the value
+is somebody else's number, and a misconfigured proxy answering "retry after 24
+hours" must not hang a backtest until tomorrow.
+
+**An empty span is an error, and "empty" is defined precisely.** Requirement 4
+says a 404 degrades that chunk only, and the fallback ladder is what delivers
+that — the day is recovered from REST and the month still returns. What is left
+is the bottom of the ladder: a chunk that produced no candles from any source.
+That fails the whole call, with an error wrapping `ErrNotAvailable` naming the
+span, and no partial result alongside it.
+
+The question is asked about the **intersection of the chunk with the request**,
+never about the chunk alone, and both directions of that matter. A chunk covers
+more than the request routinely — archives are indivisible and consolidation
+widens plans further — so a delisted pair whose final monthly archive holds the
+first ten days of a month is not *empty*, and a check on the chunk's own extent
+would pass it, trim every candle away and return success with nothing in it.
+Pointing the other way, a monthly chunk substituted into days yields daily chunks
+lying entirely before the request, which have no data because the pair had not
+listed yet; failing the call for those fails a request whose own range is
+completely available. An empty intersection is therefore skipped outright. A backtest handed 22 candles for a
+31-day month cannot tell "the market was quiet" from "nine days are missing", and
+every number computed from the second is wrong with no sign that it is.
+
+The definition has to exclude the present or it would fire on every ordinary
+request. A range ending at "now" ends part-way through a candle that has not
+closed, and unclosed candles are deliberately dropped, so the final chunk
+routinely produces nothing. `expectsCandles` therefore asks a precise question:
+could a candle have both *opened and closed* inside this chunk by now? `alignUp`
+finds the first open time on the grid at or after the chunk's start, and it
+counts only if it falls inside the chunk and its interval has elapsed.
+
+Note what is not checked. Whether the chunk is *full* is never asked — archives
+are legitimately partial, `SHIBUSDT-1d-2021-05` holding 22 rows for a 31-day
+month because the pair listed on the 10th — so a completeness test here would
+reject real data. It is the same one-directional rule `codec.go` applies to rows,
+one level up.
+
+So the guarantee reaches as far as the chunk, which is the granularity Binance
+publishes at, and that is worth stating rather than implying. In practice the
+case that matters is caught anyway, because an absent period is an absent
+*archive*: asking for BTCUSDT from 2015 makes every month before 2017-08 a chunk
+of its own with nothing in it. What is not caught is a pair that began trading
+part-way through a month whose archive does exist — the range then starts at the
+first real candle rather than at `Start`, with no error.
+
+**One consequence worth stating: an error can leave the cache warmer.** A failing
+chunk cancels its siblings, but a download the cache has already started is not
+stopped — it finishes and populates the cache for the next run, which is the
+right trade for a directory that outlives the process. So `Fetch` can return an
+error while bytes are still being written, and a program that deletes its cache
+directory immediately after a failure is racing work it cannot see. Retrying,
+which is the ordinary response, is the case this is optimised for.
+
+### Partial months, and the comment that contradicted the code
+
+`Expand` used to fan a partly-wanted month out into up to 31 daily chunks, while
+`Chunk`'s own doc comment argued 130 lines above that over-fetching a whole month
+"is not waste in a cache-backed library". Both cannot be right, and Stage 7 owned
+the decision.
+
+Neither end of it is right for both shapes of request. Twenty-five days of
+January as daily downloads is fifty requests to avoid fetching six days nobody
+asked for, and it leaves the cache holding twenty-five files that the next
+request for January cannot use as a month. One day of January as a monthly
+download is 93 MB of 1s candles to serve 86,400 of them.
+
+So the rule is a threshold — take the month once at least half of it is wanted,
+days otherwise — and the comment now states it. Over-fetching genuinely is cheap
+here, but "cheap" is a claim about the ratio between what was fetched and what
+was wanted, and that ratio is what the threshold bounds: the worst monthly
+over-fetch is just under 2× and the worst daily request count is 62.
+
+**Where the rule is applied matters as much as the rule.** It went into `Expand`
+first, tested against `Spec.ArchivesThrough` — and that cannot answer the
+question it was asked. `ArchivesThrough` is the later of the monthly and daily
+frontiers, so it says whether a period is before the frontier, not whether a
+monthly archive for it exists. Dailies lag real time by about a day and monthlies
+by up to a month plus that day, so the two disagree for most of every month, and
+in exactly that window `Expand` would pick a whole-month chunk for a month
+Binance has not written yet. The chunk 404s, `Substitute` fans out the entire
+month, and a request for twenty days of February costs twenty-nine daily archives
+— worse than the plan before the threshold existed.
+
+The trade is only sound with the listing in hand, so it lives in
+`plan.Consolidate`, which takes availability as a predicate and stays pure, and
+is called from `Loader.route`, which has the index. `Expand` is availability-blind
+again, which is what it was always documented to be.
+
 ## Package layout
 
 ```
@@ -539,8 +741,8 @@ the whole REST tail to nothing and report success.
 ├── cache.go          the two tiers, atomic writes, singleflight
 ├── parquet.go        tier 2: the schema, the footer stamp, the column reader
 ├── restapi.go        the REST tail: pagination, partial-candle policy
-├── options.go        functional options for NewLoader                        (planned)
-├── loader.go         Fetch / FetchAll / Stream                               (planned)
+├── options.go        functional options, Progress, Source
+├── loader.go         plan/execute/reduce; Fetch / FetchAll / Stream
 │
 ├── internal/
 │   ├── plan/         range → []Chunk (pure; imports only errors, fmt, time)
@@ -614,8 +816,8 @@ the root is a mechanical rename, not a redesign.
 
 ## Public API
 
-The domain types exist as of Stage 1 and `Request` as of Stage 2. `Loader` and
-the options are still *planned*.
+The domain types exist as of Stage 1, `Request` as of Stage 2, and `Loader`
+with its options as of Stage 7. This is the whole surface.
 
 ```go
 type Request struct {
@@ -630,10 +832,40 @@ func (r Request) Validate() error
 
 func NewLoader(opts ...Option) (*Loader, error)
 
+func WithCacheDir(dir string) Option
+func WithConcurrency(n int) Option
+func WithHTTPClient(c *http.Client) Option
+func WithProgress(fn func(Progress)) Option
+func WithLogger(l *slog.Logger) Option
+
 func (l *Loader) Fetch(ctx context.Context, req Request) ([]Kline, error)
 func (l *Loader) FetchAll(ctx context.Context, reqs []Request) (map[Request][]Kline, error)
 func (l *Loader) Stream(ctx context.Context, req Request) iter.Seq2[Kline, error]
+
+type Progress struct {
+    Request     Request   // the request this work belongs to, resolved
+    Source      Source    // monthly archive, daily archive or REST
+    Start, End  time.Time // the chunk's own range
+    Klines      int       // candles it produced, before merging and trimming
+    Total, Done int       // chunks planned, chunks finished
+    Err         error
+}
 ```
+
+### `WithoutChecksumVerify` was dropped rather than built
+
+Earlier drafts of this API listed it. It cannot be honoured, and the reason is
+structural rather than a matter of taste. The `.CHECKSUM` sidecar's hash is not
+only a safety check — it is half of the Parquet stamp, so it is what tells a
+cached derived file whether it still matches the archive it was built from. An
+option that skipped it could only be a no-op, or could only work by disabling
+tier 2 and paying the 62 ms CSV parse on every read instead of 6 ms.
+
+It also saves nothing. The sidecar is 91 bytes and is fetched first regardless,
+and the SHA-256 is computed by an `io.MultiWriter` on a copy that has to happen
+anyway. `ensureArchive` never re-hashes an archive already on disk, so there is
+no expensive re-check to turn off either. Verification stays non-optional, which
+is what requirement 9 and `docs/caching.md` already assumed.
 
 **Ranges are half-open**: `Start` is included, `End` is excluded, so a full year
 of 2024 is `Start` 2024-01-01 and `End` 2025-01-01. This is what lets the pieces
@@ -722,8 +954,8 @@ because they are easy to get subtly wrong and silent when they are.
 | 1 | The end of a request range is resolved **per call**, never captured once at construction — a long-running process must not drift onto a stale end date | 2 ✅ |
 | 2 | Month-boundary comparisons anchor on the 1st of the month. A range such as `2024-12-20` → `2025-01-03` must not be misclassified as "current month", which **silently drops the last days** | 2 ✅ |
 | 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 ✅ |
-| 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns. A 404 from the *REST* endpoint is not this: it answers an empty range with 200, so a 404 there is a misconfiguration and stays untyped | 4 (typed error) → 6 (the REST distinction) → 7 (policy) |
-| 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 5 ✅ (the cache owns the key) → 7 (the pool sits outside it) |
+| 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns. A 404 from the *REST* endpoint is not this: it answers an empty range with 200, so a 404 there is a misconfiguration and stays untyped | 4 (typed error) → 6 (the REST distinction) → 7 ✅ (policy) |
+| 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 5 ✅ (the cache owns the key) → 7 ✅ (the pool sits outside it) |
 | 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 ✅ |
 | 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 ✅ |
 | 8 | One `http.Client` is shared for the process, so connections are reused rather than reopened per request | 4 ✅ |
@@ -746,7 +978,7 @@ setting is a defect, not a stub.
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | **done** |
 | 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | **done** |
 | 6 | REST fetcher — pagination for the recent tail, rate limiting | **done** |
-| 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | |
+| 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | **done** |
 | 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress | |
 | 9 | Docs and release — runnable examples, pkg.go.dev polish, v0.1.0 | |
 
@@ -755,7 +987,7 @@ setting is a defect, not a stub.
 | Dependency | Purpose | Stage |
 | --- | --- | --- |
 | `github.com/quagmt/udecimal` | Exact prices and volumes | 1 |
-| `golang.org/x/sync` | `errgroup` (the two availability listings in parallel, then the Stage 7 bounded pool), `singleflight` (dedup) | 4 |
+| `golang.org/x/sync` | `errgroup` (the two availability listings in parallel; in Stage 7 the loader's error collection and cancellation, with the concurrency bound itself a semaphore so it can span calls), `singleflight` (dedup) | 4 |
 | `github.com/parquet-go/parquet-go` | Tier-2 cache and CLI export; pure Go. Raised the module's floor from Go 1.24.0 to 1.24.9, which it declares from v0.26.0 onward — accepted deliberately as a patch-level bump; see `go.mod` | 5 |
 | `golang.org/x/time` | `rate.Limiter`, the token bucket pacing the REST endpoint | 6 |
 
@@ -805,3 +1037,15 @@ and cross-compilation.
   first request inside the server until the other seven callers have queued
   behind it, because a test that merely starts goroutines and counts requests
   passes just as happily when the deduplication is missing.
+- **The loader is tested against three fake hosts at once.** `loader_test.go`
+  stands up an `httptest.Server` for each of the listing, archive and REST
+  endpoints, and counts what each was asked for. That is what makes "the plan
+  avoided a request" a testable claim: a test that only checks the candles came
+  back passes just as happily when the pipeline made sixty-two pointless round
+  trips getting them.
+- **Grid functions are checked against each other, not against a list.**
+  `aligned` tests whether an instant sits on a candle grid and `alignUp` computes
+  the next one that does, and two functions disagreeing about where the grid
+  lines fall would be silent. The test states the relationship — the answer is on
+  the grid, is not before the input, and skips no grid point in between — and
+  sweeps it across all sixteen intervals.

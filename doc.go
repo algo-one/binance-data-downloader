@@ -5,10 +5,38 @@
 // of candles and get them back quickly on every run, without re-downloading or
 // re-parsing anything it has already seen.
 //
+// # Getting started
+//
+// Build a [Loader] once and share it — one per process. It is safe for
+// concurrent use, and the concurrency limit, the connection pool and the REST
+// rate limiter all live on it, so two Loaders each pacing themselves correctly
+// would still exceed Binance's per-IP quota together.
+//
+//	loader, err := binancedata.NewLoader()
+//	if err != nil {
+//	    return err
+//	}
+//
+//	klines, err := loader.Fetch(ctx, binancedata.Request{
+//	    Symbol:   "BTC/USDT",
+//	    Interval: binancedata.Interval1h,
+//	    Market:   binancedata.MarketSpot,
+//	    Start:    start,
+//	    End:      end, // leave zero for "now, at call time"
+//	})
+//
+// Ranges are half-open: Start is included and End is excluded, so a full year
+// of 2024 is Start 2024-01-01 and End 2025-01-01. See [Request] for why that
+// matters more than it looks.
+//
+// [Loader.Stream] yields the same candles one at a time for a range too large
+// to hold at once, and [Loader.FetchAll] runs several requests under one
+// concurrency budget, downloading whatever they have in common exactly once.
+//
 // # Status
 //
-// Under construction. This file currently describes the intended API; the
-// types below arrive stage by stage. See docs/architecture.md for the plan.
+// The library is complete as of Stage 7. The bmd command-line tool is Stage 8
+// and its subcommands are still stubs. See docs/architecture.md for the plan.
 //
 // # Where the data comes from
 //

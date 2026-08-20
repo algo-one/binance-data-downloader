@@ -102,12 +102,36 @@ func (k Kind) String() string {
 // Chunk is one unit of work: a source and the half-open range it covers.
 //
 // For an archive chunk the range is the archive's own extent — a whole calendar
-// month or a whole day — regardless of how much of it the request wanted. A
-// request for two days in the middle of January produces two daily chunks, but
-// a request for a single day at an interval that has no daily archives produces
-// one monthly chunk spanning all of January. Downloading a whole month to serve
-// one day of it is not waste in a cache-backed library; it is the next eleven
-// requests already answered.
+// month or a whole day — regardless of how much of it the request wanted, so a
+// chunk routinely covers more than was asked for and the reduce step trims the
+// result.
+//
+// # How much more
+//
+// A month that is wanted in full, or wanted at an interval with no daily
+// archives, is always one monthly chunk. The interesting case is a month that
+// is published in full and wanted in part, and there the answer is a trade
+// rather than a principle:
+//
+//	                        requests        bytes
+//	31 daily archives       62 (a zip and a sidecar each)   only the days wanted
+//	1 monthly archive       2                               the whole month
+//
+// Neither end of that is right for both shapes of request. Twenty-five days of
+// January as twenty-five daily downloads is fifty requests to avoid fetching
+// six days nobody asked for, and it leaves the cache holding twenty-five files
+// that the next request for January cannot use as a month. One day of January
+// as a monthly download is 93 MB of 1s candles to serve 86,400 of them.
+//
+// So the rule is a threshold: take the month once at least half of it is
+// wanted, and take days otherwise. Over-fetching really is cheap in a
+// cache-backed library — it is the next eleven requests already answered — but
+// "cheap" is a claim about the ratio between what was fetched and what was
+// wanted, and that ratio is what the threshold bounds.
+//
+// The rule lives in [Consolidate] rather than in [Expand], because it is only
+// sound when the monthly archive actually exists, and only the bucket listing
+// knows that.
 type Chunk struct {
 	Kind  Kind
 	Start time.Time // inclusive
@@ -235,7 +259,21 @@ func Expand(s Spec) ([]Chunk, error) {
 
 		// A monthly archive is usable when the whole month falls inside the
 		// part of the range archives cover. A month that is only partly
-		// requested, or only partly published, is not — it goes to dailies.
+		// requested, or only partly published, is not — it goes to dailies,
+		// and [Consolidate] decides afterwards whether the month was the
+		// cheaper fetch after all.
+		//
+		// That split is deliberate and was not always here. The threshold used
+		// to live in this loop, tested against ArchivesThrough — which is the
+		// later of the monthly and daily frontiers, so it answers "is this
+		// period before the frontier?" and not "does a monthly archive for it
+		// exist?". Those differ for most of every month, because dailies lag
+		// real time by a day and monthlies by up to a month plus that day, and
+		// picking a whole-month chunk for a month Binance has not published
+		// yet is the worst of both: the substitution then fans out the entire
+		// month rather than the days that were wanted. Only the bucket listing
+		// can answer the question the trade-off actually rests on, and this
+		// package cannot see it — so the decision moved to where it can.
 		wholeMonthCovered := !mStart.Before(s.Start) && !mEnd.After(archiveEnd)
 
 		switch {
@@ -285,6 +323,91 @@ func Expand(s Spec) ([]Chunk, error) {
 	return chunks, nil
 }
 
+// Consolidate replaces runs of daily chunks with the monthly archive covering
+// them, wherever that month exists and enough of it is wanted.
+//
+// monthExists is asked about the first instant of a month and must answer from
+// the bucket listing. It is a parameter rather than a lookup because this
+// package has no network and is not allowed one — see the package comment — so
+// the caller supplies the one fact the trade-off turns on.
+//
+// # Why this is not part of Expand
+//
+// The threshold trades requests against bytes: one monthly download instead of
+// up to sixty-two daily ones, at the cost of fetching days nobody asked for.
+// That trade is only worth making if the monthly archive is there. If it is
+// not, the chunk 404s and [Substitute] fans it back out into *every* day of the
+// month rather than the days that were wanted — strictly worse than never
+// having consolidated, and worse than the plan before the threshold existed.
+//
+// This used to be decided inside [Expand], against Spec.ArchivesThrough, which
+// cannot answer the question: it is the later of the monthly and daily
+// frontiers, so for most of every month it says "published" about a month whose
+// archive Binance has not written yet. Daily archives lag real time by about a
+// day and monthly ones by up to a month plus that day, so the window in which
+// the two disagree is not an edge case — it is most of the time.
+//
+// # What it will not do
+//
+// Cross a month boundary, reorder anything, or touch a chunk that is not a
+// daily archive. Runs are maximal within one calendar month, and the monthly
+// chunk that replaces one covers at least the run's own span, so coverage is
+// preserved — wider, never narrower, which is what [Chunk] documents as normal.
+func Consolidate(chunks []Chunk, monthExists func(time.Time) bool) []Chunk {
+	if monthExists == nil {
+		// No listing, no upgrade. Returning the plan unchanged is the safe
+		// direction: it fetches exactly what was asked for.
+		return chunks
+	}
+
+	out := make([]Chunk, 0, len(chunks))
+
+	for i := 0; i < len(chunks); {
+		// Anything that is not a daily archive passes straight through.
+		if chunks[i].Kind != KindDailyArchive {
+			out = append(out, chunks[i])
+			i++
+
+			continue
+		}
+
+		// Take every consecutive daily chunk that falls inside this month, and
+		// note whether they were contiguous.
+		//
+		// Contiguity is checked rather than assumed. Expand emits contiguous
+		// days, so a gap cannot arrive from there — but if one ever did, the
+		// month covering the days *around* the gap also covers the gap, and
+		// emitting it beside the days that were kept would put two chunks over
+		// the same dates. That is not a data error (the reduce step
+		// deduplicates on open time) but it is a download of the same month
+		// twice over, which is the opposite of what consolidating is for. A
+		// month whose days do not form one run is therefore left alone
+		// entirely.
+		mStart := monthStart(chunks[i].Start)
+		mEnd := mStart.AddDate(0, 1, 0)
+
+		j, contiguous := i+1, true
+
+		for j < len(chunks) && chunks[j].Kind == KindDailyArchive && chunks[j].Start.Before(mEnd) {
+			if !chunks[j].Start.Equal(chunks[j-1].End) {
+				contiguous = false
+			}
+
+			j++
+		}
+
+		if contiguous && monthExists(mStart) && worthWholeMonth(chunks[i].Start, chunks[j-1].End, mStart, mEnd) {
+			out = append(out, Chunk{KindMonthlyArchive, mStart, mEnd})
+		} else {
+			out = append(out, chunks[i:j]...)
+		}
+
+		i = j
+	}
+
+	return out
+}
+
 // Substitute returns the chunks to try in place of one that turned out not to
 // exist, or an error if there is nothing left to try.
 //
@@ -296,8 +419,13 @@ func Expand(s Spec) ([]Chunk, error) {
 //	monthly archive ──► daily archives ──► REST range
 //	                    (skipped when the interval has none)
 //
-// The returned chunks cover exactly the same range as the one passed in, so a
-// caller can splice them in place without re-checking coverage.
+// The returned chunks are contiguous and cover *at least* the range passed in,
+// so a caller can splice them in where the chunk used to be. At least, rather
+// than exactly, for the reason [Chunk] gives: a daily archive is a whole day
+// and cannot be cut, so replacing a chunk that begins at 07:00 means beginning
+// at the midnight before it. Substituting is therefore the one operation that
+// can make a plan overlap itself, and the reduce step — which deduplicates on
+// open time — is what absorbs that.
 func Substitute(c Chunk, hasDaily bool) ([]Chunk, error) {
 	switch c.Kind {
 	case KindMonthlyArchive:
@@ -309,8 +437,16 @@ func Substitute(c Chunk, hasDaily bool) ([]Chunk, error) {
 			return []Chunk{{KindRESTRange, c.Start, c.End}}, nil
 		}
 
+		// dayStart, not c.Start. Binance names a daily archive after a date
+		// and nothing else, so every chunk of this kind must sit at midnight
+		// UTC — a loop starting from c.Start verbatim yields 07:00 chunks for
+		// a 07:00 input, which name archives that do not exist and 404 their
+		// way to the REST API one day at a time. Expand only ever emits
+		// month-aligned monthly chunks, so nothing reaches this with a ragged
+		// start today; snapping here is what keeps that a fact about Expand
+		// rather than a precondition this function silently depends on.
 		var days []Chunk
-		for d := c.Start; d.Before(c.End); d = d.AddDate(0, 0, 1) {
+		for d := dayStart(c.Start); d.Before(c.End); d = d.AddDate(0, 0, 1) {
 			days = append(days, Chunk{KindDailyArchive, d, d.AddDate(0, 0, 1)})
 		}
 
@@ -372,6 +508,38 @@ func verifyCoverage(chunks []Chunk, start, end time.Time) error {
 	}
 
 	return nil
+}
+
+// day is the length of a calendar day in UTC, which is the only calendar this
+// package deals in. Named so that the divisions in [worthWholeMonth] read as
+// counting days rather than as duration arithmetic.
+//
+// It is exactly 24 hours because these instants are UTC and UTC has no
+// daylight saving. The same expression against a zoned time would be wrong
+// twice a year, which is why every boundary in this package is built with
+// time.Date in time.UTC rather than by adding durations.
+const day = 24 * time.Hour
+
+// worthWholeMonth reports whether a month wanted only in part is nonetheless
+// cheaper to fetch as its monthly archive. [Consolidate] is the only caller.
+//
+// from and to bound the part still wanted; mStart and mEnd bound the month.
+// The rule is half: 16 days of a 31-day January take the month, 15 take the
+// days. See [Chunk] for the two costs being traded off, and note that both
+// sides of the trade are bounded — the worst monthly over-fetch is just under
+// 2× what was wanted, and the worst daily request count is 62.
+//
+// The division truncates, and deliberately: a partial day at either end is not
+// a day's worth of archive, and rounding it up would let a range of a few
+// hours either side of midnight count as two days. Truncating makes the
+// threshold err towards daily archives, which is the cheaper mistake — it
+// fetches too little rather than too much, and the next request warms the
+// cache properly.
+func worthWholeMonth(from, to, mStart, mEnd time.Time) bool {
+	wanted := int(to.Sub(from) / day)
+	total := int(mEnd.Sub(mStart) / day)
+
+	return wanted*2 >= total
 }
 
 // monthStart returns midnight UTC on the 1st of t's month.

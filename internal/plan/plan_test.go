@@ -121,6 +121,9 @@ func TestExpand(t *testing.T) {
 			want: []Chunk{monthly(2024, 1), monthly(2024, 2), monthly(2024, 3)},
 		},
 		{
+			// Expand is availability-blind, so a partial month always becomes
+			// days here. Whether the month was the cheaper fetch after all is
+			// [Consolidate]'s question, because only the listing can answer it.
 			name: "partial first month falls back to dailies",
 			spec: Spec{
 				Start: utc(2024, 1, 15), End: utc(2024, 3, 1),
@@ -466,6 +469,22 @@ func TestSubstitute(t *testing.T) {
 			want:     []Chunk{rest(utc(2024, 5, 7), utc(2024, 5, 8))},
 		},
 		{
+			// Expand only ever emits month-aligned monthly chunks, so nothing
+			// in this library can reach this case today — which is exactly why
+			// it is worth pinning. Midnight is the only time of day Binance
+			// names a daily archive after, so a substitution that starts at
+			// 07:00 asks for files that do not exist, and every one of them
+			// 404s into a REST range that the archives could have served.
+			//
+			// The days it produces necessarily overshoot the chunk they
+			// replace at both ends, for the same reason every other chunk in
+			// this package may: an archive is a whole day and cannot be cut.
+			name:     "a month that is not day-aligned still expands into whole days",
+			chunk:    Chunk{KindMonthlyArchive, utc(2024, 2, 10, 7), utc(2024, 2, 13, 0, 30)},
+			hasDaily: true,
+			want:     dailyRange(2024, 2, 10, 13),
+		},
+		{
 			name:     "a REST range has nothing left to fall back to",
 			chunk:    rest(utc(2024, 5, 7), utc(2024, 5, 8)),
 			hasDaily: true,
@@ -498,13 +517,25 @@ func TestSubstitute(t *testing.T) {
 
 			assertChunks(t, got, tt.want)
 
-			// Whatever the substitution, it must cover exactly what it
+			// Whatever the substitution, it must cover at least what it
 			// replaced — otherwise splicing it into a plan opens the gap the
-			// coverage check was built to catch.
-			if !got[0].Start.Equal(tt.chunk.Start) || !got[len(got)-1].End.Equal(tt.chunk.End) {
-				t.Errorf("substitution spans [%s,%s), replaced chunk spans [%s,%s)",
+			// coverage check was built to catch. At *least*, not exactly:
+			// daily archives are whole days, so replacing a chunk that starts
+			// mid-day means starting at the midnight before it.
+			if got[0].Start.After(tt.chunk.Start) || got[len(got)-1].End.Before(tt.chunk.End) {
+				t.Errorf("substitution spans [%s,%s), which does not cover the replaced chunk [%s,%s)",
 					got[0].Start.Format(time.RFC3339), got[len(got)-1].End.Format(time.RFC3339),
 					tt.chunk.Start.Format(time.RFC3339), tt.chunk.End.Format(time.RFC3339))
+			}
+
+			// And it must be contiguous within itself, since the whole point
+			// of a substitution is that it can be spliced in where the chunk
+			// it replaces used to be.
+			for i := 1; i < len(got); i++ {
+				if !got[i].Start.Equal(got[i-1].End) {
+					t.Errorf("substitute chunk %d (%s) does not continue from %d (%s)",
+						i, got[i], i-1, got[i-1])
+				}
 			}
 		})
 	}
@@ -582,4 +613,152 @@ func ExampleExpand() {
 	// 21 chunks
 	// first: daily[2026-07-28T00:00:00Z,2026-07-29T00:00:00Z)
 	// last:  rest[2026-08-17T00:00:00Z,2026-08-18T00:00:00Z)
+}
+
+// alwaysPublished and neverPublished are the two trivial listings, for cases
+// where the interesting variable is the plan rather than what exists.
+func alwaysPublished(time.Time) bool { return true }
+func neverPublished(time.Time) bool  { return false }
+
+func TestConsolidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		in     []Chunk
+		exists func(time.Time) bool
+		want   []Chunk
+	}{
+		{
+			// 16 of January's 31 days is over half, so one download beats
+			// thirty-two.
+			name:   "a run worth more than half the month becomes the month",
+			in:     dailyRange(2024, 1, 16, 31),
+			exists: alwaysPublished,
+			want:   []Chunk{monthly(2024, 1)},
+		},
+		{
+			// One day fewer is 15 of 31, and the threshold does not flip. The
+			// two cases are deliberately adjacent so the boundary is pinned
+			// rather than merely exercised.
+			name:   "a run worth less than half the month stays as days",
+			in:     dailyRange(2024, 1, 17, 31),
+			exists: alwaysPublished,
+			want:   dailyRange(2024, 1, 17, 31),
+		},
+		{
+			// The case that moved this out of Expand. The month is worth
+			// consolidating onto and does not exist, so consolidating would
+			// mean a 404 followed by a fan-out across the *whole* month —
+			// strictly worse than the days that were actually wanted.
+			name:   "a month the listing does not have is never consolidated onto",
+			in:     dailyRange(2024, 2, 5, 29),
+			exists: neverPublished,
+			want:   dailyRange(2024, 2, 5, 29),
+		},
+		{
+			name:   "with no listing at all nothing is consolidated",
+			in:     dailyRange(2024, 1, 16, 31),
+			exists: nil,
+			want:   dailyRange(2024, 1, 16, 31),
+		},
+		{
+			// Runs are maximal *within* a month. Consolidating across the
+			// boundary would produce a chunk naming an archive that does not
+			// exist, since Binance publishes one file per calendar month.
+			name:   "a run spanning a month boundary is split at it",
+			in:     append(dailyRange(2024, 1, 16, 31), dailyRange(2024, 2, 1, 29)...),
+			exists: alwaysPublished,
+			want:   []Chunk{monthly(2024, 1), monthly(2024, 2)},
+		},
+		{
+			// A hole in the run means the month does not cover the same
+			// ground, so replacing it would claim coverage of the missing day.
+			name:   "a run with a hole in it is left alone",
+			in:     append(dailyRange(2024, 1, 1, 10), dailyRange(2024, 1, 12, 31)...),
+			exists: alwaysPublished,
+			want:   append(dailyRange(2024, 1, 1, 10), dailyRange(2024, 1, 12, 31)...),
+		},
+		{
+			name: "chunks that are not daily archives pass through",
+			in: []Chunk{
+				monthly(2024, 1),
+				rest(utc(2024, 2, 1), utc(2024, 2, 5)),
+			},
+			exists: alwaysPublished,
+			want: []Chunk{
+				monthly(2024, 1),
+				rest(utc(2024, 2, 1), utc(2024, 2, 5)),
+			},
+		},
+		{
+			// The tail of a real plan: days up to the archive frontier, then
+			// the REST range past it. Only the days are eligible.
+			name:   "a daily run followed by a REST tail",
+			in:     append(dailyRange(2026, 8, 1, 16), rest(utc(2026, 8, 17), utc(2026, 8, 18))),
+			exists: alwaysPublished,
+			want: []Chunk{
+				monthly(2026, 8),
+				rest(utc(2026, 8, 17), utc(2026, 8, 18)),
+			},
+		},
+		{
+			name:   "nothing to do",
+			in:     nil,
+			exists: alwaysPublished,
+			want:   nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := Consolidate(tt.in, tt.exists)
+
+			assertChunks(t, got, tt.want)
+
+			// Whatever it did, the result must still cover everything the
+			// input covered. Consolidation may widen a plan; it may never
+			// narrow one.
+			if len(tt.in) > 0 {
+				if got[0].Start.After(tt.in[0].Start) {
+					t.Errorf("consolidated plan starts at %s, after the input's %s",
+						got[0].Start.Format(time.RFC3339), tt.in[0].Start.Format(time.RFC3339))
+				}
+
+				if got[len(got)-1].End.Before(tt.in[len(tt.in)-1].End) {
+					t.Errorf("consolidated plan ends at %s, before the input's %s",
+						got[len(got)-1].End.Format(time.RFC3339),
+						tt.in[len(tt.in)-1].End.Format(time.RFC3339))
+				}
+			}
+		})
+	}
+}
+
+// TestConsolidateThenVerifyCoverage runs the real sequence — Expand, then
+// Consolidate — and re-checks the invariant Expand guarantees, because
+// consolidation is the one step that can legitimately widen a plan and a widened
+// plan must still be a covering one.
+func TestConsolidateThenVerifyCoverage(t *testing.T) {
+	t.Parallel()
+
+	spec := Spec{
+		Start: utc(2024, 1, 16), End: utc(2024, 3, 20),
+		ArchivesThrough: farFuture, HasDaily: true, HasMonthly: true,
+	}
+
+	chunks, err := Expand(spec)
+	if err != nil {
+		t.Fatalf("Expand: %v", err)
+	}
+
+	got := Consolidate(chunks, alwaysPublished)
+
+	// January is wanted from the 16th (16 of 31, so consolidated), February
+	// whole, March to the 20th (19 of 31, so consolidated too).
+	assertChunks(t, got, []Chunk{monthly(2024, 1), monthly(2024, 2), monthly(2024, 3)})
+
+	checkCovers(t, got, spec.Start, spec.End)
 }

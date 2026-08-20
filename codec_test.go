@@ -935,3 +935,147 @@ func BenchmarkDecodeArchiveAll(b *testing.B) {
 		}
 	}
 }
+
+// TestAlignUpAgreesWithAligned checks the two halves of the grid against each
+// other rather than against a list written by hand.
+//
+// [aligned] tests whether an instant sits on the grid; [alignUp] computes the
+// next instant that does. Two functions that disagree about where the grid
+// lines fall would be a bug nobody would spot — a candle silently treated as
+// missing, or a span silently excused for holding none — so the test states the
+// relationship instead of enumerating answers:
+//
+//   - alignUp(t) is on the grid
+//   - alignUp(t) is not before t
+//   - nothing between t and alignUp(t) is on the grid
+//
+// The instants swept are deliberately awkward: a leap day, a month boundary,
+// the ms→µs switch, a Sunday, and several offsets by a prime number of seconds
+// so that nothing lands on a grid line by accident.
+func TestAlignUpAgreesWithAligned(t *testing.T) {
+	t.Parallel()
+
+	intervals := []Interval{
+		Interval1s, Interval1m, Interval3m, Interval5m, Interval15m, Interval30m,
+		Interval1h, Interval2h, Interval4h, Interval6h, Interval8h, Interval12h,
+		Interval1d, Interval3d, Interval1w, Interval1mo,
+	}
+
+	instants := []time.Time{
+		utc(2024, 1, 1),
+		utc(2024, 2, 29, 13, 47, 3),
+		utc(2024, 3, 1),
+		utc(2024, 12, 31, 23, 59, 59),
+		utc(2025, 1, 1),
+		utc(2025, 6, 15, 7, 11, 13),
+		utc(2021, 6, 6, 0, 0, 1), // a Sunday, one second in
+		utc(2018, 1, 17, 5, 0, 0),
+	}
+
+	for _, iv := range intervals {
+		for _, when := range instants {
+			got, ok := alignUp(when, iv)
+			if !ok {
+				t.Errorf("%s: alignUp(%s) reported no grid", iv, when.Format(time.RFC3339))
+
+				continue
+			}
+
+			if !aligned(got, iv) {
+				t.Errorf("%s: alignUp(%s) = %s, which is not on the grid",
+					iv, when.Format(time.RFC3339), got.Format(time.RFC3339))
+			}
+
+			if got.Before(when) {
+				t.Errorf("%s: alignUp(%s) = %s, which is earlier than its input",
+					iv, when.Format(time.RFC3339), got.Format(time.RFC3339))
+			}
+
+			// Nothing strictly between the input and the answer may be on the
+			// grid, or alignUp skipped a candle — and "overshot by exactly one
+			// period" is the mistake most likely to survive the two checks
+			// above, since it lands on the grid and is not before the input.
+			//
+			// Checked by stepping back one grid point rather than by walking
+			// forward. Walking is what this did first, one second at a time,
+			// which is only affordable for intervals of a minute or less — so
+			// fourteen of the sixteen were never checked for it at all. The
+			// previous grid point must be strictly earlier than the input; that
+			// is the same statement, exactly, and it costs one subtraction.
+			prev := previousGridPoint(got, iv)
+
+			if !prev.Before(when) {
+				t.Errorf("%s: alignUp(%s) = %s overshot — the grid point at %s is also at or after the input",
+					iv, when.Format(time.RFC3339), got.Format(time.RFC3339), prev.Format(time.RFC3339))
+			}
+
+			if !aligned(prev, iv) {
+				t.Errorf("%s: the test's own previous grid point %s is not on the grid",
+					iv, prev.Format(time.RFC3339))
+			}
+		}
+	}
+}
+
+// TestAlignUpIsIdempotentOnTheGrid: an instant already on the grid is its own
+// answer. Rounding it up to the *next* one would make expectsCandles treat the
+// first candle of every archive as absent.
+func TestAlignUpIsIdempotentOnTheGrid(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		iv   Interval
+		when time.Time
+	}{
+		{Interval1h, utc(2024, 1, 15, 13)},
+		{Interval1d, utc(2024, 1, 15)},
+		{Interval1mo, utc(2024, 2, 1)},
+		{Interval1w, utc(2024, 1, 15)}, // a Monday
+		{Interval3d, utc(2024, 3, 31)}, // measured against the live 3d grid
+		{Interval1s, utc(2025, 1, 1, 0, 0, 7)},
+	}
+
+	for _, tt := range tests {
+		if !aligned(tt.when, tt.iv) {
+			t.Fatalf("%s: the test's own instant %s is not on the grid",
+				tt.iv, tt.when.Format(time.RFC3339))
+		}
+
+		got, ok := alignUp(tt.when, tt.iv)
+		if !ok {
+			t.Errorf("%s: alignUp reported no grid", tt.iv)
+
+			continue
+		}
+
+		if !got.Equal(tt.when) {
+			t.Errorf("%s: alignUp(%s) = %s, want the input unchanged",
+				tt.iv, tt.when.Format(time.RFC3339), got.Format(time.RFC3339))
+		}
+	}
+}
+
+// TestAlignUpHasNoGridForAnUnsetInterval mirrors [aligned]: no interval, no
+// grid, and the caller is told so rather than handed a plausible instant.
+func TestAlignUpHasNoGridForAnUnsetInterval(t *testing.T) {
+	t.Parallel()
+
+	if got, ok := alignUp(utc(2024, 1, 15), Interval(0)); ok {
+		t.Errorf("alignUp with no interval returned %s and ok", got.Format(time.RFC3339))
+	}
+}
+
+// previousGridPoint returns the candle open time immediately before t, which
+// must itself be on the grid.
+//
+// It exists so that [TestAlignUpAgreesWithAligned] can state minimality as one
+// comparison for every interval, rather than only for those short enough to
+// walk. 1mo is the one that cannot be done by subtracting a duration, for the
+// same reason [intervalEnd] special-cases it: months have no fixed length.
+func previousGridPoint(t time.Time, iv Interval) time.Time {
+	if d, fixed := iv.Duration(); fixed {
+		return t.Add(-d)
+	}
+
+	return t.AddDate(0, -1, 0)
+}

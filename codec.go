@@ -148,6 +148,16 @@ const microsecondCutoff = 1e14
 //     April's first opens on the 3rd.
 var grid3d = time.Date(1970, time.January, 2, 0, 0, 0, 0, time.UTC)
 
+// grid1w is the anchor for weekly candles: the first Monday at or after the
+// epoch. 1970-01-01 was a Thursday, so that is the 5th.
+//
+// [aligned] states the same grid as "Monday, at midnight UTC", which needs no
+// anchor. This exists for [alignUp], which has to compute the next grid point
+// rather than test one, and the two must not be allowed to drift apart — the
+// test in codec_test.go checks them against each other rather than against a
+// hardcoded list.
+var grid1w = time.Date(1970, time.January, 5, 0, 0, 0, 0, time.UTC)
+
 // decodeSpec is what the caller believes the bytes contain: which interval, and
 // which half-open span of time the file covers.
 //
@@ -684,6 +694,78 @@ func aligned(t time.Time, iv Interval) bool {
 	// has ever carried sub-microsecond precision. The largest interval reaching
 	// this line is 1d, or 8.64e10 microseconds, so nothing here overflows.
 	return t.UnixMicro()%d.Microseconds() == 0
+}
+
+// alignUp returns the first candle open time at or after t, and whether the
+// interval has a grid at all.
+//
+// It is the counterpart to [aligned] — `aligned(alignUp(t, iv), iv)` is true
+// for every valid interval — and it exists because the loader has to answer a
+// question the decoder never asks: given a span of time, could a candle
+// possibly have opened *and closed* inside it by now? See [expectsCandles],
+// which is the only caller. Keeping it here rather than in loader.go is
+// deliberate: two functions that disagree about where the grid lines fall is a
+// bug nobody would spot, and the odds of that drop when they sit together.
+//
+// The three anchored intervals are handled by the same arithmetic as the
+// thirteen ordinary ones, because a grid is a grid: an anchor and a period.
+// Only 1mo needs the calendar, months having no fixed length.
+func alignUp(t time.Time, iv Interval) (time.Time, bool) {
+	// Early returns rather than a switch, for the reason [aligned] gives just
+	// above: a switch on iv reads as a promise that all sixteen intervals
+	// appear in it, when the point is that thirteen of them share one rule.
+	if iv == Interval1mo {
+		first := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+		if first.Equal(t) {
+			return t, true
+		}
+
+		return first.AddDate(0, 1, 0), true
+	}
+
+	// The two anchored-but-fixed-length intervals. Their periods come from
+	// [Interval.Duration] like everyone else's — restating 72h and 7*24h here
+	// would put the same number in two places that have to be changed
+	// together, and the whole point of this function is that a grid is just an
+	// anchor and a period.
+	d, ok := iv.Duration()
+	if !ok {
+		return time.Time{}, false
+	}
+
+	if iv == Interval1w {
+		return ceilFrom(t, grid1w, d), true
+	}
+
+	if iv == Interval3d {
+		return ceilFrom(t, grid3d, d), true
+	}
+
+	// The epoch is itself midnight UTC and every remaining interval divides 24
+	// hours evenly, so the epoch is their common anchor. This is the same
+	// statement [aligned] makes with a modulo.
+	return ceilFrom(t, time.Unix(0, 0).UTC(), d), true
+}
+
+// ceilFrom rounds t up to the next multiple of period measured from anchor,
+// returning t itself when it already sits on one.
+//
+// Go's integer division truncates towards zero rather than towards negative
+// infinity, which is the detail that makes this three lines instead of five:
+// for an instant *before* the anchor the truncation is already the ceiling, so
+// only the positive remainder needs adjusting. No real timestamp is before
+// either anchor — both are in January 1970 and Binance began in 2017 — but a
+// rounding rule that is wrong outside its expected range is one that hides its
+// own misuse.
+func ceilFrom(t, anchor time.Time, period time.Duration) time.Time {
+	delta := t.Sub(anchor)
+
+	n := delta / period
+	if delta%period > 0 {
+		n++
+	}
+
+	return anchor.Add(n * period)
 }
 
 // intervalEnd returns the instant the next candle opens.
