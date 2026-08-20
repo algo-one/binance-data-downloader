@@ -443,3 +443,38 @@ the answer written down next to the cursor.
 #5 is a genuine gap but the existing comment is not wrong, only incomplete: it answers the
 pacing question and is silent on the accounting one. Fixing the comment may be the whole
 fix.
+
+---
+
+## Resolution
+
+All fifteen were applied, in the commit after the one that landed Stage 6. Three
+of them changed a verdict Stage 7 would have built on, and those are the ones
+worth remembering:
+
+| # | What changed |
+| --- | --- |
+| 1 | `statusCause` decides the sentinel from the status class rather than from the body, so a 5xx carries the new internal `vision.ErrServerError` and reaches the caller unrecognised rather than as `ErrInvalidRequest`. An unexplained 4xx is now typed too — whose fault a refusal is no longer depends on whether the server sent JSON |
+| 2 | `translateRESTError` leaves a REST 404 untyped and says why in the message. The shared translation keeps the calendar reading, which is correct for the bucket |
+| 3 | The cursor advances to `intervalEnd(prev)` — the next candle's open — which is correct under either reading of Binance's inclusive `startTime`, so the question never has to be measured. `restapi_test.go` runs the same range against a handler for each reading; the new one fails against the old cursor with "page 2 row 1: open time … does not follow" |
+| 4 | `readAPIError` reads `maxErrorDoc` (8 KiB) rather than the snippet's 204 bytes. Finding 1's fix already removed the consequence — the sentinel no longer depends on the parse — so this now only affects whether Binance's own code and message are recovered |
+| 5 | `Policy.Reserve` is consulted once per attempt inside `doWithRetry`, so a call that retries four times spends four reservations. `API` no longer holds the limiter; the closure does |
+| 6 | The page cap is untyped, with a message naming the fix (split the range). Still untested: reaching it needs 1,001 full pages |
+| 7 | A zero `now` is rejected with `ErrInvalidRequest` before any request is sent |
+| 8 | `writeAtomic` creates nothing until the first byte is written, via `tempFile`; a write that never starts leaves no trace. The `ctx.Err()` guard moved inside the singleflight loop, which is what the foreign-cancellation retry needed. Directories are still not removed after a failed write, deliberately: concurrent writers share one, and a tidy-up races them |
+| 9 | `ErrIPBanned` is a sixth public sentinel, attached alongside `ErrRateLimited` |
+| 10 | `docs/architecture.md` now says the header is decoded and available to the layer above, and the field's comment names Stage 7 as its consumer |
+| 11 | `'t'` and `'f'` join the refusing case in `jsonScalar` |
+| 12 | `readBodyPrefix` holds the read-limit-then-drain sequence once |
+| 13 | `rows[i][:]` |
+| 14 | README says 1.25.0 |
+| 15 | The plan's Stage 6 row describes `x/time/rate` |
+
+One finding the review missed was fixed in the same pass: every failure in
+`decodeKlines` was untyped, so a body that would not parse as JSON reached the
+caller unrecognised while a bad decimal inside a well-formed row was
+`ErrCorruptArchive` — the same condition answered two ways depending on which
+layer noticed. `vision.ErrMalformedResponse` now covers the JSON half and
+`translateVisionError` folds it onto `ErrCorruptArchive`.
+
+`mise run ci` is green: 0 lint issues, 652 tests under `-race`, up from 633.

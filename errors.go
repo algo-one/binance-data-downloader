@@ -49,7 +49,7 @@ import "errors"
 //	if err == ErrNotAvailable { ... }            // broken by any wrapping
 //
 // A `var` block groups related declarations the way an import block groups
-// imports. It is one declaration, not five, and reads as a single unit.
+// imports. It is one declaration, not six, and reads as a single unit.
 var (
 	// ErrInvalidRequest reports that a request was rejected before any I/O
 	// happened, because something about the request itself is wrong: an
@@ -100,6 +100,24 @@ var (
 	// this can occur; the bulk archives are static files and are not limited.
 	//
 	// It is a distinct sentinel because it is the one failure where the right
-	// response is to wait rather than to give up or to try elsewhere.
+	// response is to wait rather than to give up or to try elsewhere. A 418
+	// carries [ErrIPBanned] as well, for the case where waiting is not enough.
 	ErrRateLimited = errors.New("rate limited")
+
+	// ErrIPBanned reports an HTTP 418: Binance has barred this IP address
+	// rather than merely asked it to slow down. It is the escalation applied
+	// to a client that keeps ignoring 429s, and it lasts from two minutes to
+	// three days, lengthening with repeat offences.
+	//
+	// Every error carrying it also carries ErrRateLimited, so a caller asking
+	// only "should I slow down?" needs to know nothing about it. The reason it
+	// exists as well is that the right response is different in kind: there is
+	// no backoff short enough to ride out a ban, and retrying is what earns the
+	// next, longer one. A pipeline that can stop should stop.
+	//
+	// The ban is on the address, not the process or the API key. One earned by
+	// a history download also locks out anything else on the same host — a live
+	// trading bot, most expensively — which is why internal/vision paces this
+	// endpoint preventatively rather than reacting once this arrives.
+	ErrIPBanned = errors.New("ip banned")
 )

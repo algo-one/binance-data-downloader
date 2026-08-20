@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"strconv"
 	"time"
-	"unicode/utf8"
 
 	"golang.org/x/time/rate"
 )
@@ -88,13 +87,49 @@ const maxKlinesResponse = 4 << 20
 // finds ErrRateLimited through the same value.
 var ErrIPBanned = errors.New("ip banned")
 
-// ErrBadRequest reports a 4xx the server explained: the request was understood
-// and refused. An unknown symbol and an unsupported interval both land here.
+// ErrBadRequest reports a 4xx: the request was understood and refused. An
+// unknown symbol and an unsupported interval both land here.
 //
 // Retrying cannot help, which is why it is separate from the statuses
-// [retryableStatus] lists. Errors carrying it are [*APIError] and name the code
-// Binance returned.
+// [retryableStatus] lists. When the body carried Binance's own explanation the
+// error is an [*APIError] naming the code it returned; when it did not, the
+// status alone is the verdict. That distinction deliberately does not change
+// the sentinel — whose fault a refusal is depends on the status class, not on
+// whether the server chose to explain itself.
 var ErrBadRequest = errors.New("request rejected")
+
+// ErrServerError reports a 5xx: Binance's side failed, and nothing about the
+// request needs changing.
+//
+// It exists because the alternative is worse than having no sentinel at all.
+// [retryableStatus] already retries 500, 502, 503 and 504, and when those
+// attempts are exhausted [doWithRetry] hands back the response so the caller
+// can report what the server actually said. Binance answers a 5xx with the same
+// {"code","msg"} document it uses for a 400 — {"code":-1001,"msg":"Internal
+// error; unable to process your request."} — so a status-blind reading of the
+// body reports an outage as the caller's own bug, and the root package's
+// ErrInvalidRequest documents itself as "always the caller's to fix". A worker
+// pool told that would refuse to retry or fall back precisely when both would
+// have worked.
+//
+// It is not translated into a root-package sentinel. The public vocabulary in
+// errors.go says nothing about server-side failure, and an error that arrives
+// unrecognised is a smaller lie than one that arrives mislabelled.
+var ErrServerError = errors.New("server error")
+
+// ErrMalformedResponse reports that a 200 carried bytes this package could not
+// read as a klines response: not JSON, not an array of arrays, a row with the
+// wrong number of columns, or a column holding something no number can be
+// recovered from.
+//
+// It is the JSON counterpart of a corrupt archive, and the root package maps it
+// onto exactly that sentinel. Without it the two halves of one condition part
+// company: a price that will not parse as a decimal is caught by codec.go and
+// reported as ErrCorruptArchive, while a body that is not JSON at all reaches
+// the caller untyped — the same "Binance sent bytes this library cannot
+// understand" arriving as two different answers depending on which layer
+// noticed first.
+var ErrMalformedResponse = errors.New("malformed response")
 
 // APIError is a refusal the REST API described in its body, in the shape it
 // documents:
@@ -113,6 +148,12 @@ type APIError struct {
 	// same body mean different things.
 	Status string
 
+	// StatusCode is the same status as a number, and it decides which sentinel
+	// [APIError.Unwrap] reports. Binance uses one body shape for refusals and
+	// for its own failures, so the status class is the only thing in the
+	// response that says whose fault it is.
+	StatusCode int
+
 	// Code and Msg are Binance's own. Code is negative in every documented
 	// case; a zero Code means the body did not parse as an error document.
 	Code int
@@ -121,14 +162,37 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	if e.Code != 0 {
-		return fmt.Sprintf("%s: %s (code %d): %s", e.Status, e.Msg, e.Code, ErrBadRequest)
+		return fmt.Sprintf("%s: %s (code %d): %s", e.Status, e.Msg, e.Code, e.cause())
 	}
 
-	return fmt.Sprintf("%s: %s", e.Status, ErrBadRequest)
+	return fmt.Sprintf("%s: %s", e.Status, e.cause())
 }
 
-// Unwrap is what makes errors.Is(err, ErrBadRequest) true for this type.
-func (e *APIError) Unwrap() error { return ErrBadRequest }
+// Unwrap is what makes errors.Is(err, ErrBadRequest) true for this type — or
+// errors.Is(err, ErrServerError), for the statuses where the failure is
+// Binance's rather than ours.
+func (e *APIError) Unwrap() error { return e.cause() }
+
+// cause picks the sentinel from the status class, so that the message and the
+// value a caller branches on cannot disagree: both ask this one function.
+func (e *APIError) cause() error { return statusCause(e.StatusCode) }
+
+// statusCause is the rule for whose fault a failed request was, in the one
+// place both users of it can read.
+//
+// The rule is the status class and nothing else. A 4xx means the server
+// understood the request and refused it; a 5xx means the server failed. Binance
+// describes both in the same {"code","msg"} document, so the body cannot be
+// asked this question — and the two callers here are the typed error and the
+// untyped fallback, which have to answer it identically or an endpoint's choice
+// of formatting starts deciding what a caller is told.
+func statusCause(code int) error {
+	if code >= http.StatusInternalServerError {
+		return ErrServerError
+	}
+
+	return ErrBadRequest
+}
 
 // RawKline is one row exactly as Binance sent it: twelve fields, every one of
 // them the original characters.
@@ -243,24 +307,33 @@ type KlinesPage struct {
 	// [WeightLimitPerMinute] quota this IP has spent in the current minute,
 	// counting this request. Zero when the header was absent or unreadable.
 	//
-	// It is reported rather than acted on. The limiter's job is to keep this
-	// number low; surfacing it lets the layer above notice when that is not
-	// working — a second process on the same address, most likely — which is a
-	// diagnosis no amount of local accounting can reach.
+	// It is decoded rather than acted on. The limiter's job is to keep this
+	// number low, and this is the only way to notice when that is not working
+	// — a second process on the same address spending the same quota, most
+	// likely, which no amount of local accounting can detect.
+	//
+	// Nothing reads it yet. restapi.go drops the field, because a fetcher
+	// returning candles has nowhere to put a diagnostic; Stage 7 owns progress
+	// reporting and is where it becomes visible. Recording that here rather
+	// than claiming the diagnosis already works is the difference between a
+	// decoded value with a known consumer and one that is quietly ignored.
 	UsedWeight int
 }
 
 // API reads klines from the REST mirror.
 //
 // Like [Lister] and [Downloader] it holds its client rather than making one, so
-// that every request in the process shares a connection pool. Unlike them it
-// also holds a limiter, for the reason limiter.go opens with: this endpoint has
-// a quota and the bucket does not.
+// that every request in the process shares a connection pool. Unlike them it is
+// paced, for the reason limiter.go opens with: this endpoint has a quota and
+// the bucket does not.
+//
+// The limiter is not a field here. It is captured by the Reserve closure on the
+// policy, which is the only thing that reads it — a second reference on the
+// struct would be state that looks consultable and never is.
 type API struct {
 	baseURL string
 	client  *http.Client
 	policy  Policy
-	limiter *rate.Limiter
 }
 
 // NewAPI returns an API reading from baseURL using client, retrying per p and
@@ -285,28 +358,37 @@ func NewAPI(baseURL string, client *http.Client, p Policy, lim *rate.Limiter) *A
 		lim = defaultLimiter()
 	}
 
-	return &API{baseURL: baseURL, client: client, policy: p.withDefaults(), limiter: lim}
+	policy := p.withDefaults()
+
+	// The limiter is installed on the policy rather than consulted here,
+	// because [doWithRetry] is the layer that knows how many requests one call
+	// becomes. Set unconditionally: pacing this endpoint is the API's own
+	// business, and a caller who supplied a Policy with its own Reserve would
+	// be quietly opting out of the quota that earns IP bans.
+	policy.Reserve = func(ctx context.Context) error {
+		// WaitN blocks until KlinesWeight units of budget are available, or
+		// ctx ends. It takes its tokens before waiting rather than after, so
+		// ten goroutines arriving together leave in an orderly queue instead
+		// of all observing the same empty bucket and firing at the same
+		// instant — and it puts them back if the wait is cancelled.
+		return lim.WaitN(ctx, KlinesWeight)
+	}
+
+	return &API{baseURL: baseURL, client: client, policy: policy}
 }
 
 // Klines fetches one page.
 //
-// The rate limiter is consulted once, before the request, rather than before
-// each retry. Retries already carry their own backoff — and honour a
-// Retry-After when the server sends one — so pacing them again would apply two
-// delays for one problem. What the limiter is for is the case where nothing has
-// gone wrong yet.
+// The rate limiter is not consulted here. It is installed on the policy by
+// [NewAPI] and spent inside [doWithRetry], once per HTTP request rather than
+// once per call — the difference being that a call which retries makes several,
+// and does so exactly when the quota is under pressure. See Policy.Reserve.
+//
+// The validation below runs first, so a query that could never be sent costs no
+// budget: the cheapest request is the one refused before it exists.
 func (a *API) Klines(ctx context.Context, q KlineQuery) (KlinesPage, error) {
 	if err := q.validate(); err != nil {
 		return KlinesPage{}, err
-	}
-
-	// WaitN blocks until KlinesWeight units of budget are available, or ctx
-	// ends. It takes its tokens before waiting rather than after, so ten
-	// goroutines arriving together leave in an orderly queue instead of all
-	// observing the same empty bucket and firing at the same instant — and it
-	// puts them back if the wait is cancelled.
-	if err := a.limiter.WaitN(ctx, KlinesWeight); err != nil {
-		return KlinesPage{}, fmt.Errorf("klines %s %s: %w", q.Symbol, q.Interval, err)
 	}
 
 	endpoint, err := url.JoinPath(a.baseURL, klinesPath)
@@ -367,8 +449,11 @@ func (a *API) statusError(q KlineQuery, resp *http.Response) error {
 		return fmt.Errorf("%s: %w", label, ErrNotFound)
 
 	default:
-		// Binance explains its refusals in the body, so the body is where the
-		// diagnosis is. readAPIError drains and closes.
+		// Everything else — every 4xx this package has no specific handling
+		// for, and every 5xx that outlived the retry loop. Binance explains
+		// both in the body, so the body is where the diagnosis is; the status
+		// class is what decides whose fault it is. readAPIError drains and
+		// closes.
 		return fmt.Errorf("%s: %w", label, readAPIError(resp))
 	}
 }
@@ -377,33 +462,46 @@ func (a *API) statusError(q KlineQuery, resp *http.Response) error {
 // handling for, preferring Binance's own explanation when the body carries one.
 //
 // It takes ownership of resp.
+//
+// # The body decides the detail, the status decides the verdict
+//
+// Those are two questions and it is worth keeping them apart. Whether the
+// result is an [*APIError] naming a code, or a quoted snippet of whatever
+// arrived, depends on what the body turned out to be. Which sentinel it carries
+// does not: a 400 is the caller's problem and a 503 is Binance's, whether or not
+// either explained itself. Deciding the sentinel from the body instead — the
+// shape this started as — meant an endpoint that answered a 400 with HTML
+// produced an untyped error, so whether a caller could tell "this is my bug"
+// came down to how the server felt like formatting its refusal.
 func readAPIError(resp *http.Response) error {
 	// Read a bounded prefix before deciding what it is: the body has to be
 	// consumed either way, and reading it once serves both the JSON parse and
-	// the fallback snippet.
-	b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSnippet+utf8.UTFMax))
+	// the fallback snippet. The limit is the document's rather than the
+	// snippet's, because a document truncated to snippet length is not a
+	// shorter document, it is invalid JSON — see [maxErrorDoc].
+	b := readBodyPrefix(resp, maxErrorDoc)
 
-	drainAndClose(resp)
-
-	if readErr == nil {
-		var doc struct {
-			Code int    `json:"code"`
-			Msg  string `json:"msg"`
-		}
-
-		// A code of zero means the body was valid JSON but not an error
-		// document — an empty object, or something else entirely — so it falls
-		// through to the snippet rather than being reported as "code 0".
-		if err := json.Unmarshal(b, &doc); err == nil && doc.Code != 0 {
-			return &APIError{Status: resp.Status, Code: doc.Code, Msg: doc.Msg}
-		}
+	var doc struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
 	}
+
+	// A code of zero means the body was valid JSON but not an error document —
+	// an empty object, or something else entirely — so it falls through to the
+	// snippet rather than being reported as "code 0".
+	if err := json.Unmarshal(b, &doc); err == nil && doc.Code != 0 {
+		return &APIError{Status: resp.Status, StatusCode: resp.StatusCode, Code: doc.Code, Msg: doc.Msg}
+	}
+
+	// No usable document, so the status is the whole diagnosis. It still
+	// carries the sentinel its class implies.
+	cause := statusCause(resp.StatusCode)
 
 	if snippet := snippetOf(b); snippet != "" {
-		return fmt.Errorf("unexpected status %s: %s", resp.Status, snippet)
+		return fmt.Errorf("unexpected status %s: %s: %w", resp.Status, snippet, cause)
 	}
 
-	return fmt.Errorf("unexpected status %s", resp.Status)
+	return fmt.Errorf("unexpected status %s: %w", resp.Status, cause)
 }
 
 // decodeKlines reads the response body into rows of exact strings.
@@ -428,14 +526,18 @@ func decodeKlines(r io.Reader) ([]RawKline, error) {
 	// body into memory. json.Decoder rather than ReadAll plus Unmarshal so
 	// that the bytes are never held twice.
 	if err := json.NewDecoder(io.LimitReader(r, maxKlinesResponse)).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		// %w twice: the decoder's own message says where in the body it gave
+		// up, which is the diagnostic, while [ErrMalformedResponse] is the
+		// condition a caller branches on. Losing either would be a loss.
+		return nil, fmt.Errorf("decoding response: %w: %w", err, ErrMalformedResponse)
 	}
 
 	rows := make([]RawKline, 0, len(raw))
 
 	for i, fields := range raw {
 		if len(fields) != KlineFields {
-			return nil, fmt.Errorf("row %d has %d fields, want %d", i+1, len(fields), KlineFields)
+			return nil, fmt.Errorf("row %d has %d fields, want %d: %w",
+				i+1, len(fields), KlineFields, ErrMalformedResponse)
 		}
 
 		var row RawKline
@@ -443,7 +545,7 @@ func decodeKlines(r io.Reader) ([]RawKline, error) {
 		for j, f := range fields {
 			s, err := jsonScalar(f)
 			if err != nil {
-				return nil, fmt.Errorf("row %d field %d: %w", i+1, j+1, err)
+				return nil, fmt.Errorf("row %d field %d: %w: %w", i+1, j+1, err, ErrMalformedResponse)
 			}
 
 			row[j] = s
@@ -463,9 +565,11 @@ func decodeKlines(r io.Reader) ([]RawKline, error) {
 // digits Binance sent are the digits that get parsed, with no numeric type in
 // between to round them.
 //
-// A null, object or array is refused rather than rendered. None appears in a
-// kline row, and turning one into a plausible-looking string would hand the
-// decimal parser something to fail on two layers away from the cause.
+// Anything that is not a number or a string is refused rather than rendered:
+// null, an object, an array, and the two booleans. None appears in a kline row,
+// and turning one into a plausible-looking string would hand the decimal parser
+// something to fail on two layers away from the cause — `open "true": invalid
+// syntax`, reported against a column that was never a number to begin with.
 func jsonScalar(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {
 		return "", errors.New("empty value")
@@ -480,7 +584,7 @@ func jsonScalar(raw json.RawMessage) (string, error) {
 
 		return s, nil
 
-	case '{', '[', 'n':
+	case '{', '[', 'n', 't', 'f':
 		return "", fmt.Errorf("expected a number or a string, got %s", snippetOf(raw))
 
 	default:

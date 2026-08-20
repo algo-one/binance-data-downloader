@@ -95,6 +95,35 @@ type Policy struct {
 	// same reason as After — a test asserting on a date-form Retry-After must
 	// not depend on what time it is when the suite runs.
 	Now func() time.Time
+
+	// Reserve, when set, is called before every attempt and must not return
+	// until the request it is about to permit fits inside whatever budget it
+	// is keeping. Nil means unmetered, which is what the bucket endpoints use:
+	// a static file server publishes no quota.
+	//
+	// # Why the reservation lives here rather than at the call site
+	//
+	// Because the thing being counted is a request, and this is the only
+	// function that knows how many of those an attempt-carrying call makes.
+	// [API.Klines] reserved once, before calling in, and the number looked
+	// right — one call, one reservation — right up until the endpoint started
+	// failing. A retryable status turns one reservation into as many as
+	// MaxAttempts requests, and it does so precisely when the budget matters
+	// most, because 429 and every retryable 5xx are the statuses that trigger
+	// the extra attempts. The limiter that exists to pre-empt an IP ban was
+	// what permitted the burst that earns one.
+	//
+	// # And why this is not a second backoff
+	//
+	// The obvious objection to reserving before a *retry* is that the attempt
+	// is already waiting out its own delay, so a limiter wait on top of it
+	// applies two delays for one problem. It does not, in the case that
+	// matters: the reservation returns immediately whenever the budget has
+	// room, which after several hundred milliseconds of backoff it normally
+	// does. When it does not have room, waiting is not a duplicated penalty —
+	// it is the pipeline being over budget, which is the one condition this
+	// hook exists to notice.
+	Reserve func(context.Context) error
 }
 
 // DefaultPolicy is the retry behaviour used when a caller passes the zero
@@ -301,6 +330,15 @@ func doWithRetry(ctx context.Context, client *http.Client, req *http.Request, p 
 	var lastErr error
 
 	for attempt := 1; ; attempt++ {
+		// Before the request, every time, including the first. See
+		// Policy.Reserve for why the count belongs to attempts rather than to
+		// calls.
+		if p.Reserve != nil {
+			if err := p.Reserve(ctx); err != nil {
+				return nil, fmt.Errorf("%s: %w", req.URL, err)
+			}
+		}
+
 		// Clone per attempt rather than reusing the same *http.Request. The
 		// transport is allowed to modify a request it is given (it sets Host
 		// and connection headers), and a request that has been through one

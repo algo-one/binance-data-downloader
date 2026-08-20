@@ -838,6 +838,60 @@ func TestWriteAtomic(t *testing.T) {
 		assertNoFiles(t, dir)
 	})
 
+	t.Run("a write that never starts creates nothing at all", func(t *testing.T) {
+		t.Parallel()
+
+		// The ordinary way to fetch a month Binance never published:
+		// fetchArchive asks for the 91-byte sidecar first, it 404s, and the
+		// callback returns without writing a byte. That is a routine answer
+		// rather than a fault, and it used to leave the whole directory tree
+		// and a temporary file behind — created before the callback ran, on
+		// the way to discovering there was nothing to put in them.
+		root := t.TempDir()
+		path := filepath.Join(root, "spot", "daily", "klines", "FOOUSDT", "1h", "file.zip")
+		boom := errors.New("404")
+
+		err := writeAtomic(path, func(io.Writer) error { return boom })
+		if !errors.Is(err, boom) {
+			t.Fatalf("writeAtomic = %v, want the write's own error", err)
+		}
+
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatalf("reading the cache root: %v", err)
+		}
+
+		if len(entries) != 0 {
+			t.Errorf("the cache root holds %d entries after a write that never began, want none", len(entries))
+		}
+	})
+
+	t.Run("a write of nothing still produces a file", func(t *testing.T) {
+		t.Parallel()
+
+		// The other side of the same change. Deferring creation to the first
+		// byte must not turn a successful write of zero bytes into a
+		// successful call that left no file — the caller would be told the
+		// entry is cached and find nothing there.
+		dir := t.TempDir()
+		path := filepath.Join(dir, "empty.txt")
+
+		if err := writeAtomic(path, func(io.Writer) error { return nil }); err != nil {
+			t.Fatalf("writeAtomic: %v", err)
+		}
+
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading: %v", err)
+		}
+
+		if len(got) != 0 {
+			t.Errorf("got %q, want an empty file", got)
+		}
+
+		assertOnlyFiles(t, dir, "empty.txt")
+	})
+
 	t.Run("a failed write leaves an existing file alone", func(t *testing.T) {
 		t.Parallel()
 

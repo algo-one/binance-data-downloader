@@ -37,8 +37,12 @@ import (
 // Errors from the decoder wrap [ErrCorruptArchive], which reads oddly for a
 // JSON body. It is deliberate: the condition a caller branches on is "Binance
 // sent bytes this library cannot understand", and that is one condition however
-// the bytes were packaged. A sixth sentinel would split it in two and make
-// every caller handle both.
+// the bytes were packaged. A sentinel of its own would split it in two and make
+// every caller handle both. The same reasoning reaches one layer further down —
+// a body that is not JSON at all fails inside internal/vision, which has its
+// own vision.ErrMalformedResponse for it, and translateVisionError folds that
+// onto this sentinel rather than letting where the failure was noticed decide
+// what the caller is told.
 
 // restPageSize is how many candles to ask for per call.
 //
@@ -110,9 +114,9 @@ func (r restRef) validate() error {
 
 // restFetcher reads ranges of candles from the REST API.
 type restFetcher struct {
-	// api is the transport. It carries the shared http.Client, the retry
-	// policy and — unlike anything else in this library — a rate limiter, for
-	// the reason internal/vision/limiter.go opens with.
+	// api is the transport. It carries the shared http.Client and the retry
+	// policy, and its policy carries the rate limiter — which nothing else in
+	// this library has, for the reason internal/vision/limiter.go opens with.
 	api *vision.API
 
 	// includePartial selects whether the candle currently being formed is
@@ -155,12 +159,33 @@ type restFetcher struct {
 //	a short page           fewer rows than asked for means the range ran out
 //	the cursor reaches End the range is covered
 //
-// The cursor is taken from the last candle of the page and advanced by one
-// millisecond — the endpoint's own resolution, and the smallest step that
-// cannot return the same candle twice. Since every candle in a page opens at or
-// after the cursor that requested it, the next cursor is strictly greater, so
-// the loop cannot stand still. [maxRESTPages] guards the case where that
-// reasoning is wrong.
+// The cursor is taken from the last candle of the page and advanced to the
+// instant its successor opens — [intervalEnd], not "one millisecond later".
+//
+// # Why not one millisecond later
+//
+// That is what this did first, and it is one millisecond *into* the candle it
+// is trying to move past, which is only safe if Binance's inclusive startTime
+// filters strictly on open time. If it instead selects the kline whose interval
+// *contains* the timestamp — the reading a mid-candle startTime makes plausible
+// — page 2 opens with the same candle page 1 ended with, and appendPage's
+// strict-increase check fails the whole fetch. Loudly, at least, and on the
+// first multi-page range anyone asks for.
+//
+// One handler cannot settle it, because a handler written in this repository
+// necessarily encodes whichever reading its author assumed. So restapi_test.go
+// runs the same range against one of each.
+//
+// Landing exactly on the next open is correct under both readings, needs no
+// measurement to justify, and skips nothing — a candle opening at that instant
+// is the next one wanted, and if Binance has no candle there (an illiquid pair,
+// a gap) the page simply starts at the first one after it. The Python loader
+// this replaces advanced by close_time+1, which is the same instant reached
+// from the other side.
+//
+// Since every candle in a page opens at or after the cursor that requested it,
+// the next cursor is strictly greater, so the loop cannot stand still.
+// [maxRESTPages] guards the case where that reasoning is wrong.
 func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]Kline, error) {
 	if err := ref.validate(); err != nil {
 		return nil, err
@@ -175,6 +200,17 @@ func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]
 		return nil, err
 	}
 
+	// The clock is checked for the same reason every other field is, and it is
+	// the one whose absence is invisible. A zero now — a field forgotten in a
+	// struct literal, a clock not yet wired — makes intervalEnd(...).After(now)
+	// true for every candle ever published, so appendPage stops on row 1 of
+	// page 1 and this returns ([], nil): a failed read wearing the shape of an
+	// empty range, which is the conflation finding 1 of the Stage 3 review
+	// exists to prevent and the whole reason ErrNotAvailable is a typed error.
+	if now.IsZero() {
+		return nil, fmt.Errorf("%s: the clock is required: %w", ref, ErrInvalidRequest)
+	}
+
 	out := make([]Kline, 0, spec.estimateRows())
 
 	// The previous candle's open time. Candles must strictly increase, which
@@ -186,8 +222,20 @@ func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]
 
 	for page := 1; cursor.Before(ref.End); page++ {
 		if page > maxRESTPages {
-			return nil, fmt.Errorf("%s: still incomplete after %d pages: %w",
-				ref, maxRESTPages, ErrCorruptArchive)
+			// Untyped, deliberately. This is a resource bound rather than a
+			// diagnosis: nothing about the data is wrong, there is merely more
+			// of it than one REST fetch is willing to page through.
+			//
+			// It was ErrCorruptArchive, which claims Binance published bytes
+			// this library cannot understand and tells the caller that retrying
+			// is pointless. Half of that is even true — a retry does hit the
+			// same cap — but it would have a caller give up on data that is
+			// perfectly fine and merely large, and Stage 7 is the layer that
+			// could instead split the range and ask again. ErrInvalidRequest is
+			// no better: errors.go promises it costs no network round trip, and
+			// this one costs a thousand.
+			return nil, fmt.Errorf("%s: still incomplete after %d pages of %d candles; "+
+				"split the range and fetch it in parts", ref, maxRESTPages, restPageSize)
 		}
 
 		got, err := f.api.Klines(ctx, vision.KlineQuery{
@@ -198,7 +246,7 @@ func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]
 			Limit:    restPageSize,
 		})
 		if err != nil {
-			return nil, translateVisionError(err)
+			return nil, translateRESTError(err)
 		}
 
 		if len(got.Klines) == 0 {
@@ -217,7 +265,7 @@ func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]
 			break
 		}
 
-		cursor = prev.Add(time.Millisecond)
+		cursor = intervalEnd(prev, ref.Interval)
 	}
 
 	return out, nil
@@ -237,12 +285,20 @@ func (f restFetcher) appendPage(
 	now time.Time,
 	page int,
 ) (bool, error) {
-	for i, row := range rows {
-		// row is [vision.KlineFields]string and decodeRow indexes a []string
-		// by the column constants in codec.go. The two counts are checked
-		// against each other once, at init, so this slice expression cannot be
-		// short — see the assertion at the bottom of this file.
-		k, err := decodeRow(row[:], spec)
+	for i := range rows {
+		// rows[i] is [vision.KlineFields]string and decodeRow indexes a
+		// []string by the column constants in codec.go. The two counts are
+		// checked against each other once, at compile time, so this slice
+		// expression cannot be short — see the assertion at the bottom of this
+		// file.
+		//
+		// Indexed rather than `for i, row := range rows`, which binds a copy of
+		// the element: a RawKline is twelve string headers, 192 bytes on a
+		// 64-bit build, and slicing the copy is also what forces it to be
+		// addressable. Slicing rows[i] borrows the row where it already is. A
+		// day of 1s candles is 86,400 of them, and the shorter expression is
+		// the cheaper one.
+		k, err := decodeRow(rows[i][:], spec)
 		if err != nil {
 			return false, fmt.Errorf("page %d row %d: %w", page, i+1, err)
 		}

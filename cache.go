@@ -298,11 +298,18 @@ func (c *cache) klines(ctx context.Context, ref archiveRef, spec decodeSpec) ([]
 	//
 	// The same shape as [Policy.wait], which checks ctx even for a zero delay
 	// so that a cancelled context cannot perform one more request.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
+	//
+	// It sits inside the loop rather than in front of it, which matters for the
+	// one path that comes back around: the foreign-cancellation retry below
+	// re-enters DoChan, and between that decision and this point the caller's
+	// own context can end. Guarding only the entrance would leave the last
+	// attempt starting exactly the abandoned goroutine the guard exists to
+	// prevent — rarely, and therefore worse.
 	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		// DoChan rather than Do, because Do offers no way to stop waiting.
 		// A caller whose own context is cancelled has to be able to walk away
 		// from a download that is still running for somebody else, and only a
@@ -636,6 +643,17 @@ func readSidecar(path, wantName string) (string, error) {
 // so every failure — a network error mid-download, a corrupt archive, a
 // cancelled context — leaves the cache exactly as it was.
 //
+// # Nothing is created until there are bytes
+//
+// The directory tree and the temporary file used to be made first, before the
+// callback ran, which meant every failure that happened before the first byte
+// still left something behind. That is not a rare path: [fetchArchive] asks for
+// the 91-byte sidecar before the archive, so fetching a month Binance never
+// published — an ordinary answer, not an error in the system — created
+// data/spot/daily/klines/FOOUSDT/1h/ and a temporary file inside it purely to
+// learn that there was nothing to put there. Deferring both to the first Write
+// means a write that never starts leaves no trace at all. See [tempFile].
+//
 // # No context here either
 //
 // For the reason given on [readSidecar]. The work inside this function that can
@@ -646,37 +664,36 @@ func readSidecar(path, wantName string) (string, error) {
 // can do.
 func writeAtomic(path string, write func(io.Writer) error) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, cacheDirPerm); err != nil {
-		return fmt.Errorf("cache: creating %s: %w", dir, err)
-	}
 
 	// The pattern's "*" is where CreateTemp puts its random suffix. The leading
 	// dot hides the file from a casual listing, and the name deliberately does
 	// not end in .zip or .parquet so that nothing scanning the directory for
 	// cache entries can mistake a half-written one for a finished one.
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("cache: creating a temporary file in %s: %w", dir, err)
-	}
+	t := &tempFile{dir: dir, pattern: "." + filepath.Base(path) + ".tmp-*"}
 
-	tmp := f.Name()
 	renamed := false
 
 	defer func() {
 		if !renamed {
-			// Both errors are ignored deliberately, and the explicit
-			// assignment says so at the call site rather than leaving a reader
-			// to wonder. Close after a failed write is very likely to fail
-			// again, and Remove after a failed Close cannot be acted on — the
-			// operation being reported is the one that already went wrong.
-			_ = f.Close()
-			_ = os.Remove(tmp)
+			t.discard()
 		}
 	}()
 
-	if err := write(f); err != nil {
+	if err := write(t); err != nil {
 		return err
 	}
+
+	// A write that succeeded without producing a byte still has to produce a
+	// file, or the rename below has nothing to rename and a successful call
+	// would leave no cache entry. Nothing this library writes is legitimately
+	// empty, so this is the guard for a case that should not arise rather than
+	// a path with a use — which is exactly the kind worth handling, since the
+	// alternative is a nil dereference.
+	if err := t.create(); err != nil {
+		return err
+	}
+
+	f, tmp := t.f, t.f.Name()
 
 	// Sync asks the operating system to put the bytes on the physical device.
 	// Without it the rename can reach the disk before the data does, so a
@@ -714,6 +731,82 @@ func writeAtomic(path string, write func(io.Writer) error) error {
 	syncDir(dir)
 
 	return nil
+}
+
+// tempFile is the destination [writeAtomic] hands to its callback: an io.Writer
+// that brings its own file into existence the first time it is written to, and
+// not before.
+//
+// # Why this is not just an *os.File
+//
+// Because creating the file is itself a side effect on a shared directory, and
+// the decision to write can fail after the writer exists and before any byte
+// reaches it — a 404 for an archive that was never published, a cancelled
+// context, a checksum that will not match. Creating eagerly turns every one of
+// those into a directory tree and a temporary file that outlive the call.
+//
+// # What it still leaves behind
+//
+// Directories, once a write has genuinely begun and then failed. Those are not
+// removed, and the reason is a race rather than an oversight: several months of
+// one symbol share a directory, Stage 7 fetches them concurrently, and a failed
+// writer tidying away a directory it created can delete the one another writer
+// has just created and is about to write into. An empty directory costs an
+// inode; a spurious ENOENT costs a download. The trade is not close.
+type tempFile struct {
+	dir     string
+	pattern string
+
+	// f is nil until the first write. Its presence is the record of whether
+	// anything needs cleaning up.
+	f *os.File
+}
+
+// Write implements io.Writer, creating the file on the way past if it does not
+// exist yet.
+func (t *tempFile) Write(p []byte) (int, error) {
+	if err := t.create(); err != nil {
+		return 0, err
+	}
+
+	return t.f.Write(p)
+}
+
+// create makes the directory and the temporary file, once. Calling it again is
+// free, which is what lets Write call it on every byte without checking.
+func (t *tempFile) create() error {
+	if t.f != nil {
+		return nil
+	}
+
+	if err := os.MkdirAll(t.dir, cacheDirPerm); err != nil {
+		return fmt.Errorf("cache: creating %s: %w", t.dir, err)
+	}
+
+	f, err := os.CreateTemp(t.dir, t.pattern)
+	if err != nil {
+		return fmt.Errorf("cache: creating a temporary file in %s: %w", t.dir, err)
+	}
+
+	t.f = f
+
+	return nil
+}
+
+// discard closes and removes the file if there is one, and does nothing at all
+// if the write never started.
+//
+// Both errors are ignored deliberately, and the explicit assignment says so at
+// the call site rather than leaving a reader to wonder. Close after a failed
+// write is very likely to fail again, and Remove after a failed Close cannot be
+// acted on — the operation being reported is the one that already went wrong.
+func (t *tempFile) discard() {
+	if t.f == nil {
+		return
+	}
+
+	_ = t.f.Close()
+	_ = os.Remove(t.f.Name())
 }
 
 // syncDir flushes a directory's own metadata, which is what makes a rename into

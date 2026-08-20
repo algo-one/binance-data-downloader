@@ -419,10 +419,20 @@ can offer it as an option.
 **Pagination terminates three ways**, because any one alone is a bug waiting for
 the right response: an empty page, a page shorter than requested, or a cursor
 that reaches the end of the range. The cursor is taken from the last candle of
-each page and advanced one millisecond — the endpoint's own resolution, and the
-smallest step that cannot return the same candle twice. Since every candle opens
-at or after the cursor that requested it, the cursor strictly increases, so the
-loop cannot stand still.
+each page and advanced to the instant its successor opens. Since every candle
+opens at or after the cursor that requested it, the cursor strictly increases,
+so the loop cannot stand still.
+
+It advanced by one millisecond first, which is one millisecond *into* the candle
+it means to move past. Binance documents `startTime` as inclusive without saying
+inclusive of what, and that cursor is only safe under the reading where the
+filter is on open time; under the other — the kline whose interval *contains*
+the timestamp — page 2 repeats the candle page 1 ended with and the
+strict-increase check fails the whole fetch. Landing on the next open is correct
+under both, so the question never has to be answered. No test could have caught
+it either, since a handler written in this repository encodes whichever reading
+its author assumed; `restapi_test.go` now runs the same range against a handler
+implementing each.
 
 ### Rate limiting, and why only here
 
@@ -477,12 +487,39 @@ test driving an `httptest.Server` cannot use a bubble. Those tests assert on
 request counts instead, and `retry.go` keeps `Policy.Now` and `Policy.After` for
 exactly that reason.
 
+The reservation is spent **per request, not per call**. `Policy.Reserve` is
+consulted inside the retry loop, because that is the only layer that knows how
+many requests one call becomes: a retryable status turns one call into as many
+as `MaxAttempts`, and it does so exactly when the quota is under pressure, since
+429 and every retryable 5xx are the statuses that cause the extra attempts. Spent
+per call, the limiter that exists to pre-empt an IP ban is what permits the burst
+that earns one.
+
 A 418 is reported as `*vision.RateLimitError` with `Banned` set, and its
-`Unwrap` returns **both** `ErrRateLimited` and `ErrIPBanned`. A caller asking
-only "should I slow down?" gets a yes; one that can tell a ban from a throttle
-can. `X-MBX-USED-WEIGHT-1M` is parsed and reported rather than acted on — when
-it climbs while the local accounting says otherwise, something else on the
-address is spending the quota, which is a diagnosis no local bookkeeping reaches.
+`Unwrap` returns **both** `ErrRateLimited` and `ErrIPBanned`. Those are
+internal; the root package re-attaches the same pair from `errors.go`, so a
+library consumer asking only "should I slow down?" gets a yes and one that can
+tell a ban from a throttle can. `X-MBX-USED-WEIGHT-1M` is decoded onto
+`vision.KlinesPage` and available to the layer above, which does not read it
+yet — Stage 7 owns progress and diagnostics and is where it becomes visible.
+
+**A status decides whose fault a failure is; the body only decides the detail.**
+Binance answers a 5xx with the same `{"code","msg"}` document it uses for a 400,
+so a body-first reading reports an outage as the caller's own bug — and
+`ErrInvalidRequest` is documented as always the caller's to fix, which would have
+Stage 7 refuse to retry the one failure retrying exists for. A 4xx therefore
+carries `vision.ErrBadRequest` and a 5xx `vision.ErrServerError`, whether or not
+either explained itself. The 5xx has no public sentinel and reaches the caller
+unrecognised: an error that arrives unlabelled is a smaller lie than one that
+arrives mislabelled.
+
+**A 404 from this endpoint is not a calendar fact.** The bucket is a static file
+server, where a missing object genuinely means the month was never published;
+the REST endpoint answers a range it has nothing in with 200 and an empty array,
+so a 404 from it means the base URL or the path is wrong. `translateRESTError` is
+that one difference — it leaves the 404 untyped, where the shared translation
+would make it `ErrNotAvailable` and Stage 7's requirement-4 policy would degrade
+the whole REST tail to nothing and report success.
 
 ## Package layout
 
@@ -648,6 +685,7 @@ var (
     ErrCorruptArchive = errors.New("corrupt archive")
     ErrInvalidRequest = errors.New("invalid request")
     ErrRateLimited    = errors.New("rate limited")
+    ErrIPBanned       = errors.New("ip banned")            // added in Stage 6
 )
 ```
 
@@ -655,6 +693,23 @@ Callers test with `errors.Is` / `errors.As`. `ErrNotAvailable` is the one worth
 highlighting: a missing archive is a fact about the calendar, not a failure, and
 making it a typed error means the compiler forces every caller to acknowledge
 it — where an empty-result-and-no-error convention relies on them remembering.
+
+`ErrIPBanned` is the sixth, and the bar it had to clear is the one
+`ErrRateLimited` already states: a sentinel earns its place when the right
+response is different *in kind*. A throttle means wait; a ban means stop, since
+no backoff rides out two minutes to three days and retrying earns the next,
+longer one. Every error carrying it also carries `ErrRateLimited`, so nothing a
+caller already wrote has to change. The distinction existed inside
+`internal/vision` before Stage 6's review and could not be reached from outside
+the module at all — a comment promising `errors.Is(err, vision.ErrIPBanned)` to
+consumers who cannot import `internal/`.
+
+Two conditions deliberately have **no** sentinel. A 5xx from the REST endpoint
+reaches the caller unrecognised, because "Binance's side failed" is a state this
+vocabulary does not describe and mislabelling it as either the caller's bug or a
+gap in the calendar is worse than leaving it plain. Exceeding the REST page cap
+is likewise untyped: it is a resource bound rather than a diagnosis, and the
+caller's move is to split the range, not to give up on it.
 
 ## Correctness requirements
 
@@ -667,7 +722,7 @@ because they are easy to get subtly wrong and silent when they are.
 | 1 | The end of a request range is resolved **per call**, never captured once at construction — a long-running process must not drift onto a stale end date | 2 ✅ |
 | 2 | Month-boundary comparisons anchor on the 1st of the month. A range such as `2024-12-20` → `2025-01-03` must not be misclassified as "current month", which **silently drops the last days** | 2 ✅ |
 | 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 ✅ |
-| 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns | 4 (typed error) → 7 (policy) |
+| 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns. A 404 from the *REST* endpoint is not this: it answers an empty range with 200, so a 404 there is a misconfiguration and stays untyped | 4 (typed error) → 6 (the REST distinction) → 7 (policy) |
 | 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 5 ✅ (the cache owns the key) → 7 (the pool sits outside it) |
 | 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 ✅ |
 | 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 ✅ |

@@ -150,18 +150,27 @@ func translateVisionError(err error) error {
 	case errors.Is(err, vision.ErrNotFound):
 		// A 404 is a fact about the calendar, not a failure: the month is not
 		// published yet, or the symbol had not been listed on that day.
+		//
+		// True of the bucket, which is a static file server, and false of the
+		// REST endpoint, which answers a range it has no data for with 200 and
+		// an empty array. [translateRESTError] is the half that knows that.
 		return fmt.Errorf("%w: %w", err, ErrNotAvailable)
+
+	case errors.Is(err, vision.ErrIPBanned):
+		// Tested before the rate-limit case below, which it would otherwise
+		// satisfy: vision.RateLimitError unwraps to both sentinels, and a
+		// switch takes the first arm that matches.
+		//
+		// Three %w verbs, so the error answers all three questions at once —
+		// what happened, in the transport's own words; whether to slow down;
+		// and whether slowing down can possibly be enough. A ban is the case
+		// where it cannot.
+		return fmt.Errorf("%w: %w: %w", err, ErrRateLimited, ErrIPBanned)
 
 	case errors.Is(err, vision.ErrRateLimited):
 		// The retry policy already backed off inside the request and the 429
 		// outlived it. The whole pipeline needs to slow down, which is a
 		// decision for the layer that owns the worker pool.
-		//
-		// An HTTP 418 — the ban Binance escalates a persistent 429 into —
-		// arrives here too, because vision.RateLimitError wraps both sentinels
-		// and this case tests the coarser one. The distinction is not lost: it
-		// stays readable through errors.Is(err, vision.ErrIPBanned) and in the
-		// message, which is where a caller that can act on it will look.
 		return fmt.Errorf("%w: %w", err, ErrRateLimited)
 
 	case errors.Is(err, vision.ErrBadRequest):
@@ -176,7 +185,48 @@ func translateVisionError(err error) error {
 		// the caller.
 		return fmt.Errorf("%w: %w", err, ErrInvalidRequest)
 
+	case errors.Is(err, vision.ErrMalformedResponse):
+		// Bytes that arrived intact and could not be read as klines. Same
+		// condition as a ZIP that will not open or a CSV row with the wrong
+		// number of columns, so it gets the same sentinel: the packaging
+		// differs, what a caller can do about it does not.
+		return fmt.Errorf("%w: %w", err, ErrCorruptArchive)
+
 	default:
+		// Anything unrecognised passes through untouched, and one thing lands
+		// here deliberately: vision.ErrServerError, the 5xx that outlived the
+		// retry loop. There is no public sentinel for "Binance's side failed",
+		// and the alternatives were both worse than leaving it unlabelled —
+		// ErrInvalidRequest, which is what it used to become, blames the caller
+		// for an outage, and ErrNotAvailable would have a worker pool record a
+		// transient 503 as a permanent hole in the calendar.
 		return err
 	}
+}
+
+// translateRESTError is [translateVisionError] with the one difference the REST
+// endpoint makes, which is what a 404 means.
+//
+// The bucket is a static file server, so a missing object there is a fact about
+// the calendar and [ErrNotAvailable] is exactly right. The REST endpoint has no
+// such thing as a missing object: asked for a range it has no data for, it
+// answers 200 with an empty array — verified on 2026-08-20, and the reason
+// [restFetcher.klines] treats an empty page as a termination condition rather
+// than an error. So a 404 from it is not a statement about data at all. It says
+// the base URL or the path is wrong, which is a misconfiguration.
+//
+// The distinction is not cosmetic. Stage 7 implements correctness requirement 4
+// — a 404 degrades that chunk and the rest of the range still returns — so
+// labelling this ErrNotAvailable would turn a wrong base URL into a successful,
+// silently short result instead of an error. Untyped is the honest answer: this
+// package does not have a sentinel for "you pointed me at the wrong host", and
+// inventing one from a status code that could equally mean a proxy in the way
+// would be a claim it cannot back.
+func translateRESTError(err error) error {
+	if errors.Is(err, vision.ErrNotFound) {
+		return fmt.Errorf("%w (the klines endpoint answers an empty range with 200, "+
+			"so a 404 means the base URL or path is wrong)", err)
+	}
+
+	return translateVisionError(err)
 }

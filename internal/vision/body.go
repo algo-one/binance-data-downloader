@@ -23,6 +23,23 @@ const (
 	// Enough to see a proxy's HTML title or a JSON error field, short enough
 	// to fit in a terminal.
 	maxSnippet = 200
+
+	// maxErrorDoc is how much of a body is read when it might be a structured
+	// error document that wants parsing rather than quoting.
+	//
+	// It is deliberately far larger than [maxSnippet]. The two limits look
+	// interchangeable and are not: a snippet may be cut anywhere, because its
+	// job is to show a human the beginning of something, while a document cut
+	// anywhere is invalid JSON and parses as nothing at all. Sharing one buffer
+	// between the two uses is fine and reading it at the snippet's length is
+	// not — the parse would then succeed or fail on how many characters the
+	// server happened to put in its message.
+	//
+	// Eight kibibytes is far more than Binance's own error documents need — the
+	// longest documented template comes to about 110 bytes — and the body is
+	// being read and discarded either way, so the ceiling costs nothing until
+	// something answers with an error document larger than any error document.
+	maxErrorDoc = 8 << 10
 )
 
 // drain reads and discards what is left of a response body, so that the
@@ -80,22 +97,41 @@ func drainAndClose(resp *http.Response) {
 // bodySnippet reads the beginning of a body for use in an error message, then
 // drains and closes the rest.
 func bodySnippet(resp *http.Response) string {
+	return snippetOf(readBodyPrefix(resp, maxSnippet+utf8.UTFMax))
+}
+
+// readBodyPrefix reads up to limit bytes of a body and then drains and closes
+// the rest, so that the connection underneath survives being finished with.
+//
+// It takes ownership of resp. A read that fails yields nil rather than an
+// error: every caller is already on an error path and building a message, and
+// "the body could not be read" is not a more useful thing to say there than
+// saying nothing about the body at all.
+//
+// # Why this is a function
+//
+// The three lines it holds — a limited read, then [drainAndClose] — were
+// written twice, once for the snippet and once for the error-document parse.
+// Two copies of a limit is two limits, and the next change to body handling
+// would silently apply to one endpoint only. The `+utf8.UTFMax` its snippet
+// caller passes is the subtle half: it is what leaves [snippetOf] a whole rune
+// to trim back through instead of a fragment of one.
+func readBodyPrefix(resp *http.Response, limit int64) []byte {
 	if resp == nil || resp.Body == nil {
-		return ""
+		return nil
 	}
 
-	// LimitReader caps what the error message can contain; the drain below
-	// deals with whatever is left on the connection. Reading UTFMax extra
-	// bytes gives snippetOf a whole rune to trim back through.
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxSnippet+utf8.UTFMax))
+	// LimitReader caps what is read; the drain below deals with whatever is
+	// left on the connection.
+	b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 
 	drainAndClose(resp)
 
 	if err != nil {
-		return ""
+		return nil
 	}
 
-	return snippetOf(b)
+	return b
 }
 
 // snippetOf trims b to something short enough, and safe enough, to end an error

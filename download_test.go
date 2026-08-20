@@ -3,6 +3,7 @@ package binancedata
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -429,15 +430,64 @@ func TestTranslateVisionError(t *testing.T) {
 	tests := []struct {
 		name string
 		in   error
-		want error
+		// want is every sentinel the result must carry.
+		want []error
+		// wantNot is every sentinel it must not.
+		wantNot []error
 		// keep asserts that the original error is still reachable, so a
 		// message naming the key and status is not thrown away in the
 		// translation.
 		keep error
 	}{
-		{"not found", vision.ErrNotFound, ErrNotAvailable, vision.ErrNotFound},
-		{"rate limited", vision.ErrRateLimited, ErrRateLimited, vision.ErrRateLimited},
-		{"anything else passes through", other, other, other},
+		{
+			name: "not found",
+			in:   vision.ErrNotFound,
+			want: []error{ErrNotAvailable},
+			keep: vision.ErrNotFound,
+		},
+		{
+			name:    "rate limited",
+			in:      vision.ErrRateLimited,
+			want:    []error{ErrRateLimited},
+			wantNot: []error{ErrIPBanned},
+			keep:    vision.ErrRateLimited,
+		},
+		{
+			// A *RateLimitError with Banned set unwraps to both sentinels, so
+			// the ban case has to be tested before the throttle case in the
+			// switch or it never runs. Both arrive at the caller: stopping is
+			// the right answer and slowing down is not the wrong one.
+			name: "banned",
+			in:   &vision.RateLimitError{Key: "klines", Banned: true},
+			want: []error{ErrRateLimited, ErrIPBanned},
+			keep: vision.ErrIPBanned,
+		},
+		{
+			// The JSON half of "Binance sent bytes this library cannot
+			// understand". The CSV half is already ErrCorruptArchive, and a
+			// caller should not have to know which layer noticed.
+			name: "malformed response",
+			in:   vision.ErrMalformedResponse,
+			want: []error{ErrCorruptArchive},
+			keep: vision.ErrMalformedResponse,
+		},
+		{
+			// Deliberately unrecognised. There is no public sentinel for
+			// "Binance's side failed", and the two it used to be given —
+			// ErrInvalidRequest from reading the body, or ErrNotAvailable from
+			// treating it as a gap — are both worse than arriving plain.
+			name:    "a server error stays unrecognised",
+			in:      vision.ErrServerError,
+			want:    []error{vision.ErrServerError},
+			wantNot: []error{ErrInvalidRequest, ErrNotAvailable, ErrCorruptArchive, ErrRateLimited},
+			keep:    vision.ErrServerError,
+		},
+		{
+			name: "anything else passes through",
+			in:   other,
+			want: []error{other},
+			keep: other,
+		},
 	}
 
 	for _, tt := range tests {
@@ -446,8 +496,16 @@ func TestTranslateVisionError(t *testing.T) {
 
 			got := translateVisionError(tt.in)
 
-			if !errors.Is(got, tt.want) {
-				t.Errorf("got %v, want an error wrapping %v", got, tt.want)
+			for _, want := range tt.want {
+				if !errors.Is(got, want) {
+					t.Errorf("got %v, want an error wrapping %v", got, want)
+				}
+			}
+
+			for _, notWant := range tt.wantNot {
+				if errors.Is(got, notWant) {
+					t.Errorf("got %v, which should not wrap %v", got, notWant)
+				}
 			}
 
 			if !errors.Is(got, tt.keep) {
@@ -460,6 +518,34 @@ func TestTranslateVisionError(t *testing.T) {
 	// cannot justify.
 	if got := translateVisionError(other); errors.Is(got, ErrNotAvailable) {
 		t.Error("an unrecognised error was labelled ErrNotAvailable")
+	}
+}
+
+// TestTranslateRESTError covers the one difference the REST endpoint makes.
+//
+// The bucket is a static file server, so a missing object there is a fact about
+// the calendar. This endpoint answers a range it has nothing in with 200 and an
+// empty array, so a 404 from it is not about data at all — it says the base URL
+// or the path is wrong. Labelling that ErrNotAvailable would have Stage 7's
+// requirement-4 policy degrade the whole REST tail to nothing and report a
+// successful, silently short result.
+func TestTranslateRESTError(t *testing.T) {
+	t.Parallel()
+
+	got := translateRESTError(fmt.Errorf("klines: %w", vision.ErrNotFound))
+
+	if errors.Is(got, ErrNotAvailable) {
+		t.Errorf("got %v, which reports a misconfigured endpoint as a gap in Binance's calendar", got)
+	}
+
+	if !errors.Is(got, vision.ErrNotFound) {
+		t.Errorf("got %v, which no longer wraps the original", got)
+	}
+
+	// Everything else is translated exactly as the archive half is, so the two
+	// halves cannot drift apart on the sentinels they share.
+	if banned := translateRESTError(&vision.RateLimitError{Key: "klines", Banned: true}); !errors.Is(banned, ErrIPBanned) {
+		t.Errorf("got %v, want an error wrapping %v", banned, ErrIPBanned)
 	}
 }
 

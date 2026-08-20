@@ -350,6 +350,52 @@ func TestKlinesStatusErrors(t *testing.T) {
 			// Quoted by strconv.Quote, so the server's words are delimited
 			// from ours.
 			wantMessage: `"<html><title>502 Bad Gateway</title></html>"`,
+			// A 502 is Binance's failure whether or not the thing that
+			// answered bothered to explain itself in JSON.
+			wantIs:    []error{ErrServerError},
+			wantIsNot: []error{ErrBadRequest},
+		},
+		{
+			// The finding this case exists for. Binance describes its own
+			// failures in the same {"code","msg"} document it uses for a
+			// refusal, so reading the body without reading the status reports
+			// an outage as the caller's bug — and the root package maps
+			// ErrBadRequest onto ErrInvalidRequest, which it documents as
+			// always the caller's to fix.
+			name:        "a 5xx with Binance's own document is still Binance's failure",
+			status:      http.StatusServiceUnavailable,
+			body:        `{"code":-1001,"msg":"Internal error; unable to process your request."}`,
+			wantIs:      []error{ErrServerError},
+			wantIsNot:   []error{ErrBadRequest, ErrNotFound, ErrRateLimited},
+			wantMessage: "Internal error; unable to process your request.",
+		},
+		{
+			// A 4xx nobody explained. The status is the whole diagnosis, and
+			// it is enough of one: whose fault a refusal is depends on the
+			// class of the status, not on whether the server chose to say
+			// anything. This used to arrive untyped, so a caller could branch
+			// on "this is my bug" only when Binance felt like sending JSON.
+			name:      "an unexplained 4xx is still the caller's",
+			status:    http.StatusForbidden,
+			body:      "<html>blocked</html>",
+			wantIs:    []error{ErrBadRequest},
+			wantIsNot: []error{ErrServerError},
+		},
+		{
+			// The parse reads a document-sized prefix rather than a
+			// snippet-sized one. Read at the snippet's 204 bytes, a message
+			// this long is cut mid-document, fails json.Unmarshal, and loses
+			// both its code and its sentinel — so whether a caller could tell
+			// that this was their own bug came down to how many characters
+			// Binance put in msg.
+			name:   "a long explanation still parses",
+			status: http.StatusBadRequest,
+			body: `{"code":-1102,"msg":"Mandatory parameter 'symbol' was not sent, was empty/null, ` +
+				`or malformed. Reference the API documentation for the parameter list of this ` +
+				`endpoint, its accepted spellings, and the constraints applied to each of them ` +
+				`before retrying the request with a corrected parameter set."}`,
+			wantIs:      []error{ErrBadRequest},
+			wantMessage: "before retrying the request with a corrected parameter set.",
 		},
 	}
 
@@ -387,6 +433,53 @@ func TestKlinesStatusErrors(t *testing.T) {
 				t.Errorf("error = %v, want it to mention %q", err, tc.wantMessage)
 			}
 		})
+	}
+}
+
+// TestKlinesSpendsQuotaPerRequestNotPerCall is the accounting the limiter
+// exists for.
+//
+// One call is one reservation only while nothing goes wrong. A retryable status
+// turns it into as many as MaxAttempts requests, and it does so precisely when
+// the budget matters — 429 and every retryable 5xx are the statuses that
+// trigger the extra attempts, so the failure mode is that the limiter which
+// exists to pre-empt an IP ban is what permits the burst that earns one.
+//
+// The bucket here holds exactly four requests' worth of weight and refills at
+// one unit a second, so the test spends no real time and the reading afterwards
+// is the whole spend: empty means four attempts were counted, and three
+// quarters full means the old behaviour is back.
+func TestKlinesSpendsQuotaPerRequestNotPerCall(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+
+	t.Cleanup(srv.Close)
+
+	lim := NewLimiter(1, 4*KlinesWeight)
+
+	api := NewAPI(srv.URL, srv.Client(), testPolicy(), lim)
+
+	_, err := api.Klines(t.Context(), KlineQuery{Symbol: "BTCUSDT", Interval: "1h"})
+	if !errors.Is(err, ErrServerError) {
+		t.Fatalf("error %v is not %v", err, ErrServerError)
+	}
+
+	if want := int32(DefaultPolicy().MaxAttempts); calls.Load() != want {
+		t.Fatalf("the server saw %d requests, want %d", calls.Load(), want)
+	}
+
+	// Tokens() reports what is left, including whatever trickled back in while
+	// the test ran — at one unit a second over a few milliseconds, well under
+	// one. Anything above that is weight that was spent without being counted.
+	if left := lim.Tokens(); left >= 1 {
+		t.Errorf("%.1f of %d weight units left after %d requests, so %d of them went uncounted",
+			left, 4*KlinesWeight, calls.Load(), calls.Load()-1)
 	}
 }
 
@@ -563,6 +656,11 @@ func TestKlinesPacesItselfAgainstTheLimiter(t *testing.T) {
 // is the same argument applied to the quota: it is enforced per IP address, so
 // two limiters each allowing the documented rate permit twice it — each correct
 // alone and wrong together.
+//
+// The limiter is not a field on API — it is captured by the Reserve closure the
+// constructor installs on the policy — so sharing is asserted where it actually
+// happens, on the sync.OnceValue that produces it, and the constructor is
+// checked for having wired pacing in at all.
 func TestKlinesDefaultsAreShared(t *testing.T) {
 	t.Parallel()
 
@@ -573,8 +671,15 @@ func TestKlinesDefaultsAreShared(t *testing.T) {
 		t.Error("two APIs hold different http.Clients, so they do not share a connection pool")
 	}
 
-	if a.limiter != b.limiter {
-		t.Error("two APIs hold different limiters, so together they exceed the quota each respects alone")
+	// Two calls into two variables, rather than comparing the calls directly:
+	// staticcheck reads `f() != f()` as a mistake, and here it is the point.
+	first, second := defaultLimiter(), defaultLimiter()
+	if first != second {
+		t.Error("the process-wide limiter is rebuilt per call, so limiters together exceed the quota each respects alone")
+	}
+
+	if a.policy.Reserve == nil || b.policy.Reserve == nil {
+		t.Error("an API was built with no reservation on its policy, so its requests are unpaced")
 	}
 
 	if a.baseURL != DefaultAPIBaseURL {

@@ -516,32 +516,63 @@ func TestRESTTranslatesTransportErrors(t *testing.T) {
 		name      string
 		status    int
 		body      string
-		want      error
-		wantNotIs error
+		want      []error
+		wantNotIs []error
 	}{
 		{
-			name:   "404 is a fact about the calendar",
-			status: http.StatusNotFound,
-			want:   ErrNotAvailable,
+			// The bucket is a static file server, where a missing object is a
+			// fact about the calendar. This endpoint is not: asked for a range
+			// it has nothing in, it answers 200 and an empty array. So a 404
+			// here is a misconfigured base URL or path, and calling it
+			// ErrNotAvailable would have Stage 7 degrade the whole REST tail to
+			// nothing and report success.
+			name:      "404 is a misconfiguration, not a calendar fact",
+			status:    http.StatusNotFound,
+			wantNotIs: []error{ErrNotAvailable, ErrInvalidRequest},
 		},
 		{
 			name:   "429 asks the pipeline to slow down",
 			status: http.StatusTooManyRequests,
-			want:   ErrRateLimited,
+			want:   []error{ErrRateLimited},
+			// A throttle is not a ban. Reporting one as the other would have a
+			// caller that can stop, stop — for a condition that clears in
+			// seconds.
+			wantNotIs: []error{ErrIPBanned},
 		},
 		{
 			name:   "418 is a ban, and still a rate limit",
 			status: http.StatusTeapot,
-			want:   ErrRateLimited,
+			want:   []error{ErrRateLimited, ErrIPBanned},
 		},
 		{
 			name:   "an unknown symbol is the caller's bug",
 			status: http.StatusBadRequest,
 			body:   `{"code":-1121,"msg":"Invalid symbol."}`,
-			want:   ErrInvalidRequest,
+			want:   []error{ErrInvalidRequest},
 			// Above all not ErrNotAvailable: "Binance has not published this"
 			// would send whoever is debugging to the wrong place entirely.
-			wantNotIs: ErrNotAvailable,
+			wantNotIs: []error{ErrNotAvailable},
+		},
+		{
+			// The finding this test exists for. Binance answers a 5xx with the
+			// same {"code","msg"} document it uses for a 400, so a reading that
+			// looks only at the body reports its own outage as the caller's
+			// bug — and ErrInvalidRequest is documented as always the caller's
+			// to fix, so a worker pool told that would refuse to retry the one
+			// failure retrying was made for.
+			name:      "a 5xx outage is nobody's bug but Binance's",
+			status:    http.StatusServiceUnavailable,
+			body:      `{"code":-1001,"msg":"Internal error; unable to process your request."}`,
+			wantNotIs: []error{ErrInvalidRequest, ErrNotAvailable, ErrCorruptArchive},
+		},
+		{
+			// The same status with a body from something that is not Binance at
+			// all — a proxy in the way. The verdict comes from the status class
+			// either way; only the detail in the message changes.
+			name:      "a 5xx from a proxy is judged the same way",
+			status:    http.StatusBadGateway,
+			body:      "<html><title>502 Bad Gateway</title></html>",
+			wantNotIs: []error{ErrInvalidRequest, ErrNotAvailable},
 		},
 	}
 
@@ -558,12 +589,204 @@ func TestRESTTranslatesTransportErrors(t *testing.T) {
 				Market: MarketSpot, Symbol: "BTCUSDT", Interval: Interval1h, Start: start, End: end,
 			}, end)
 
-			if !errors.Is(err, tc.want) {
-				t.Errorf("error %v does not wrap %v", err, tc.want)
+			if err == nil {
+				t.Fatal("a non-200 produced no error at all")
 			}
 
-			if tc.wantNotIs != nil && errors.Is(err, tc.wantNotIs) {
-				t.Errorf("error %v should not wrap %v", err, tc.wantNotIs)
+			for _, want := range tc.want {
+				if !errors.Is(err, want) {
+					t.Errorf("error %v does not wrap %v", err, want)
+				}
+			}
+
+			for _, notWant := range tc.wantNotIs {
+				if errors.Is(err, notWant) {
+					t.Errorf("error %v should not wrap %v", err, notWant)
+				}
+			}
+		})
+	}
+}
+
+// serveKlinesContaining answers the way the endpoint would if its inclusive
+// startTime selected the kline whose *interval contains* the timestamp, rather
+// than the first kline opening at or after it.
+//
+// # Why a second handler exists
+//
+// Because the first one cannot test this. [serveKlines] filters on
+// row.open.UnixMilli(), which is one of the two readings of Binance's
+// documented "inclusive startTime" — and a handler written here necessarily
+// encodes whichever reading its author assumed, so a cursor that depends on
+// that assumption passes against it no matter what Binance actually does.
+//
+// This is the other reading, and it is the unforgiving one: a cursor landing
+// one millisecond past a candle's open is still inside that candle, so the page
+// begins by repeating the candle the previous page ended with, and
+// appendPage's strict-increase check fails the whole fetch. A cursor landing
+// exactly on the next candle's open is correct under both, which is why
+// klines advances by intervalEnd and why this test can pass at the same time as
+// the one above.
+func serveKlinesContaining(rows []fakeKline, iv time.Duration, calls *atomic.Int32) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if calls != nil {
+			calls.Add(1)
+		}
+
+		q := r.URL.Query()
+
+		startMs := parseMs(q.Get("startTime"), -1)
+		endMs := parseMs(q.Get("endTime"), 1<<62)
+
+		limit, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || limit <= 0 {
+			limit = 500
+		}
+
+		var page []string
+
+		for _, row := range rows {
+			openMs := row.open.UnixMilli()
+
+			// The whole difference: a row qualifies when startTime falls
+			// anywhere inside its interval, not only on its open.
+			closeMs := row.open.Add(iv).UnixMilli() - 1
+			if closeMs < startMs || openMs > endMs {
+				continue
+			}
+
+			page = append(page, row.json)
+
+			if len(page) == limit {
+				break
+			}
+		}
+
+		_, _ = w.Write([]byte("[" + strings.Join(page, ",") + "]"))
+	}
+}
+
+// TestRESTPaginatesUnderEitherStartTimeReading is the regression test for the
+// pagination cursor.
+//
+// Binance documents startTime as inclusive and does not say inclusive of what.
+// The cursor used to be the last candle's open plus one millisecond, which is
+// an instant *inside* that candle and therefore only safe under one of the two
+// readings. Under the other, every fetch longer than one page fails — loudly,
+// but on the first real multi-page range anyone asks for.
+//
+// Advancing to the next candle's open instead removes the dependency rather
+// than betting on the answer, and this test is what says so: the same range,
+// the same assertions, a handler implementing the other reading.
+func TestRESTPaginatesUnderEitherStartTimeReading(t *testing.T) {
+	t.Parallel()
+
+	start := utc(2024, 1, 15)
+
+	const count = 2500
+
+	rows := makeKlines(start, time.Minute, count)
+	end := start.Add(count * time.Minute)
+
+	var calls atomic.Int32
+
+	f := newTestRESTFetcher(t, serveKlinesContaining(rows, time.Minute, &calls))
+
+	got, err := f.klines(t.Context(), restRef{
+		Market: MarketSpot, Symbol: "BTCUSDT", Interval: Interval1m, Start: start, End: end,
+	}, end)
+	if err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+
+	if len(got) != count {
+		t.Fatalf("got %d candles, want %d", len(got), count)
+	}
+
+	if want := int32(3); calls.Load() != want {
+		t.Errorf("made %d requests, want %d (1000 + 1000 + 500)", calls.Load(), want)
+	}
+
+	for i, k := range got {
+		if want := start.Add(time.Duration(i) * time.Minute); !k.OpenTime.Equal(want) {
+			t.Fatalf("candle %d opens at %s, want %s", i, k.OpenTime.Format(time.RFC3339), want.Format(time.RFC3339))
+		}
+	}
+}
+
+// TestRESTRequiresAClock covers the one input to klines that fails silently.
+//
+// Every other field is validated, and a zero time.Time passes through to the
+// partial-candle rule as an instant that every candle ever published closes
+// after — so appendPage stops on the first row of the first page and the fetch
+// returns no candles and no error. A failed read wearing the shape of an empty
+// range is the conflation the typed errors in errors.go exist to prevent.
+func TestRESTRequiresAClock(t *testing.T) {
+	t.Parallel()
+
+	start := utc(2024, 1, 15)
+	rows := makeKlines(start, time.Hour, 24)
+	end := start.AddDate(0, 0, 1)
+
+	var calls atomic.Int32
+
+	f := newTestRESTFetcher(t, serveKlines(rows, &calls))
+
+	got, err := f.klines(t.Context(), restRef{
+		Market: MarketSpot, Symbol: "BTCUSDT", Interval: Interval1h, Start: start, End: end,
+	}, time.Time{})
+
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("error %v does not wrap %v", err, ErrInvalidRequest)
+	}
+
+	if got != nil {
+		t.Errorf("got %d candles alongside the error, want none", len(got))
+	}
+
+	if calls.Load() != 0 {
+		t.Errorf("made %d requests for a call that could not succeed, want 0", calls.Load())
+	}
+}
+
+// TestRESTMalformedResponseIsACorruptArchive checks that a body which is not
+// klines reaches the caller as the sentinel for "Binance sent bytes this
+// library cannot understand".
+//
+// The condition is one condition however the bytes were packaged: a CSV row
+// with the wrong column count and a JSON array that is not an array of arrays
+// are the same problem, and a caller should not have to discover which layer
+// noticed in order to know what to do. The two used to disagree — a bad decimal
+// inside a well-formed row was ErrCorruptArchive, while a body that would not
+// parse at all arrived untyped.
+func TestRESTMalformedResponseIsACorruptArchive(t *testing.T) {
+	t.Parallel()
+
+	start := utc(2024, 1, 15)
+	end := start.Add(5 * time.Hour)
+
+	bodies := map[string]string{
+		"not JSON at all":          "<html>the wrong service answered</html>",
+		"an object, not a page":    `{"klines":[]}`,
+		"a row of the wrong width": `[[1705276800000,"1","2","3","4"]]`,
+		"a column that is a boolean": `[[1705276800000,true,"2","1","2","10",` +
+			`1705280399999,"20",5,"5","10","0"]]`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newTestRESTFetcher(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+
+			_, err := f.klines(t.Context(), restRef{
+				Market: MarketSpot, Symbol: "BTCUSDT", Interval: Interval1h, Start: start, End: end,
+			}, end)
+
+			if !errors.Is(err, ErrCorruptArchive) {
+				t.Errorf("error %v does not wrap %v", err, ErrCorruptArchive)
 			}
 		})
 	}
