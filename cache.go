@@ -274,6 +274,34 @@ func (c *cache) klines(ctx context.Context, ref archiveRef, spec decodeSpec) ([]
 		return nil, err
 	}
 
+	// A context that is already dead gets no work started for it.
+	//
+	// This is not a shortcut — it is the only place the caller and the work can
+	// still be separated. Below, singleflight.DoChan runs load in a *new*
+	// goroutine, and the select deliberately abandons it on cancellation rather
+	// than stopping it: whoever else is waiting still wants the download, and
+	// if nobody is, it finishes and populates the cache for the next run. That
+	// is the right policy for a cache whose directory outlives any one request.
+	//
+	// It is the wrong policy for a caller who was cancelled before asking,
+	// because there is no "whoever else" — the entry is created by this call.
+	// The goroutine would run load with the same dead context, get as far as
+	// writeAtomic's MkdirAll and CreateTemp (both of which happen *before* the
+	// callback where the cancelled download actually fails), and only then give
+	// up. So a call that returned an error still left directories and a
+	// temporary file behind, written after the caller had gone.
+	//
+	// That surfaced as a flaky test rather than as a bug report: t.TempDir's
+	// cleanup runs RemoveAll on the cache root the instant the test returns,
+	// races the abandoned goroutine creating paths inside it, and fails with
+	// "directory not empty" perhaps once in a hundred runs.
+	//
+	// The same shape as [Policy.wait], which checks ctx even for a zero delay
+	// so that a cancelled context cannot perform one more request.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	for attempt := 0; ; attempt++ {
 		// DoChan rather than Do, because Do offers no way to stop waiting.
 		// A caller whose own context is cancelled has to be able to walk away

@@ -47,13 +47,18 @@ update that table *and* the one in the plan file.
   `errors.Is`. Never `==`.
 - Every function that does I/O takes `ctx context.Context` first.
 - Tests are table-driven. Network paths use `httptest.Server` with committed
-  fixtures — **no test may touch Binance.** Time is injected, never read from
-  `time.Now()` inside logic.
-- `go.mod` declares Go 1.24.9 as the floor; mise pins 1.26.5 for development. A
-  CI job builds with real 1.24, so do not use newer language or stdlib features
-  without raising the floor deliberately. The patch component came from
-  parquet-go in Stage 5 — a dependency's own floor becomes ours, so check what
-  `go get` did to the `go` directive before committing.
+  fixtures — **no test may touch Binance.** Time is injected into *logic*, never
+  read from `time.Now()` inside it. For *timing* — delays, backoff, pacing —
+  prefer a `testing/synctest` bubble over an injected clock: it gives the whole
+  `time` package a fake clock, so assertions are on exact durations and cost no
+  real time. Bubbles and real network calls do not mix, so tests driving an
+  `httptest.Server` keep the injected clock.
+- `go.mod` declares Go 1.25.0 as the floor; mise pins 1.26.6 for development. A
+  CI job builds with real 1.25, so do not use newer language or stdlib features
+  without raising the floor deliberately. The floor has moved twice: to 1.24.9
+  by parquet-go in Stage 5 (a dependency's own floor becomes ours, so check what
+  `go get` did to the `go` directive before committing) and to 1.25.0 in
+  Stage 6, deliberately, for `testing/synctest`.
 
 ## Commands
 

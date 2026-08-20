@@ -14,27 +14,46 @@ module github.com/algo-one/binance-data-downloader
 // The `go` directive is the MINIMUM Go version required to build this module,
 // not the version we develop with. Those are deliberately different:
 //
-//   - This line (1.24.9) is a promise to consumers: anyone on Go 1.24.9 or
-//     newer can import the library. Setting it to the newest release would lock
-//     out users for no benefit, and a published library should be generous here.
+//   - This line (1.25.0) is a promise to consumers: anyone on Go 1.25 or newer
+//     can import the library. Setting it to the newest release would lock out
+//     users for no benefit, and a published library should be generous here.
 //   - mise.toml pins the *development* toolchain to a specific patch release
 //     so every machine and CI runner compiles with identical bits.
 //
-// The compiler enforces this: language features newer than 1.24 are rejected
+// The compiler enforces this: language features newer than 1.25 are rejected
 // even when a newer toolchain is doing the compiling. That is the point — it
-// stops us accidentally breaking the promise.
+// stops us accidentally breaking the promise. CI has a job pinned to the floor
+// for the same reason.
 //
-// It said 1.24.0 until Stage 5. parquet-go declares `go 1.24.9` from v0.26.0
-// onward, and a module's floor cannot sit below any of its dependencies' —
-// `go get` therefore rewrote this line, exactly as `go get golang.org/x/sync`
-// tried to in Stage 4. The difference is that this one is a *patch* bump within
-// 1.24 rather than a move to 1.25: it excludes nobody who keeps their toolchain
-// patched, Go's own support policy only covers the newest patch of each minor
-// release anyway, and it was accepted deliberately rather than absorbed. The
-// alternative was pinning parquet-go v0.25.1, the last release declaring
-// `go 1.22`, and taking a year-old version of the library that owns this
-// project's on-disk format.
-go 1.24.9
+// # Why it moved, twice
+//
+// It said 1.24.0 until Stage 5, when parquet-go — which declares `go 1.24.9`
+// from v0.26.0 — pushed it to 1.24.9. A module's floor cannot sit below any of
+// its dependencies', so `go get` rewrote the line. That one was a patch bump
+// inside 1.24 and excluded nobody who keeps their toolchain current.
+//
+// It moved to 1.25.0 in Stage 6, and that one is a real break for anyone still
+// on 1.24. It was taken deliberately, for `testing/synctest`, which entered the
+// stable API in 1.25 (it was `synctest.Run` behind GOEXPERIMENT in 1.24).
+//
+// The reasoning is worth recording, because a floor bump for a *test* facility
+// looks like a poor trade until the knock-on effects are counted:
+//
+//   - synctest gives a test a private fake clock for the entire time package.
+//     That let internal/vision/limiter.go drop a hand-rolled token bucket in
+//     favour of golang.org/x/time/rate. The bucket existed only because this
+//     package injects its clock so that tests assert on delays rather than
+//     spending them, and rate.Limiter reads time.Now() internally — an
+//     objection a bubble removes completely.
+//   - x/sync could come off its v0.18.0 pin, which existed solely because
+//     v0.20.0 onward requires 1.25.
+//   - x/sys could move to v0.47.0, closing GO-2026-5024. It had been left
+//     outstanding because the fix requires 1.25.
+//
+// So the bump bought a dependency we no longer maintain ourselves, two pins
+// released, and an open advisory closed. The cost is consumers on 1.24, and Go
+// supports only the two newest minor releases in any case.
+go 1.25.0
 
 // `go mod tidy` writes these blocks from the imports in the source, so they are
 // a report rather than a wish list — the way to add a dependency is to import
@@ -71,12 +90,27 @@ require (
 	// pool. singleflight, in the same module, collapses duplicate in-flight
 	// requests in Stage 5.
 	//
-	// Pinned to v0.18.0 rather than latest on purpose: from v0.20.0 the module
-	// requires Go 1.25, and adopting it would silently drag this module's floor
-	// up with it — breaking the promise the `go` line above makes to consumers
-	// still on 1.24. `go get golang.org/x/sync@latest` does exactly that, with
-	// nothing but a line in its output to say so.
-	golang.org/x/sync v0.18.0
+	// It was pinned to v0.18.0 from Stage 4 until Stage 6, because v0.20.0
+	// onward requires Go 1.25 and `go get golang.org/x/sync@latest` would have
+	// dragged this module's floor up with it, with nothing but a line of output
+	// to say so. Moving the floor to 1.25 deliberately made the pin pointless,
+	// so it is gone.
+	golang.org/x/sync v0.22.0
+
+	// x/time/rate is the token bucket that paces calls to
+	// data-api.binance.vision. That endpoint — unlike the archive bucket — has a
+	// published quota of 6000 request-weight per minute per IP, and exceeding it
+	// earns an HTTP 418 IP ban of two minutes to three days that punishes every
+	// process on the address. See internal/vision/limiter.go.
+	//
+	// Stage 6 shipped a hand-rolled bucket first and replaced it in the same
+	// stage. The only argument for owning the code was that this package injects
+	// its clock so tests can assert on delays without spending them, and
+	// rate.Limiter reads time.Now() itself; testing/synctest answers that
+	// completely, and the library's cancellation path is more careful than the
+	// hand-rolled one — it restores only tokens that later reservations have not
+	// already claimed.
+	golang.org/x/time v0.15.0
 )
 
 // Dependencies of dependencies. `go mod tidy` maintains this block; nothing
@@ -85,14 +119,14 @@ require (
 // klauspost/compress is ahead of the v1.17.9 parquet-go asks for, deliberately:
 // that version carries GO-2026-5841, and v1.18.7 is the fix. Go resolves a
 // dependency to the highest version anyone in the graph requires, so raising it
-// here is enough — and v1.18.7 still declares `go 1.24`, so it costs nothing at
-// the floor. govulncheck reports it as uncalled either way; it is fixed rather
-// than waived because it was free to fix.
+// here is enough. govulncheck reports it as uncalled either way; it is fixed
+// rather than waived because it was free to fix.
 //
-// golang.org/x/sys is knowingly left at v0.38.0 with GO-2026-5024 outstanding.
-// The fix, v0.44.0, declares `go 1.25.0` and would move this module's floor off
-// 1.24 entirely — the same trade x/sync was pinned to avoid. govulncheck
-// confirms nothing here calls it.
+// golang.org/x/sys is on v0.47.0, which closes GO-2026-5024. It sat at v0.38.0
+// with that advisory open through Stage 5, because the fix declares
+// `go 1.25.0` and the floor was still 1.24 — govulncheck confirmed nothing here
+// called it, so the trade was to wait. Stage 6 moved the floor for other
+// reasons and this came along for free.
 require (
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -101,6 +135,6 @@ require (
 	github.com/parquet-go/jsonlite v1.0.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/twpayne/go-geom v1.6.1 // indirect
-	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 )

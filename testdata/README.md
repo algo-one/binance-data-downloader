@@ -34,3 +34,25 @@ decoder has to get right.
 No archive spans the switch — it fell on a day *and* month boundary — so the
 per-row detection rule is exercised by a synthetic mixed file in `codec_test.go`
 and these fixtures prove each side of it.
+
+## The REST capture
+
+| File | Rows | Why it is here |
+| --- | --- | --- |
+| `BTCUSDT-1h-2024-01-15.klines.json` | 24 | The **same day** as `BTCUSDT-1h-2024-01-15.zip`, fetched from `data-api.binance.vision/api/v3/klines` on 2026-08-20 |
+
+This one is not an archive and has no `.CHECKSUM`, because Binance publishes
+none for an API response. It is here to make one claim testable that nothing
+else could check: this library treats a zipped CSV from the bucket and a JSON
+array from the API as interchangeable sources of the same candles, and that is
+only true if they decode identically.
+
+`TestRESTAgreesWithTheArchive` in `restapi_test.go` decodes both fixtures and
+compares all 24 candles field by field. Both sides are real data, so the test
+fails if the REST decoder, the CSV decoder, or Binance's own two representations
+ever drift apart. It was confirmed to fail when a single digit in the last
+decimal place of one price was altered.
+
+The same "do not modify" rule applies. Editing it would turn a comparison of two
+real sources into a comparison of one real source against something this
+repository made up.

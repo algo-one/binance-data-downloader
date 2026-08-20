@@ -99,21 +99,51 @@ type RateLimitError struct {
 	// misconfigured proxy's 24 hours down to 30 seconds here would hide the
 	// misconfiguration rather than surface it. Callers should bound it.
 	RetryAfter time.Duration
+
+	// Banned distinguishes an HTTP 418 from an HTTP 429: the address is barred
+	// rather than merely being asked to slow down.
+	//
+	// Only the REST API produces it — the static bucket has no quota — and it
+	// is the escalation Binance applies to a client that keeps ignoring 429s.
+	// The ban runs from two minutes to three days and lengthens with repeat
+	// offences, so the right response is to stop rather than to back off: a
+	// retry cannot outlast it and does earn the next one. See klines.go.
+	Banned bool
 }
 
 func (e *RateLimitError) Error() string {
-	if e.RetryAfter > 0 {
-		return fmt.Sprintf("%q: %s, retry after %s", e.Key, ErrRateLimited, e.RetryAfter)
+	cause := ErrRateLimited
+	if e.Banned {
+		cause = ErrIPBanned
 	}
 
-	return fmt.Sprintf("%q: %s", e.Key, ErrRateLimited)
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("%q: %s, retry after %s", e.Key, cause, e.RetryAfter)
+	}
+
+	return fmt.Sprintf("%q: %s", e.Key, cause)
 }
 
 // Unwrap is what makes errors.Is(err, ErrRateLimited) true for this type.
 // Returning the sentinel rather than embedding it keeps the two ways of asking
 // — the condition and the detail — from needing to agree about anything beyond
 // this one method.
-func (e *RateLimitError) Unwrap() error { return ErrRateLimited }
+//
+// # Why it returns a slice
+//
+// A ban is two facts at once: the address is barred, and the pipeline is going
+// too fast. A caller that only asks "should I slow down?" should get a yes from
+// a 418 as readily as from a 429, while one that can tell the difference should
+// be able to. Since Go 1.20 an Unwrap returning []error attaches both, and
+// errors.Is walks every branch — so the coarse question and the precise one are
+// answered by the same value without either having to know about the other.
+func (e *RateLimitError) Unwrap() []error {
+	if e.Banned {
+		return []error{ErrRateLimited, ErrIPBanned}
+	}
+
+	return []error{ErrRateLimited}
+}
 
 // Result describes what one download produced.
 type Result struct {

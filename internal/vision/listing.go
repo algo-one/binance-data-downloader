@@ -1,4 +1,21 @@
-// Package vision talks to the bucket behind data.binance.vision.
+// Package vision is the only package in this library that speaks HTTP.
+//
+// It talks to three endpoints, which are three genuinely different services
+// that happen to share a domain name:
+//
+//	data.binance.vision                   fetches one archive        download.go
+//	s3-ap-northeast-1.amazonaws.com/...   lists what exists          listing.go
+//	data-api.binance.vision               the recent tail, as JSON   klines.go
+//
+// The first two are a static file server and the S3 API in front of it, and
+// neither has a quota. The third is the read-only half of Binance's trading
+// API — market data, no key — and it enforces the trading API's rate limit,
+// which is why limiter.go exists and applies to that endpoint alone.
+//
+// Everything here is transport. No type in this package knows what a candle is:
+// strings and bytes go in, strings and bytes come out. That is what allows it
+// to live under internal/ at all — see docs/architecture.md, which draws the
+// line at whether a package needs the root's domain types.
 //
 // # What the bucket is
 //

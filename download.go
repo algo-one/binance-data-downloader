@@ -156,7 +156,25 @@ func translateVisionError(err error) error {
 		// The retry policy already backed off inside the request and the 429
 		// outlived it. The whole pipeline needs to slow down, which is a
 		// decision for the layer that owns the worker pool.
+		//
+		// An HTTP 418 — the ban Binance escalates a persistent 429 into —
+		// arrives here too, because vision.RateLimitError wraps both sentinels
+		// and this case tests the coarser one. The distinction is not lost: it
+		// stays readable through errors.Is(err, vision.ErrIPBanned) and in the
+		// message, which is where a caller that can act on it will look.
 		return fmt.Errorf("%w: %w", err, ErrRateLimited)
+
+	case errors.Is(err, vision.ErrBadRequest):
+		// A 4xx the REST API explained: an unknown symbol, an interval it does
+		// not serve. The server understood the request and refused it, so the
+		// fault is on this side and no amount of retrying or falling back to
+		// another source changes the answer.
+		//
+		// Deliberately not ErrNotAvailable. "Binance has not published this"
+		// and "you asked for something that does not exist" send whoever is
+		// debugging to different places, and only the second one is fixable by
+		// the caller.
+		return fmt.Errorf("%w: %w", err, ErrInvalidRequest)
 
 	default:
 		return err

@@ -378,6 +378,112 @@ the old file or the new one. A Parquet file truncated by a crash is the failure
 worth naming: its footer is written last, so a torn one is not readable at all —
 but only because nothing wrote it in place.
 
+## The REST tail
+
+The archives lag real time by roughly a day — verified on 2026-08-17, when the
+2026-08-16 daily archive existed and the 2026-08-17 one did not — so a request
+ending today has a tail that has never been written to a file. `internal/plan`
+already accounts for it: `Expand` emits a `KindRESTRange` chunk past the archive
+frontier, and `Substitute` ends its ladder there, because `3d`, `1w` and `1mo`
+have no daily archives and a hole in their monthly ones (the real, missing
+`BTCUSDT-1mo-2024-03`) has nowhere else to go.
+
+`data-api.binance.vision` is a **different service from the bucket** despite the
+shared domain. It is the read-only half of the trading API: no key, market data
+only — and, unlike a static file server, it has a quota.
+
+**The rows are never decoded as numbers.** A kline arrives as a JSON array
+mixing unquoted numbers with quoted decimals, and the one-line decode into
+`[]any` turns every one of those numbers into a `float64`. That is precisely
+what this library exists not to do. Each element is lifted out as
+`json.RawMessage` and rendered back to the exact characters Binance sent, so the
+digits reach `udecimal` unrounded.
+
+**One decoder, two formats.** The response carries the same twelve columns in
+the same order as the CSV inside an archive (verified against the live endpoint
+on 2026-08-20), so `decodeRow`, `checkTimes` and `checkValues` police both. The
+two column counts live in packages that cannot import each other, so their
+equality is asserted at compile time rather than assumed. `restapi_test.go`
+proves the two paths agree by decoding a real archive and a real REST capture of
+the same day and comparing all 24 candles field by field.
+
+**The candle in progress is dropped.** The endpoint always returns the interval
+currently forming, whose volume and close price are still moving; archives never
+contain one. Everything downstream assumes a candle is settled once seen — the
+Parquet tier caches it, Stage 7 will merge on open time — so admitting one makes
+two identical requests seconds apart disagree, with neither being wrong. A
+candle is returned once `intervalEnd(OpenTime)` has passed, compared against an
+injected clock rather than `time.Now`. It is a field on the fetcher, so Stage 7
+can offer it as an option.
+
+**Pagination terminates three ways**, because any one alone is a bug waiting for
+the right response: an empty page, a page shorter than requested, or a cursor
+that reaches the end of the range. The cursor is taken from the last candle of
+each page and advanced one millisecond — the endpoint's own resolution, and the
+smallest step that cannot return the same candle twice. Since every candle opens
+at or after the cursor that requested it, the cursor strictly increases, so the
+loop cannot stand still.
+
+### Rate limiting, and why only here
+
+The bucket has no quota; this endpoint does. Measured on 2026-08-20 via
+`/api/v3/exchangeInfo`:
+
+```
+REQUEST_WEIGHT   6000 per minute, per IP address
+```
+
+and one klines call costs 2. Exceeding it is worse than being slow. Binance
+escalates a 429 that a client keeps ignoring into an HTTP **418** — an IP ban
+running from two minutes to three days, lengthening with repeat offences. That
+punishes the address rather than the process, so a ban earned by a history
+download also locks out a live trading bot on the same host, and no retry can
+undo it.
+
+So the limiter is preventative; the `Retry-After` handling in `retry.go` is the
+reactive half, and by the time it runs some damage is already done. It is
+`golang.org/x/time/rate`, configured to 40 weight per second against a ceiling
+of 100 — deliberately leaving most of the budget unspent, because the quota is
+per IP and anything else on the machine draws from the same 6000.
+
+It is process-wide via `sync.OnceValue`, for the same reason the `http.Client`
+is. Two limiters each honouring the documented rate permit twice it — each
+correct alone and wrong together.
+
+**This started as a hand-rolled bucket and was replaced within the stage**, and
+the reason is worth recording because it generalises. The only argument for
+owning fifty lines of token-bucket arithmetic was that everything else in
+`internal/vision` injects its clock so tests can assert on delays instead of
+spending them, and `rate.Limiter` reads `time.Now()` internally.
+
+`testing/synctest` dissolves that argument. A test inside a bubble gets a
+private fake clock for the *entire* `time` package, so the limiter's internal
+`time.Now()` and its timers are virtual without it knowing, and the test asserts
+on exact durations — 50 ms, not "between 40 and 70" — while running in zero real
+time. What was left was arithmetic maintained against a canonical implementation
+whose cancellation path is more careful than ours: it restores only the tokens
+later reservations have not already claimed.
+
+That is what the move to a Go 1.25 floor bought, and it paid for itself twice
+over: `x/sync` came off the v0.18.0 pin it only had because v0.20.0 wants 1.25,
+and `x/sys` moved to v0.47.0, closing GO-2026-5024 — an advisory left open in
+Stage 5 for the same reason.
+
+The limit of the technique is worth stating too, since it decides the shape of
+several tests. Time in a bubble advances only when every goroutine in it is
+*durably blocked* — blocked on something only another goroutine in the same
+bubble can release. A goroutine waiting on a real socket never qualifies, so a
+test driving an `httptest.Server` cannot use a bubble. Those tests assert on
+request counts instead, and `retry.go` keeps `Policy.Now` and `Policy.After` for
+exactly that reason.
+
+A 418 is reported as `*vision.RateLimitError` with `Banned` set, and its
+`Unwrap` returns **both** `ErrRateLimited` and `ErrIPBanned`. A caller asking
+only "should I slow down?" gets a yes; one that can tell a ban from a throttle
+can. `X-MBX-USED-WEIGHT-1M` is parsed and reported rather than acted on — when
+it climbs while the local accounting says otherwise, something else on the
+address is spending the quota, which is a diagnosis no local bookkeeping reaches.
+
 ## Package layout
 
 ```
@@ -395,18 +501,20 @@ but only because nothing wrote it in place.
 ├── download.go       archive key → verified bytes; vision errors → sentinels
 ├── cache.go          the two tiers, atomic writes, singleflight
 ├── parquet.go        tier 2: the schema, the footer stamp, the column reader
-├── restapi.go        data-api.binance.vision klines                          (planned)
+├── restapi.go        the REST tail: pagination, partial-candle policy
 ├── options.go        functional options for NewLoader                        (planned)
 ├── loader.go         Fetch / FetchAll / Stream                               (planned)
 │
 ├── internal/
 │   ├── plan/         range → []Chunk (pure; imports only errors, fmt, time)
-│   └── vision/       the bucket: one shared client, retries, listing, download
+│   └── vision/       every HTTP call: one shared client, retries, both hosts
 │       ├── client.go    the process-wide http.Client and its Transport
 │       ├── retry.go     Policy, doWithRetry, Retry-After
 │       ├── body.go      draining and quoting response bodies
 │       ├── listing.go   S3 ListObjects with marker pagination
-│       └── download.go  one object, streamed and hashed in a single pass
+│       ├── download.go  one object, streamed and hashed in a single pass
+│       ├── klines.go    data-api.binance.vision/api/v3/klines
+│       └── limiter.go   x/time/rate, sized to that endpoint's quota
 │
 ├── cmd/bmd/          the CLI binary
 ├── testdata/         real archives, byte-untouched (see its README)
@@ -582,7 +690,7 @@ setting is a defect, not a stub.
 | 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | **done** |
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | **done** |
 | 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | **done** |
-| 6 | REST fetcher — pagination for the recent tail, rate limiting | |
+| 6 | REST fetcher — pagination for the recent tail, rate limiting | **done** |
 | 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | |
 | 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress | |
 | 9 | Docs and release — runnable examples, pkg.go.dev polish, v0.1.0 | |
@@ -594,6 +702,14 @@ setting is a defect, not a stub.
 | `github.com/quagmt/udecimal` | Exact prices and volumes | 1 |
 | `golang.org/x/sync` | `errgroup` (the two availability listings in parallel, then the Stage 7 bounded pool), `singleflight` (dedup) | 4 |
 | `github.com/parquet-go/parquet-go` | Tier-2 cache and CLI export; pure Go. Raised the module's floor from Go 1.24.0 to 1.24.9, which it declares from v0.26.0 onward — accepted deliberately as a patch-level bump; see `go.mod` | 5 |
+| `golang.org/x/time` | `rate.Limiter`, the token bucket pacing the REST endpoint | 6 |
+
+The module's floor is **Go 1.25.0**, and it has moved twice. parquet-go pushed
+it from 1.24.0 to 1.24.9 in Stage 5, because a module's floor cannot sit below
+any of its dependencies'. Stage 6 moved it to 1.25.0 deliberately, for
+`testing/synctest` — see the rate-limiting section above for what that bought.
+CI has a job pinned to the floor so that a further move has to be a decision
+rather than an accident.
 
 Everything else is standard library: `net/http`, `archive/zip`, `encoding/csv`,
 `crypto/sha256`, `log/slog`, `flag`, `iter`, `testing`.

@@ -43,7 +43,7 @@ jobs:
 
       - run: mise run ci
 
-  # go.mod promises this module builds on Go 1.24.9, while we develop on 1.26.
+  # go.mod promises this module builds on Go 1.25.0, while we develop on 1.26.
   # A promise nobody tests is a promise that quietly breaks, so this job builds
   # and tests with the oldest supported toolchain.
   oldest-go:
@@ -52,13 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # "1.24" without a patch resolves to the newest 1.24.x release, which is
-      # what makes this job honest about the floor: go.mod says 1.24.9 (a floor
-      # parquet-go brought with it in Stage 5), and a runner pinned to an older
-      # patch would fail to build rather than silently passing.
+      # "1.25" without a patch resolves to the newest 1.25.x release, which is
+      # what makes this job honest about the floor: go.mod says 1.25.0, and a
+      # runner pinned to an older patch would fail to build rather than silently
+      # passing.
+      #
+      # It said "1.24" until Stage 6, which moved the floor to 1.25 for
+      # testing/synctest — stable from 1.25, and behind GOEXPERIMENT before it.
+      # This job is what would have caught that change had it been accidental.
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          go-version: "1.25"
 
       # GOTOOLCHAIN=local stops Go from silently downloading a newer toolchain
       # when it thinks it needs one — which would defeat the entire purpose of

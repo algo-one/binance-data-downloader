@@ -608,13 +608,52 @@ func TestCacheRejectsCorruptedDownloads(t *testing.T) {
 func TestCacheHonoursCancellation(t *testing.T) {
 	t.Parallel()
 
-	c, _ := newTestCache(t, nil)
+	c, requests := newTestCache(t, nil)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	if _, err := c.klines(ctx, testRef(), testSpec()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("klines = %v, want context.Canceled", err)
+	}
+
+	if got := requests.Load(); got != 0 {
+		t.Errorf("a cancelled call made %d requests, want 0", got)
+	}
+
+	// Nothing may be left on disk either, and this half is the part that was
+	// missing.
+	//
+	// klines hands its work to singleflight.DoChan, which runs it in a new
+	// goroutine, and the cancellation path deliberately walks away rather than
+	// stopping it — correct when other callers are waiting, wrong when the
+	// caller was cancelled before it asked, because then there are none. That
+	// goroutine reached writeAtomic's MkdirAll and CreateTemp, both of which
+	// run *before* the callback where the cancelled download fails, so a call
+	// that returned an error still created directories afterwards. MkdirAll's
+	// are never cleaned up: only the temp file is.
+	//
+	// It showed up as flakiness rather than as a failure. t.TempDir removes the
+	// cache root the moment the test returns, racing the abandoned goroutine
+	// writing into it, and fails with "directory not empty" — reproducible at
+	// -count=300, invisible at -count=1.
+	//
+	// Be clear about what the check below does and does not do. It is *not*
+	// what catches that race: measured against the unfixed code over 200 runs,
+	// the cleanup failed 169 times and this assertion fired zero, because the
+	// goroutine has not reached MkdirAll yet at the instant the test body looks.
+	// The detector is t.TempDir's own cleanup under -count. What this adds is
+	// the invariant stated out loud — a cancelled call leaves the cache exactly
+	// as it found it — which catches the version of this bug that is not a
+	// race, such as klines creating its directories eagerly before checking the
+	// context.
+	entries, err := os.ReadDir(c.root)
+	if err != nil {
+		t.Fatalf("reading the cache root: %v", err)
+	}
+
+	if len(entries) != 0 {
+		t.Errorf("a cancelled call left %s in the cache root, want it untouched", names(entries))
 	}
 }
 
