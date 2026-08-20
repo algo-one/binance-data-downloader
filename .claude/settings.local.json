@@ -1,0 +1,10 @@
+{
+  "skillOverrides": {},
+  "permissions": {
+    "deny": [
+      "Read(questions.md)",
+      "Edit(questions.md)",
+      "Write(questions.md)"
+    ]
+  }
+}
