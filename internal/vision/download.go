@@ -28,10 +28,14 @@ const DefaultDownloadBaseURL = "https://data.binance.vision"
 //	data/spot/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2024-01.zip.CHECKSUM
 const ChecksumSuffix = ".CHECKSUM"
 
-// maxChecksumSize bounds how much of a sidecar is read. The real files are 91
-// bytes — 64 hex digits, two spaces and a file name — so anything approaching
-// this is not a checksum and there is no reason to buffer it.
-const maxChecksumSize = 4 << 10
+// MaxChecksumSize bounds how much of a sidecar [ReadChecksum] will read. The
+// real files are 91 bytes — 64 hex digits, two spaces and a file name — so
+// anything approaching this is not a checksum and there is no reason to buffer
+// it.
+//
+// Exported so the cache's own tests can name the boundary they are crossing
+// rather than repeating the number and hoping the two stay equal.
+const MaxChecksumSize = 4 << 10
 
 // Errors this package reports as sentinels, for the root package to translate
 // into its own. They exist because internal/vision cannot import the root — the
@@ -229,24 +233,41 @@ func (d *Downloader) Checksum(ctx context.Context, archiveKey string) (string, e
 	}
 	defer drainAndClose(resp)
 
-	// Reading one byte past the maximum is what makes "too large" detectable:
-	// a read that stops exactly at the limit cannot tell a file of exactly
-	// that size from one that was cut short.
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumSize+1))
-	if err != nil {
-		return "", fmt.Errorf("reading %q: %w", key, err)
-	}
-
-	if len(b) > maxChecksumSize {
-		return "", fmt.Errorf("reading %q: sidecar is larger than %d bytes", key, maxChecksumSize)
-	}
-
-	sum, err := parseChecksum(b, path.Base(archiveKey))
+	sum, err := ReadChecksum(resp.Body, path.Base(archiveKey))
 	if err != nil {
 		return "", fmt.Errorf("reading %q: %w", key, err)
 	}
 
 	return sum, nil
+}
+
+// ReadChecksum reads a .CHECKSUM sidecar from r and returns the hash in it.
+//
+// It is the bounded read that has to happen before [ParseChecksum] can be
+// handed a byte slice, and it is exported for the same reason the parser is:
+// the cache reads sidecars off disk while this package reads them off the
+// network, and the *reading* half of that has the same two decisions in it as
+// the parsing half. Keeping them together means the size limit is one constant
+// and the "too large" error is one sentence, rather than two of each drifting
+// apart in two packages.
+//
+// The caller supplies the context — a URL here, a file name in the cache — by
+// wrapping what comes back, so nothing in this function has to know which it
+// was reading.
+func ReadChecksum(r io.Reader, wantName string) (string, error) {
+	// Reading one byte past the maximum is what makes "too large" detectable:
+	// a read that stops exactly at the limit cannot tell a file of exactly
+	// that size from one that was cut short.
+	b, err := io.ReadAll(io.LimitReader(r, MaxChecksumSize+1))
+	if err != nil {
+		return "", err
+	}
+
+	if len(b) > MaxChecksumSize {
+		return "", fmt.Errorf("sidecar is larger than %d bytes", MaxChecksumSize)
+	}
+
+	return ParseChecksum(b, wantName)
 }
 
 // get performs one GET, with retries, and returns a response whose status is
@@ -319,7 +340,7 @@ func (d *Downloader) statusError(key string, resp *http.Response) error {
 	}
 }
 
-// parseChecksum extracts the hash from a .CHECKSUM sidecar.
+// ParseChecksum extracts the hash from a .CHECKSUM sidecar.
 //
 // The format is the one `sha256sum` writes, which the real files follow
 // exactly — 64 hex digits, two spaces, the file name, and, in the files Binance
@@ -334,7 +355,11 @@ func (d *Downloader) statusError(key string, resp *http.Response) error {
 // everything, so its length and alphabet are checked exactly.
 //
 // wantName, when non-empty, must match the name the sidecar carries.
-func parseChecksum(b []byte, wantName string) (string, error) {
+//
+// It is exported for the cache, which reads sidecars back off disk rather than
+// off the network. Two parsers for one format is one parser that gets fixed and
+// one that does not, so the local path and the network path share this.
+func ParseChecksum(b []byte, wantName string) (string, error) {
 	// Only the first line is read. A sidecar with more than one entry is not
 	// something Binance publishes, and guessing which line applies would be
 	// exactly the kind of silent assumption this library avoids.
@@ -369,4 +394,21 @@ func parseChecksum(b []byte, wantName string) (string, error) {
 	}
 
 	return sum, nil
+}
+
+// FormatChecksum renders a sidecar in the form Binance publishes: the hash, two
+// spaces, the archive's file name, and no trailing newline.
+//
+// The cache writes one of these beside every archive it stores, so that tier 1
+// on disk is the pair of files Binance served rather than the archive plus a
+// hash in some format of this project's own invention. Two consequences follow
+// from matching the published format byte for byte: `sha256sum -c` verifies a
+// cache directory with no tooling from here, and the round trip through
+// [ParseChecksum] is exercised against the real fixtures rather than against a
+// convention this package agreed with itself.
+//
+// It lives next to the parser deliberately. A writer and a reader of the same
+// format in two different files is how they drift.
+func FormatChecksum(sum, name string) string {
+	return sum + "  " + name
 }

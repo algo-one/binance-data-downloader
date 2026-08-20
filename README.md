@@ -63,7 +63,7 @@ As a CLI:
 go install github.com/algo-one/binance-data-downloader/cmd/bmd@latest
 ```
 
-Requires Go 1.24 or newer.
+Requires Go 1.24.9 or newer.
 
 ## Development
 

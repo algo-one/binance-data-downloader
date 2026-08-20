@@ -22,7 +22,7 @@
 # this is the compiler we *develop* with; go.mod declares the oldest compiler
 # a consumer may *build* with.
 [tools]
-go = "1.26.5"
+go = "1.26.6"
 # golangci-lint runs many linters in one pass, with caching. Also does
 # formatting in v2 via `golangci-lint fmt`.
 golangci-lint = "2.12.2"

@@ -437,7 +437,7 @@ func TestParseChecksum(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := parseChecksum([]byte(tt.body), tt.wantName)
+			got, err := ParseChecksum([]byte(tt.body), tt.wantName)
 
 			if tt.wantErr {
 				if err == nil {
@@ -448,7 +448,7 @@ func TestParseChecksum(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("parseChecksum: %v", err)
+				t.Fatalf("ParseChecksum: %v", err)
 			}
 
 			if got != tt.want {

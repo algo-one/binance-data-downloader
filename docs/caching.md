@@ -1,7 +1,9 @@
 # Caching
 
-> **Status:** design document. The cache lands in Stage 5. `CodecVersion`, the
-> constant this design leans on, exists as of Stage 3 and lives in `codec.go`.
+> **Status:** live as of Stage 5. `cache.go` holds the tiers and the atomic
+> writes, `parquet.go` holds the schema and the footer stamp, and `CodecVersion`
+> lives in `codec.go`. Everything below is implemented; the measurements are
+> from the code rather than from estimates that preceded it.
 
 ## The problem
 
@@ -88,9 +90,60 @@ parquet is usable  ⟺  footer["bmd.source.sha256"] == sha from the .CHECKSUM si
 ```
 
 **Cost of a cache hit:** read the ~90-byte `.CHECKSUM` file and the Parquet
-footer (one seek to end of file). Sub-millisecond, against ~60–70 ms to
-re-parse. On a hit **the ZIP is never opened and never re-hashed** — re-hashing
-it on every read would defeat the entire point.
+footer (one seek to end of file), then the rows. On a hit **the ZIP is never
+opened and never re-hashed** — re-hashing it on every read would defeat the
+entire point. `TestCacheHitDoesNotReadTheArchive` proves it by replacing the
+archive with garbage and requiring the read to succeed anyway.
+
+Measured on an Apple M1 Pro, for one symbol-month of `1m` candles (44,640 rows):
+
+| | |
+| --- | --- |
+| Decode the ZIP (Stage 3, the baseline this replaces) | ~62 ms |
+| Read the Parquet | **6.1 ms**, 479 allocations |
+| Build the Parquet, once per archive | 15 ms on top of the decode |
+
+So a hit is about **ten times cheaper** than re-parsing, which is the margin
+that makes a second copy on disk worth having.
+
+### The rows are read a column at a time
+
+That margin was not there in the first implementation, and the difference is
+worth recording because it very nearly sank the design.
+
+parquet-go's `GenericReader` reconstructs one Go struct per row through
+reflection. Reading the same month that way took **26.5 ms and 99,573
+allocations** — against 62 ms to parse the CSV. A cache twice as fast as the
+work it replaces does not earn a second copy of the data, a second format, and
+a dependency.
+
+Reading each column as one contiguous run instead — `parquet.Int64Reader` for
+the two timestamps and the trade count, `parquet.BE128Reader` for the eight
+decimals, straight into the `Kline` fields — takes 6.1 ms and 479 allocations.
+Same file, same library, 4.3× apart. The column layout is what makes it
+possible: 44,640 open times sit together on disk, so a run of one type is
+copied in bulk rather than assembled a field at a time.
+
+Both typed readers are an optimisation parquet-go offers rather than a
+guarantee it makes, so `readPage` falls back to the generic `ValueReader` for a
+page encoded some other way. The fallback is slower and correct, which is the
+right trade for a path whose purpose is that a library upgrade cannot turn into
+a cache that refuses to read itself.
+
+Reading positionally is only safe because the file's schema is checked against
+the expected column names *and* their physical types before any value is read.
+A column order that shifted by one would put the high price in the low price's
+field, and every value would still parse — the quietest possible bug, and the
+same class the twelve named CSV column constants in `codec.go` exist to prevent.
+
+The type half of that check is not symmetry for its own sake. `readPage` picks
+its fast path by asserting on the decoded page's type and falls back to a
+generic reader when the assertion fails, so a column with the right name and the
+wrong storage — an `INT64` where a `DECIMAL(38,8)` belongs — reaches the
+fallback's decimal branch and asks an integer for its bytes. parquet-go answers
+that with an `unsafe.Slice` over a nil pointer, which panics the goroutine
+rather than returning an error the cache could rebuild from. Checking the type
+keeps the whole class inside the error type.
 
 ## When a rebuild happens
 
@@ -130,12 +183,22 @@ pinned, and no wall-clock timestamp anywhere in the footer, the same
 become trivial and caches can be diffed across machines. This is worth
 deliberately *omitting* a `created_at` stamp to keep.
 
+One knob had to be pinned that the design did not anticipate. parquet-go builds
+its `created by` footer string from the module's own build information, so it
+changes whenever the library is rebuilt from a different commit — two identical
+caches would differ in their footers for a reason having nothing to do with
+their contents. It is pinned to `CodecVersion` instead, so the string changes
+exactly when the meaning of the rows does. `TestCacheRebuildIsReproducible`
+builds the same archive through two independent caches and compares the bytes.
+
 **Free corruption detection.** Parquet writes a CRC32 per data page, so a
 damaged tier-2 file is caught on read and rebuilt from tier 1.
 
 **Optional archive pruning.** Tier 1 is only needed to build or rebuild, so a
 `--prune-archives` flag could reclaim half the disk — at the cost of
-re-downloading if `CodecVersion` ever bumps. A flag, never the default.
+re-downloading if `CodecVersion` ever bumps. A flag, never the default. The read
+path already supports it: a hit needs the sidecar and the Parquet, never the
+archive, so a pruned cache serves every read that does not need a rebuild.
 
 ## Integrity
 
@@ -148,8 +211,67 @@ it, and returns `ErrChecksum` on a mismatch — so unverified bytes never reach
 the cache, and the hash the cache stamps into the Parquet footer is one that was
 computed and checked rather than copied from the sidecar on faith.
 
+A **rebuild** does not re-hash either. It reads the stored archive and stamps
+the Parquet with the hash from the sidecar beside it, so bit rot in a stored
+archive would be inherited by the file built from it rather than caught. That
+is the same trade as the read path — verification happens where it is
+affordable — and `bmd verify` in Stage 8 is what closes it.
+
+The cache writes the sidecar itself, in the format Binance publishes: 64 hex
+digits, two spaces, the archive's name, no trailing newline. Two things follow.
+`sha256sum -c` verifies a cache directory with no tooling from this project, and
+`TestCacheWritesThePublishedSidecar` can compare what the cache wrote against
+the genuine published file byte for byte — which it does. The hash in it is one
+this process computed over the bytes as they streamed past, not one copied from
+a server on faith.
+
 All cache writes go to a temporary file in the destination directory and are
 then renamed into place. `rename(2)` within a filesystem is atomic, so a crash
 mid-write leaves either the old file or the new one, never a truncated one.
 Writing straight to the final path is the trap here: an interrupted run leaves
-a torn file that looks valid to the next process to open it.
+a torn file that looks valid to the next process to open it. The temporary file
+has to be in the *destination directory* rather than the system temp directory,
+because a rename across filesystems is a copy followed by a delete — which is
+the non-atomic write this is avoiding.
+
+Tier 1 is written archive first, sidecar second. That order gives the stronger
+invariant: a sidecar implies the archive beside it, so a crash between the two
+leaves an archive with no sidecar, which the next run treats as absent and
+downloads again. The reverse would leave a sidecar vouching for a file that is
+not there.
+
+## Concurrency
+
+Two overlapping requests — January–March and February–April for one symbol —
+both want February. `singleflight` collapses them: the first caller to ask for
+an archive does the work and the others wait on its result, keyed on the Parquet
+path. Nothing is remembered once the call returns, which makes it a
+deduplicator rather than a third tier.
+
+The key is registered on the way in, before any I/O. That is correctness
+requirement 5, and the bug it exists to avoid: the ported implementation
+registered its deduplication entry *after* taking a concurrency permit, so a
+saturated pool let several tasks past the check before any of them registered
+and the same month downloaded several times over. Stage 7's bounded pool sits
+outside this, never between the check and the work.
+
+Waiters receive a copy of the candles rather than the slice itself. Stage 7
+merges and trims ranges in place, and one caller's trim writing through into
+another's range would be a silent, data-dependent bug.
+
+`singleflight` has one sharp edge worth knowing about: the shared call runs
+under the context of whichever caller arrived first, so if *that* caller cancels,
+everyone waiting is handed a cancellation that has nothing to do with them. The
+cache detects exactly that case — a context error on a call whose own context is
+still alive — and asks again, at most twice.
+
+## What was left out
+
+**A third, in-memory tier.** The stage plan listed one; it was dropped
+deliberately. A `Kline` is 312 bytes, so a month of `1m` candles is ~14 MB and a
+month of `1s` candles is ~810 MB — a map of decoded ranges needs an eviction
+policy that nothing here specifies, and the gain is small for the case that
+matters: a backtest reads each candle once, in order, so the second read a
+memory tier would accelerate often never happens. The Parquet read is 6 ms and
+the operating system's page cache keeps the file warm regardless. Stage 7 can
+revisit it with `Fetch` in hand and a benchmark to argue from.

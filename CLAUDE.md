@@ -49,9 +49,11 @@ update that table *and* the one in the plan file.
 - Tests are table-driven. Network paths use `httptest.Server` with committed
   fixtures — **no test may touch Binance.** Time is injected, never read from
   `time.Now()` inside logic.
-- `go.mod` declares Go 1.24 as the floor; mise pins 1.26.5 for development. A CI
-  job builds with real 1.24, so do not use newer language or stdlib features
-  without raising the floor deliberately.
+- `go.mod` declares Go 1.24.9 as the floor; mise pins 1.26.5 for development. A
+  CI job builds with real 1.24, so do not use newer language or stdlib features
+  without raising the floor deliberately. The patch component came from
+  parquet-go in Stage 5 — a dependency's own floor becomes ours, so check what
+  `go get` did to the `go` directive before committing.
 
 ## Commands
 

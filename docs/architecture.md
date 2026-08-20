@@ -1,9 +1,9 @@
 # Architecture
 
 > **Status:** design document. Stages 0 (scaffolding), 1 (domain types),
-> 2 (time and availability), 3 (parsing) and 4 (downloader) are complete; the
-> packages described below arrive stage by stage. Sections marked *planned*
-> describe code that does not exist yet.
+> 2 (time and availability), 3 (parsing), 4 (downloader) and 5 (cache) are
+> complete; the packages described below arrive stage by stage. Sections marked
+> *planned* describe code that does not exist yet.
 
 ## What the library does
 
@@ -335,6 +335,49 @@ the CSV record string), so a 44,640-row month of `1m` candles decodes in about
 the code existed, and it is the number the two-tier cache exists to avoid
 paying on every backtest run.
 
+## Caching
+
+`docs/caching.md` is the design and the measurements; this is what the shape of
+it means for the rest of the pipeline.
+
+`cache.klines` is the cache's whole surface within this package: one archive in,
+its candles out. Stage 7 calls it once per chunk and never learns which tier
+answered, whether anything was downloaded, or whether the derived file had to be
+rebuilt. Everything below that line — the two tiers, the atomic writes, the
+deduplication — is `cache.go`'s business.
+
+Four things about it were decided rather than defaulted.
+
+**A hit reads two small files and no archive.** The `.CHECKSUM` sidecar gives
+the hash, the Parquet footer gives what it was built from, and the rows follow
+if the two agree. Tier 1 is not opened and not re-hashed, which is what keeps a
+hit ten times cheaper than parsing the archive would be — and which also means
+a cache whose archives have been pruned still serves every read that does not
+need a rebuild.
+
+**Tier 2 is read column by column, not row by row.** The obvious implementation
+— parquet-go's `GenericReader`, one Go struct per row through reflection — was
+written first and measured at 26.5 ms per symbol-month against the 62 ms of CSV
+parsing it replaces. That margin does not justify a second copy of the data on
+disk. Reading each column as one contiguous run instead takes 6.1 ms, and reads
+positionally, which is safe only because the file's schema is verified against
+the expected column names and physical types first: a column order off by one
+puts the high price in the low price's field and every value still parses, and a
+column with the right name and the wrong storage would reach the generic page
+reader and panic inside parquet-go rather than return an error.
+
+**Deduplication registers before any I/O.** `singleflight` is keyed on the
+Parquet path and entered on the way in, so a saturated Stage 7 pool cannot let
+two workers past the check before either registers — correctness requirement 5,
+and one of the ported implementation's real bugs. Waiters get a copy of the
+candles, because Stage 7 trims ranges in place.
+
+**Nothing is written to a final path.** Every file goes to a temporary file in
+the destination directory and is renamed in, so an interrupted run leaves either
+the old file or the new one. A Parquet file truncated by a crash is the failure
+worth naming: its footer is written last, so a torn one is not readable at all —
+but only because nothing wrote it in place.
+
 ## Package layout
 
 ```
@@ -350,7 +393,8 @@ paying on every backtest run.
 ├── availability.go   bucket paths, archive names, the archive index
 ├── codec.go          zip → csv → []Kline; CodecVersion lives here
 ├── download.go       archive key → verified bytes; vision errors → sentinels
-├── cache.go          tier 1 (zip) + tier 2 (parquet) + memory                (planned)
+├── cache.go          the two tiers, atomic writes, singleflight
+├── parquet.go        tier 2: the schema, the footer stamp, the column reader
 ├── restapi.go        data-api.binance.vision klines                          (planned)
 ├── options.go        functional options for NewLoader                        (planned)
 ├── loader.go         Fetch / FetchAll / Stream                               (planned)
@@ -407,7 +451,7 @@ only standard-library types?*
 | `plan` | No — [`plan.Spec`](../internal/plan/plan.go) carries two booleans instead | `internal/plan` |
 | `vision` | No — URL strings in, keys and bytes out | `internal/vision` |
 | `codec` | Yes; its entire output is `[]Kline` | root, unexported |
-| `cache` | Yes; it stores `[]Kline` | root, unexported |
+| `cache` | Yes; it returns `[]Kline` and writes them column by column | root, unexported |
 | `restapi` | Yes; it returns `[]Kline` | root, unexported |
 
 Unexported identifiers in the root package hide just as thoroughly from
@@ -516,12 +560,12 @@ because they are easy to get subtly wrong and silent when they are.
 | 2 | Month-boundary comparisons anchor on the 1st of the month. A range such as `2024-12-20` → `2025-01-03` must not be misclassified as "current month", which **silently drops the last days** | 2 ✅ |
 | 3 | Every day in the requested range is accounted for by exactly one chunk. Whatever the monthly/daily/REST split, no path may leave a **silent gap** at the tail | 2 ✅ |
 | 4 | A 404 on one daily archive degrades that day only; the rest of the month still returns | 4 (typed error) → 7 (policy) |
-| 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 7 |
+| 5 | Deduplication registers the in-flight key **before** any concurrency limit is acquired, so saturation cannot let two workers fetch the same chunk | 5 ✅ (the cache owns the key) → 7 (the pool sits outside it) |
 | 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 ✅ |
 | 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 ✅ |
 | 8 | One `http.Client` is shared for the process, so connections are reused rather than reopened per request | 4 ✅ |
 | 9 | Checksums are **verified**, not merely stored — at download time, and on demand via `bmd verify` | 4 ✅ (download) → 8 (`bmd verify`) |
-| 10 | Cache writes are atomic: temp file in the destination directory, then `rename`. A crash never leaves a torn file | 5 |
+| 10 | Cache writes are atomic: temp file in the destination directory, then `rename`. A crash never leaves a torn file | 5 ✅ |
 
 Two rules that apply everywhere rather than to one stage: validation lives in a
 constructor that returns an `error`, so it cannot silently fail to run; and
@@ -537,7 +581,7 @@ setting is a defect, not a stub.
 | 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | **done** |
 | 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | **done** |
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | **done** |
-| 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | |
+| 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | **done** |
 | 6 | REST fetcher — pagination for the recent tail, rate limiting | |
 | 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | |
 | 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress | |
@@ -549,7 +593,7 @@ setting is a defect, not a stub.
 | --- | --- | --- |
 | `github.com/quagmt/udecimal` | Exact prices and volumes | 1 |
 | `golang.org/x/sync` | `errgroup` (the two availability listings in parallel, then the Stage 7 bounded pool), `singleflight` (dedup) | 4 |
-| `github.com/parquet-go/parquet-go` | Tier-2 cache and CLI export; pure Go | 5 |
+| `github.com/parquet-go/parquet-go` | Tier-2 cache and CLI export; pure Go. Raised the module's floor from Go 1.24.0 to 1.24.9, which it declares from v0.26.0 onward — accepted deliberately as a patch-level bump; see `go.mod` | 5 |
 
 Everything else is standard library: `net/http`, `archive/zip`, `encoding/csv`,
 `crypto/sha256`, `log/slog`, `flag`, `iter`, `testing`.
@@ -580,3 +624,13 @@ and cross-compilation.
 - **Connections are counted, not just requests.** `httptest.Server`'s
   `ConnState` hook is what makes "the body was drained so the connection was
   reused" a testable claim rather than a hopeful comment.
+- **The cache is tested by breaking it.** Each claim it makes is checked by
+  making the claim's opposite impossible to satisfy: the archive is replaced
+  with garbage to prove a hit never reads it, the Parquet is overwritten with a
+  stale stamp, a newer codec version and then rubbish to prove each rebuild
+  trigger fires, and the archive is deleted to prove a pruned cache still
+  serves. Every one of them also asserts the request count did not move.
+- **Concurrency is arranged, not hoped for.** The deduplication test blocks the
+  first request inside the server until the other seven callers have queued
+  behind it, because a test that merely starts goroutines and counts requests
+  passes just as happily when the deduplication is missing.
