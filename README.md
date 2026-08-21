@@ -89,11 +89,15 @@ Both are one-time settings:
 
 ```bash
 # Fetch anything under this org straight from the source, skipping the public
-# proxy and checksum database. See `go help private`.
-go env -w GOPRIVATE=github.com/algo-one/*
+# proxy and checksum database. See `go help private`. The value is quoted
+# because zsh — the default shell on macOS — treats an unmatched `*` as an error
+# rather than passing it through the way bash does.
+go env -w 'GOPRIVATE=github.com/algo-one/*'
 
-# Use the SSH key you already push with, instead of HTTPS.
-git config --global url."git@github.com:".insteadOf "https://github.com/"
+# Use the SSH key you already push with, instead of HTTPS. Scoped to this org so
+# it does not rewrite every other GitHub URL on the machine, and so it matches
+# the GOPRIVATE line above rather than reaching past it.
+git config --global url."git@github.com:algo-one/".insteadOf "https://github.com/algo-one/"
 ```
 
 Then, as a library:

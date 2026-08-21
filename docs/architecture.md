@@ -1115,10 +1115,14 @@ uncommitted changes says so instead of impersonating the release.
 
 ### goreleaser is configured but not wired to CI
 
-`.goreleaser.yaml` cross-compiles `bmd` for darwin and linux on amd64 and arm64
-— matching the CI matrix rather than reaching wider, since an artefact for a
-platform nothing tests is a promise made without evidence — archives each with
-the licence and `docs/cli.md`, and writes one `checksums.txt`.
+`.goreleaser.yaml` cross-compiles `bmd` for darwin and linux on amd64 and arm64,
+archives each with the licence and `docs/cli.md`, and writes one
+`checksums.txt`. The operating systems are the two CI covers; the architectures
+are four to CI's two, because `ubuntu-latest` is amd64 and `macos-latest` is
+arm64. So `darwin/amd64` and `linux/arm64` ship cross-compiled and untested,
+resting on a pure-Go source built with `CGO_ENABLED=0`. Windows is absent on
+firmer ground: the cache layer touches paths and file permissions, which is
+where platforms actually diverge.
 
 There is no release workflow. The repository is private and its audience
 installs with `go install`, so prebuilt binaries are not needed yet. What is

@@ -38,11 +38,16 @@ builds:
     env:
       - CGO_ENABLED=0
 
-    # macOS and Linux, on both architectures. This matches the CI matrix rather
-    # than reaching wider: an artefact for a platform nothing tests is a promise
-    # made without evidence. Windows is absent for the same reason — the cache
-    # layer touches paths and file permissions, and no CI job exercises it
-    # there.
+    # macOS and Linux, on both architectures. The operating systems are the two
+    # CI covers; the architectures reach one step past it, and it is worth being
+    # honest about which is which. CI runs ubuntu-latest and macos-latest — that
+    # is linux/amd64 and darwin/arm64 — so darwin/amd64 and linux/arm64 ship
+    # cross-compiled with no test run behind them, resting on a pure-Go source
+    # built with CGO_ENABLED=0 rather than on evidence.
+    #
+    # Windows is absent on stronger grounds than that, and stays absent: the
+    # cache layer touches paths and file permissions, which is exactly where
+    # platforms diverge, and no CI job exercises it there.
     goos:
       - darwin
       - linux
@@ -112,18 +117,18 @@ snapshot:
   version_template: "{{ incpatch .Version }}-SNAPSHOT-{{ .ShortCommit }}"
 
 changelog:
-  # Built from the commit subjects between this tag and the last one.
+  # Built from the commit subjects between this tag and the last one — every one
+  # of them, with nothing filtered out.
+  #
+  # goreleaser's `filters.exclude` block would normally sit here holding the
+  # conventional-commit prefixes `^docs:`, `^test:` and `^chore:`. It did, and
+  # it was removed: those regexes match against the commit subject, and this
+  # repository writes `Stage 9: documentation`, so not one of them ever fired.
+  # A filter that excludes nothing is worse than no filter at all, because the
+  # changelog then reads as curated when it is not. Curating it means changing
+  # the commit convention first; until that happens, this is every commit.
   use: git
   sort: asc
-
-  filters:
-    # Documentation and test-only commits are noise in a user-facing changelog.
-    # They are still in the history; they are just not news.
-    exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
-      - "typo"
 
 release:
   # Created as a draft, never published outright. A release is the one action in

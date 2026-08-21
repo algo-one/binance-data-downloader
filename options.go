@@ -98,11 +98,16 @@ type Option interface {
 // optionFunc adapts a plain function to [Option].
 //
 // This is the standard Go move for giving an interface a function
-// implementation — http.HandlerFunc is the same trick, and so is
-// slog.HandlerOptions' cousin in every options-carrying library — and it is why
-// each With* function below is still a one-line closure. Attaching a method to
-// a *named function type* is what satisfies the interface; the closure itself
-// carries the argument that was captured.
+// implementation — http.HandlerFunc is the same trick, and in the standard
+// library it is very nearly the only one — and it is why each With* function
+// below is still a one-line closure. Attaching a method to a *named function
+// type* is what satisfies the interface; the closure itself carries the
+// argument that was captured.
+//
+// sort.IntSlice and sort.StringSlice are the idea one step removed: methods
+// hung on a named non-struct type so that it satisfies sort.Interface. They are
+// slice types rather than func types, so they are a relative of this pattern
+// rather than an instance of it.
 //
 // It is unexported on purpose. Exporting it would hand back the ability to
 // write an arbitrary Option, and with it a pointer to loaderConfig, undoing
@@ -245,8 +250,8 @@ func WithConcurrency(n int) Option {
 
 // WithHTTPClient supplies the [http.Client] used for every request.
 //
-// The default is a package-wide client built by [vision.NewHTTPClient], and it
-// is worth knowing what you are replacing before you replace it. It clones
+// The default is a package-wide client built in internal/vision, and it is
+// worth knowing what you are replacing before you replace it. It clones
 // http.DefaultTransport — keeping proxy support and HTTP/2 negotiation, which
 // a hand-built &http.Transport{} silently drops — and raises
 // MaxIdleConnsPerHost from its default of 2 to 64, because every request this

@@ -607,8 +607,8 @@ func gaps(published []time.Time, advance func(time.Time) time.Time) []time.Time 
 // An empty result with a nil error is the honest answer for a symbol that never
 // traded: the bucket answered, and it said there is nothing there. That is a
 // different outcome from an error, which means the bucket did not answer, and
-// the two must not arrive looking the same — see the note on [vision.Lister]'s
-// three outcomes in docs/architecture.md.
+// the two must not arrive looking the same — see the note on the bucket
+// lister's three outcomes in docs/architecture.md.
 //
 // The call takes a permit from the Loader's concurrency limit for the same
 // reason the plan phase does: it is I/O, and a limit that only covers downloads
