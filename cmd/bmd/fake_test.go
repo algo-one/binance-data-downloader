@@ -30,6 +30,12 @@ type fakeLoader struct {
 	// Loader.Stream reports a failure mid-range.
 	streamErr error
 
+	// streamErrs fails one symbol and leaves the others alone, which is what a
+	// multi-symbol download needs to exercise: a delisted pair among four good
+	// ones is the case the command's error handling exists for, and streamErr
+	// above can only fail all of them at once.
+	streamErrs map[string]error
+
 	// available and availableErr are what Available returns.
 	available    binancedata.Availability
 	availableErr error
@@ -53,8 +59,21 @@ type fakeLoader struct {
 
 	// gotRequest records what Stream was asked for, which is what most of the
 	// download tests are actually about: the flags became this request.
-	gotRequest binancedata.Request
-	gotQuery   binancedata.AvailabilityQuery
+	//
+	// gotRequests keeps all of them, in call order, for the multi-symbol tests.
+	// gotRequest alone cannot serve those: it holds the last call, so a command
+	// that downloaded one symbol and a command that downloaded four ending with
+	// that symbol look identical through it.
+	gotRequest  binancedata.Request
+	gotRequests []binancedata.Request
+	gotQuery    binancedata.AvailabilityQuery
+
+	// loaders counts how many times newLoader was called. It is the assertion
+	// behind the whole reason `bmd download` takes several symbols: the
+	// rate limiter is process-wide, so several symbols must share one loader in
+	// one process. A command that built one loader per symbol would pass every
+	// test about files and candles.
+	loaders int
 
 	// gotOptions records what newLoader was handed. An Option is an opaque
 	// interface, so there is nothing to read out of one — but counting them is
@@ -66,8 +85,19 @@ type fakeLoader struct {
 
 func (f *fakeLoader) Stream(_ context.Context, req binancedata.Request) iter.Seq2[binancedata.Kline, error] {
 	f.gotRequest = req
+	f.gotRequests = append(f.gotRequests, req)
 
 	return func(yield func(binancedata.Kline, error) bool) {
+		// A per-symbol failure is yielded before the candles rather than after
+		// them, so the test sees a symbol that produced nothing. A download that
+		// fails mid-range is the streamErr case below, and both reach the
+		// command the same way.
+		if err, ok := f.streamErrs[req.Symbol]; ok {
+			yield(binancedata.Kline{}, err)
+
+			return
+		}
+
 		for _, k := range f.klines {
 			if !yield(k, nil) {
 				return
@@ -137,6 +167,7 @@ func (f *fakeLoader) install(t *testing.T) {
 
 	newLoader = func(opts ...binancedata.Option) (loader, error) {
 		f.gotOptions = opts
+		f.loaders++
 
 		return f, nil
 	}

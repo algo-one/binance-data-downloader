@@ -37,7 +37,7 @@ bmd download \
 
 | Flag | Meaning |
 | --- | --- |
-| `-symbol` | `BTC/USDT`, `BTC-USDT` or `BTCUSDT` — all normalised |
+| `-symbol` | `BTC/USDT`, `BTC-USDT` or `BTCUSDT` — all normalised. Repeat it or comma-separate for several |
 | `-interval` | `1s` … `1mo` (`1M` is accepted too); validated against what Binance publishes |
 | `-start`, `-end` | `YYYY-MM-DD` or RFC 3339, UTC. **Both ends are included** |
 | `-market` | `spot` (the only implemented value today) |
@@ -47,6 +47,63 @@ bmd download \
 | `-concurrency` | Parallel chunk fetches (default 8). Must be at least 1 |
 | `-quiet` | Print nothing to stderr but errors — no progress, no summary |
 | `-verbose` | Log what the pipeline is doing to stderr |
+
+### Several symbols
+
+```bash
+bmd download -symbol BTC/USDT,ETH/USDT,SOL/USDT \
+  -interval 1h -start 2024-01-01 -end 2024-03-31 -out ./data
+
+bmd download -symbol BTC/USDT -symbol ETH/USDT -interval 1h -start 2024-01-01 -out ./data
+```
+
+Both spellings work and mix freely. A list is what you type by hand; repetition
+is what a shell loop building an argument slice produces.
+
+**Do this rather than running one `bmd` per symbol, and the reason is the rate
+limit.** Binance enforces `REQUEST_WEIGHT` per IP address — 6000 per minute,
+which is 100 per second — and the limiter that respects it is built once per
+process and shared by everything in it. That is not an optimisation; it is the
+requirement, because two limiters each honouring the documented 40 weight per
+second permit 80 between them. Three `bmd download` processes started together
+are at 120 against a ceiling of 100, and Binance answers a client that keeps
+exceeding it with an HTTP 418: an IP ban of two minutes to three days, which
+locks out everything else on the machine and no retry undoes.
+
+One process, one limiter, however many symbols.
+
+The symbols are fetched one after another. Each one's chunks still go out in
+parallel up to `-concurrency`, and the fetch pool is shared across the whole run,
+so a range worth downloading keeps it busy on its own.
+
+**Each symbol gets its own file**, so `-out` must name a directory or be left
+off. `-out -` and `-out somefile.csv` are refused for more than one symbol —
+neither has a reading, and both failure modes are silent: one file would
+interleave headers into nonsense, and honouring one symbol would drop the rest
+without a word. A directory that does not exist is refused rather than created.
+
+Duplicates are dropped after normalising, so `-symbol BTC/USDT,BTCUSDT` is one
+download. Without that, two downloads would write the same generated file name
+and the second would silently replace the first.
+
+**One symbol failing does not abandon the rest.** A delisted pair among four good
+ones is reported, counted, and the other three are still written:
+
+```
+BTCUSDT 1h: wrote 1440 candles to ./data/BTCUSDT-1h-2024-01-01_2024-03-31.csv
+NOSUCHPAIR: klines NOSUCHPAIR 1h: 400 Bad Request: Invalid symbol. (code -1121)
+SOLUSDT 1h: wrote 1440 candles to ./data/SOLUSDT-1h-2024-01-01_2024-03-31.csv
+2 of 3 symbols, 2880 candles in total
+bmd: 1 of 3 symbols failed
+```
+
+The exit status is 1. A failed symbol leaves no file behind, because output is
+written through a temporary file and renamed only once the encoder finishes.
+Ctrl-C is different from a failure: it stops the run rather than moving on to the
+next symbol.
+
+With one symbol nothing above changes. There is no run summary, the error is
+reported as it always was, and `-out -` works.
 
 ### Both ends are included
 

@@ -1,10 +1,10 @@
 # Architecture
 
-> **Status:** all ten stages are complete — 0 (scaffolding), 1 (domain types),
+> **Status:** all eleven stages are complete — 0 (scaffolding), 1 (domain types),
 > 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache), 6 (REST
-> fetcher), 7 (loader orchestration), 8 (CLI), 9 (documentation and release) and
-> 10 (cache management). Everything described below exists. The remaining step is
-> the v0.1.0 tag itself.
+> fetcher), 7 (loader orchestration), 8 (CLI), 9 (documentation and release),
+> 10 (cache management) and 11 (multi-symbol download). Everything described
+> below exists. The remaining step is the v0.1.0 tag itself.
 
 ## What the library does
 
@@ -995,7 +995,9 @@ can consume candles without materialising the range.
 ## The command line
 
 `bmd` is five commands over the library, and the interesting part of building the
-first three was discovering that two of them had nothing to call.
+first three was discovering that two of them had nothing to call. `download`
+takes a list of symbols; see "Several symbols in one process" below for why that
+is a rate-limit decision rather than a convenience.
 
 ### The CLI needed public API before it could be a thin shell
 
@@ -1066,6 +1068,58 @@ the candles describe the same instant.
 archive's hash and the codec version, and rebuilt when either fails, so it is
 verified continuously by the code that uses it. Tier 1 is the only tier nothing
 re-reads, which is what makes it the one worth a command.
+
+## Several symbols in one process
+
+`bmd download` takes a list of symbols, and the reason is the rate limit rather
+than convenience.
+
+`REQUEST_WEIGHT` is enforced per IP address, and `internal/vision/limiter.go`
+says of its process-wide limiter that "sharing is not an optimisation here, it is
+the requirement": two limiters each allowing 40 weight per second permit 80
+against a ceiling of 100. Until now the only way to download several symbols at
+once was several `bmd` processes, which is several limiters — three of them are
+at 120 against that ceiling, and Binance answers persistent excess with an HTTP
+418 that bans the address for two minutes to three days. The tool's only
+multi-symbol shape was the shape that breaks its own limiter.
+
+**Streaming, not `FetchAll`.** `FetchAll` exists and is deliberately not used
+here. It returns `map[Request][]Kline` — every candle of every symbol resident at
+once — and this command streams precisely so a range's size does not become the
+process's memory; one symbol at five years of minute candles is already about
+820 MB. What `FetchAll` adds over a loop is deduplicating overlapping requests,
+and a list of distinct symbols has nothing to deduplicate. The rate limiter,
+which is the whole point, comes from being one process and not from which method
+that process calls.
+
+**Sequential, not concurrent.** The `Loader`'s semaphore already spans calls, so
+one symbol's chunks saturate the fetch pool for any range worth downloading;
+running symbols in parallel would fill it only for many symbols each wanting one
+or two chunks. Against that it would interleave a progress display that redraws a
+single line, and it would need a second concurrency bound outside the library's —
+the nested limit this document warns about under "Execute". Sequential keeps
+memory at one candle, the display readable, and one symbol's failure easy to
+describe.
+
+**One symbol failing does not abandon the rest**, and that is not a departure
+from the rule against returning less than was asked for. Nothing is silent: the
+failure is printed, counted, and reaches the exit status. A cancellation is
+treated differently and ends the run, since otherwise Ctrl-C would be reported as
+every remaining symbol having failed.
+
+**Everything but the symbol is parsed once**, and the clock is the reason. With
+`-end` left off the range ends "now"; reading that per symbol would give the
+symbols in one command different end instants, so their generated file names
+would disagree about the range.
+
+Two smaller decisions worth recording. `-symbol` is a `flag.Value`, because
+stdlib `flag` keeps only the last occurrence of a repeated flag — `-symbol
+BTC/USDT -symbol ETH/USDT` would otherwise download ETHUSDT alone and say nothing
+about the symbol it dropped. And the empty-value check lives in `checkSymbolFlag`
+rather than in `Set`: `flag` renders a `Set` failure with `%v` rather than `%w`,
+so an error returned from there arrives with its chain flattened, `errors.Is`
+cannot find `errUsage`, and it would exit 1 where every other bad flag value
+exits 2.
 
 ## Reclaiming disk
 
@@ -1305,11 +1359,15 @@ setting is a defect, not a stub.
 | 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress, `bmd verify`, `bmd list` | **done** |
 | 9 | Docs and release — runnable examples, `Option` as an interface, goreleaser | **done** |
 | 10 | Cache management — `Loader.CacheUsage`, `Loader.PruneArchives`, `bmd cache`, `bmd prune` | **done** |
+| 11 | Multi-symbol `bmd download` — one process, one rate limiter | **done** |
 
-Stage 10 was not in the original plan. It is the capability `docs/caching.md`
-designed in Stage 5 and left unbuilt, added because the only cache management
-that shipped was `bmd verify -rm`, which deletes corrupt files and nothing else.
-See "Reclaiming disk" above.
+Stages 10 and 11 were not in the original plan. Stage 10 is the capability
+`docs/caching.md` designed in Stage 5 and left unbuilt, added because the only
+cache management that shipped was `bmd verify -rm`, which deletes corrupt files
+and nothing else. Stage 11 closed the gap between the library's process-wide rate
+limiter and a CLI whose only multi-symbol shape was one process per symbol — the
+shape that breaks it. See "Reclaiming disk" and "Several symbols in one process"
+above.
 
 ## Dependencies
 

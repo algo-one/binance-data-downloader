@@ -260,16 +260,154 @@ func parseSymbolInterval(symbol, interval string) (string, binancedata.Interval,
 		return "", 0, usagef("-symbol %q: %v", symbol, err)
 	}
 
-	if strings.TrimSpace(interval) == "" {
-		return "", 0, usagef("-interval is required, for example 1h")
-	}
-
-	iv, err := binancedata.ParseInterval(interval)
+	iv, err := parseInterval(interval)
 	if err != nil {
-		return "", 0, usagef("-interval %q: %v", interval, err)
+		return "", 0, err
 	}
 
 	return normalized, iv, nil
+}
+
+// parseInterval resolves the -interval flag.
+//
+// Split out of parseSymbolInterval because `bmd download` takes several symbols
+// against one interval, so the two are no longer parsed together there.
+// Validation is left to the library — ParseInterval knows the sixteen intervals
+// and both spellings of the monthly one — but the error is rewritten as a usage
+// error, because a bad flag value is a typing mistake and deserves the exit
+// status that says so.
+func parseInterval(value string) (binancedata.Interval, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, usagef("-interval is required, for example 1h")
+	}
+
+	iv, err := binancedata.ParseInterval(value)
+	if err != nil {
+		return 0, usagef("-interval %q: %v", value, err)
+	}
+
+	return iv, nil
+}
+
+// symbolList collects the -symbol flag, which may be given more than once and
+// may hold a comma-separated list each time. These two are equivalent:
+//
+//	bmd download -symbol BTC/USDT,ETH/USDT
+//	bmd download -symbol BTC/USDT -symbol ETH/USDT
+//
+// Both spellings exist because both are what people already have. A list is
+// what somebody types by hand; repetition is what a shell loop building an
+// argument slice produces. Supporting one and not the other would send whoever
+// has the wrong one off to write a join or a split.
+//
+// A comma is safe as the separator because no symbol can contain one:
+// NormalizeSymbol accepts letters, digits and a single "/" or "-" separator,
+// and rejects everything else.
+//
+// # Why this is a flag.Value
+//
+// It is the only way stdlib flag lets one flag appear twice. flag.String keeps
+// the last occurrence and silently discards the earlier ones, so
+// `-symbol BTC/USDT -symbol ETH/USDT` would download ETHUSDT alone and say
+// nothing about the symbol it dropped.
+type symbolList []string
+
+// String is flag.Value's renderer, used in the default shown by -h. It is
+// deliberately the input spelling rather than Go syntax, so the help text reads
+// like something you could type.
+func (s *symbolList) String() string {
+	if s == nil {
+		return ""
+	}
+
+	return strings.Join(*s, ",")
+}
+
+// Set appends one occurrence's worth of symbols, splitting it on commas.
+//
+// An occurrence that yields nothing appends nothing and is not reported here.
+// It is a usage error, and this is the wrong place to raise one: stdlib flag
+// renders a Set failure with %v rather than %w, so an error returned here
+// reaches the caller with its chain flattened, errors.Is cannot find errUsage in
+// it, and report gives it exit status 1 where every other bad flag value gets 2.
+// checkSymbolFlag below raises it instead, where the wrapping survives.
+func (s *symbolList) Set(value string) error {
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			*s = append(*s, part)
+		}
+	}
+
+	return nil
+}
+
+// checkSymbolFlag reports an absent -symbol and an empty one differently.
+//
+// The distinction lives in the FlagSet rather than in the value, exactly as it
+// does in commonFlags.options: fs.Visit walks only the flags actually set on the
+// command line, so it separates "-symbol was never given" from "-symbol was
+// given as an empty string", which an empty slice cannot.
+//
+// It is worth telling apart. `-symbol "$SYMBOLS"` with the variable unset is a
+// command that meant to name something, and answering it with "-symbol is
+// required" points at a flag that was given, which is the kind of message that
+// costs somebody ten minutes.
+func checkSymbolFlag(fs *flag.FlagSet, symbols symbolList) error {
+	if len(symbols) > 0 {
+		return nil
+	}
+
+	given := false
+
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "symbol" {
+			given = true
+		}
+	})
+
+	if given {
+		return usagef("-symbol was given but names no symbol")
+	}
+
+	return usagef("-symbol is required, for example BTC/USDT")
+}
+
+// parseSymbols normalises every symbol and drops the duplicates.
+//
+// Deduplication is after normalisation and not before, because that is the only
+// point at which duplicates are visible: BTC/USDT, BTC-USDT and BTCUSDT are one
+// symbol written three ways, and they all become BTCUSDT here.
+//
+// It matters more than tidiness. Every symbol gets its own output file, and the
+// name is generated from the normalised symbol — so a duplicate that survived
+// this would have two downloads writing the same path, each through its own
+// temporary file, with the second rename silently replacing the first's work.
+func parseSymbols(symbols []string) ([]string, error) {
+	if len(symbols) == 0 {
+		return nil, usagef("-symbol is required, for example BTC/USDT")
+	}
+
+	var (
+		out  = make([]string, 0, len(symbols))
+		seen = make(map[string]bool, len(symbols))
+	)
+
+	for _, symbol := range symbols {
+		normalized, err := binancedata.NormalizeSymbol(symbol)
+		if err != nil {
+			return nil, usagef("-symbol %q: %v", symbol, err)
+		}
+
+		if seen[normalized] {
+			continue
+		}
+
+		seen[normalized] = true
+
+		out = append(out, normalized)
+	}
+
+	return out, nil
 }
 
 // parseMarket resolves the -market flag.

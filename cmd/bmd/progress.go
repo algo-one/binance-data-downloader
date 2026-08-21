@@ -34,6 +34,15 @@ type progress struct {
 	// active records whether anything has been drawn, so done knows whether it
 	// owes the terminal a newline.
 	active bool
+
+	// showSymbol adds the symbol to each line, and is set when one command is
+	// downloading more than one of them.
+	//
+	// Conditional rather than always on. With one symbol the name is already in
+	// the summary line and in the file name, so a column repeating it on every
+	// chunk is noise; with several it is the only thing distinguishing one
+	// [3/12] from another.
+	showSymbol bool
 }
 
 // newProgress builds the reporter, or returns nil when there should not be one.
@@ -68,8 +77,18 @@ var newProgress = func(w io.Writer, quiet bool) *progress {
 // here out of habit: it would be harmless and it would also be a lie about
 // where the synchronisation lives.
 func (p *progress) report(ev binancedata.Progress) {
-	line := fmt.Sprintf("[%*d/%d] %s %s  %s",
+	// The symbol comes from the event rather than from a field set per symbol,
+	// which is what makes this correct if the reporting ever stops being
+	// sequential: Progress carries the request the chunk belongs to, so a line
+	// cannot end up labelled with whichever symbol happened to start last.
+	label := ""
+	if p.showSymbol {
+		label = ev.Request.Symbol + " "
+	}
+
+	line := fmt.Sprintf("[%*d/%d] %s%s %s  %s",
 		digits(ev.Total), ev.Done, ev.Total,
+		label,
 		ev.Source,
 		ev.Start.Format(dateLayout),
 		outcome(ev))

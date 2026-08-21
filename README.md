@@ -38,6 +38,7 @@ under one concurrency budget and deduplicates the archives they share.
 mise run build
 
 bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
+bmd download -symbol BTC/USDT,ETH/USDT -interval 1h -start 2024-01-01 -out ./data
 bmd list     -symbol BTC/USDT -interval 1mo      # what Binance actually publishes
 bmd cache                                        # what the cache holds
 bmd prune                                        # reclaim disk; -n to look first
@@ -46,6 +47,10 @@ bmd verify                                       # re-hash the cache
 
 `-start` and `-end` are both inclusive, and a bare `-end` date covers that whole
 day. Output is csv, json or parquet. See [docs/cli.md](docs/cli.md).
+
+Give `-symbol` a list rather than running one `bmd` per symbol: Binance's rate
+limit is per IP address and the limiter honouring it is per process, so several
+processes exceed it between them.
 
 ## Why
 
