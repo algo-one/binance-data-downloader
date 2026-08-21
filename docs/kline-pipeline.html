@@ -1,0 +1,967 @@
+<title>Kline Pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #EDF0F0;
+    --surface: #FAFBFA;
+    --surface-2: #FFFFFF;
+    --ink: #141A1F;
+    --ink-soft: #4A555B;
+    --ink-faint: #7C878C;
+    --line: #D6DCDC;
+    --line-strong: #B9C2C2;
+    --accent: #B8631F;
+    --accent-soft: #E7C6A6;
+    --accent-ink: #FFF8F0;
+    --teal: #2E6E68;
+    --teal-soft: #D3E4E1;
+    --rose: #A23B3B;
+    --rose-soft: #EAD3D1;
+    --code-bg: #12171B;
+    --code-ink: #E7ECEC;
+    --code-line: #232C31;
+    --shadow: 0 1px 2px rgba(20,26,31,0.06), 0 8px 24px -12px rgba(20,26,31,0.12);
+    --font-display: "Fraunces", Georgia, "Iowan Old Style", serif;
+    --font-body: "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151A;
+      --surface: #161B21;
+      --surface-2: #1B2129;
+      --ink: #E8EAE6;
+      --ink-soft: #A7B0AE;
+      --ink-faint: #6E7876;
+      --line: #2A3138;
+      --line-strong: #3A434B;
+      --accent: #E0965A;
+      --accent-soft: #4A382A;
+      --accent-ink: #1B140E;
+      --teal: #6FC0B6;
+      --teal-soft: #1E3230;
+      --rose: #E08585;
+      --rose-soft: #3A2426;
+      --code-bg: #0C0F13;
+      --code-ink: #E7ECEC;
+      --code-line: #1E262B;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #11151A;
+    --surface: #161B21;
+    --surface-2: #1B2129;
+    --ink: #E8EAE6;
+    --ink-soft: #A7B0AE;
+    --ink-faint: #6E7876;
+    --line: #2A3138;
+    --line-strong: #3A434B;
+    --accent: #E0965A;
+    --accent-soft: #4A382A;
+    --accent-ink: #1B140E;
+    --teal: #6FC0B6;
+    --teal-soft: #1E3230;
+    --rose: #E08585;
+    --rose-soft: #3A2426;
+    --code-bg: #0C0F13;
+    --code-ink: #E7ECEC;
+    --code-line: #1E262B;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible, .pill:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .wrap {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 0 24px 120px;
+  }
+
+  /* ---------- Nav ---------- */
+
+  .topnav {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topnav-inner {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+  .brand {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    color: var(--ink);
+    flex: 0 0 auto;
+  }
+  .brand span { color: var(--accent); }
+  .pillrow {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex: 1 1 auto;
+  }
+  .pillrow::-webkit-scrollbar { display: none; }
+  .pill {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  }
+  .pill:hover {
+    color: var(--ink);
+    border-color: var(--line-strong);
+    background: var(--surface-2);
+  }
+
+  /* ---------- Hero ---------- */
+
+  .hero {
+    padding: 64px 0 40px;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(30px, 4.4vw, 44px);
+    line-height: 1.12;
+    letter-spacing: -0.01em;
+    margin: 0 0 20px;
+    text-wrap: balance;
+    max-width: 15ch;
+  }
+  .dek {
+    font-size: 18px;
+    color: var(--ink-soft);
+    max-width: 56ch;
+    margin: 0 0 8px;
+  }
+
+  .statbar {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-top: 40px;
+  }
+  .stat {
+    background: var(--surface);
+    padding: 16px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .stat b {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 19px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .stat span {
+    font-size: 12px;
+    color: var(--ink-faint);
+    line-height: 1.35;
+  }
+  @media (max-width: 640px) {
+    .statbar { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* ---------- Sections ---------- */
+
+  section { padding: 56px 0; border-top: 1px solid var(--line); }
+  section:first-of-type { border-top: none; }
+
+  .kicker {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .num {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    border: 1px solid var(--accent-soft);
+    background: var(--accent-soft);
+    border-radius: 5px;
+    padding: 1px 7px;
+    font-weight: 600;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 28px;
+    letter-spacing: -0.005em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 15px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-soft);
+    margin: 32px 0 12px;
+  }
+
+  .prose { max-width: 62ch; }
+  .prose p { margin: 0 0 14px; }
+  .prose p:last-child { margin-bottom: 0; }
+  .prose strong { color: var(--ink); font-weight: 600; }
+  .prose code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    padding: 0.05em 0.4em;
+    border-radius: 4px;
+  }
+
+  ul.plain { max-width: 62ch; margin: 0; padding: 0; list-style: none; }
+  ul.plain li {
+    position: relative;
+    padding-left: 20px;
+    margin-bottom: 12px;
+    color: var(--ink-soft);
+  }
+  ul.plain li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 9px;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  ul.plain li strong { color: var(--ink); font-weight: 600; }
+
+  /* ---------- Callout ---------- */
+
+  .callout {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 18px 20px;
+    margin: 24px 0 0;
+  }
+  .callout h4 {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    margin: 0 0 10px;
+    font-weight: 600;
+  }
+  .callout ul { margin: 0; padding: 0; list-style: none; }
+  .callout li {
+    font-size: 14.5px;
+    color: var(--ink-soft);
+    margin-bottom: 9px;
+    padding-left: 16px;
+    position: relative;
+  }
+  .callout li:last-child { margin-bottom: 0; }
+  .callout li::before {
+    content: "→";
+    position: absolute; left: 0; color: var(--ink-faint);
+  }
+  .callout li strong { color: var(--ink); font-weight: 600; }
+
+  /* ---------- Figures / diagrams ---------- */
+
+  figure {
+    margin: 28px 0 0;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px 20px 16px;
+  }
+  figure svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    overflow: visible;
+  }
+  figure .svg-scroll {
+    overflow-x: auto;
+  }
+  figcaption {
+    font-family: var(--font-display);
+    font-style: italic;
+    font-size: 14.5px;
+    color: var(--ink-soft);
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  svg text { font-family: var(--font-mono); fill: currentColor; }
+  .svg-title { font-family: var(--font-body); font-weight: 700; }
+  .svg-eyebrow { letter-spacing: 0.04em; }
+  .box-fill { fill: var(--surface-2); }
+  .box-stroke { stroke: var(--line-strong); }
+  .accent-fill { fill: var(--accent-soft); }
+  .accent-stroke { stroke: var(--accent); }
+  .teal-fill { fill: var(--teal-soft); }
+  .teal-stroke { stroke: var(--teal); }
+  .rose-fill { fill: var(--rose-soft); }
+  .rose-stroke { stroke: var(--rose); }
+  .dim { color: var(--ink-faint); }
+  .soft { color: var(--ink-soft); }
+  .ink { color: var(--ink); }
+  .accentc { color: var(--accent); }
+  .tealc { color: var(--teal); }
+  .rosec { color: var(--rose); }
+
+  /* ---------- Tables ---------- */
+
+  .tblwrap { overflow-x: auto; margin-top: 20px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14.5px;
+    min-width: 480px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+    font-weight: 600;
+  }
+  td.mono, th.mono { font-family: var(--font-mono); font-size: 13.5px; }
+  tr:last-child td { border-bottom: none; }
+  td .m { color: var(--ink-soft); }
+
+  .checklist { margin-top: 20px; }
+  .checkrow {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 14.5px;
+  }
+  .checkrow:last-child { border-bottom: none; }
+  .check {
+    flex: 0 0 auto;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: var(--teal-soft);
+    color: var(--teal);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    margin-top: 1px;
+  }
+  .checkrow .m { color: var(--ink-faint); font-family: var(--font-mono); font-size: 12px; margin-left: auto; padding-left: 12px; white-space: nowrap; }
+  .checkrow span.txt { color: var(--ink-soft); }
+
+  /* ---------- Code ---------- */
+
+  .code {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border: 1px solid var(--code-line);
+    border-radius: 10px;
+    padding: 18px 20px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.65;
+    overflow-x: auto;
+    margin-top: 20px;
+    white-space: pre;
+  }
+  .code .kw { color: #E0965A; }
+  .code .tp { color: #7FB3D5; }
+  .code .cm { color: #7A8A85; font-style: italic; }
+  .code .st { color: #A8C98A; }
+
+  /* ---------- Footer ---------- */
+
+  footer {
+    padding: 48px 0 0;
+    border-top: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  footer p { color: var(--ink-faint); font-size: 13px; margin: 0; }
+  footer .status {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--teal);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <div class="brand">bmd<span>/</span>architecture</div>
+    <div class="pillrow">
+      <a class="pill" href="#sources">Sources</a>
+      <a class="pill" href="#pipeline">Pipeline</a>
+      <a class="pill" href="#download">Downloading</a>
+      <a class="pill" href="#parse">Parsing</a>
+      <a class="pill" href="#cache">Caching</a>
+      <a class="pill" href="#rest">REST tail</a>
+      <a class="pill" href="#orchestration">Concurrency</a>
+      <a class="pill" href="#layout">Package layout</a>
+      <a class="pill" href="#correctness">Correctness</a>
+      <a class="pill" href="#api">API</a>
+    </div>
+  </div>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <p class="eyebrow">binance-data-downloader — how it actually works</p>
+    <h1>One clean stack of candles, out of three sources that each lie a little.</h1>
+    <p class="dek">A Go library that turns a symbol, an interval and a time range into a
+    verified, gap-free slice of Binance kline data — fast on the first run, ten times
+    faster on the second. This page walks through how the nine finished stages fit
+    together, with the numbers that shaped each decision.</p>
+
+    <div class="statbar">
+      <div class="stat"><b>3 → 1</b><span>data sources reconciled into one answer</span></div>
+      <div class="stat"><b>1.39 µs</b><span>to decode one candle row</span></div>
+      <div class="stat"><b>6.1 ms</b><span>cached month read back, vs 62 ms cold</span></div>
+      <div class="stat"><b>2 / 105</b><span>BTCUSDT months quietly missing from the archive</span></div>
+      <div class="stat"><b>40 / 6000</b><span>REST requests spent per minute, per IP budget</span></div>
+    </div>
+  </div>
+
+  <section id="sources">
+    <div class="kicker"><span class="num">§1</span></div>
+    <h2>Where the data comes from</h2>
+    <div class="prose">
+      <p>Binance publishes the same candles in three different places, and no single
+      one of them is enough on its own. <strong>Bulk archives</strong> are monthly and
+      daily ZIP files — the bulk of any history, immutable the moment they're
+      published. The <strong>REST API</strong> covers the tail: archives lag real time
+      by about a day, so anything more recent has to be paginated out of the live
+      endpoint. And a plain <strong>S3 bucket listing</strong> answers a question
+      neither of the other two will: what has Binance actually published?</p>
+      <p>That third source sounds like a nicety until you notice the archive has
+      holes. Out of BTCUSDT's 105 published monthly files, two are silently missing —
+      no 404 pattern, no calendar rule predicts them. The only way to know is to ask
+      the bucket what it holds, before fetching anything.</p>
+    </div>
+
+    <figure>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 860 400" role="img" aria-label="Three Binance data sources — bulk archives, the REST API, and an S3 bucket listing — all feeding into the loader, which reconciles them into one verified slice of candles.">
+        <defs>
+          <marker id="a1" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+          </marker>
+        </defs>
+
+        <rect class="box-fill box-stroke" x="20" y="15" width="300" height="88" rx="9" stroke-width="1.2"/>
+        <text x="38" y="41" class="svg-eyebrow dim" font-size="11">DATA.BINANCE.VISION</text>
+        <text x="38" y="64" class="svg-title ink" font-size="16">Bulk Archives</text>
+        <text x="38" y="86" class="soft" font-size="12">Monthly + daily ZIPs — immutable once published</text>
+
+        <rect class="box-fill box-stroke" x="20" y="156" width="300" height="88" rx="9" stroke-width="1.2"/>
+        <text x="38" y="182" class="svg-eyebrow dim" font-size="11">DATA-API.BINANCE.VISION</text>
+        <text x="38" y="205" class="svg-title ink" font-size="16">REST API</text>
+        <text x="38" y="227" class="soft" font-size="12">The ~24h tail archives haven't caught up to</text>
+
+        <rect class="box-fill box-stroke" x="20" y="297" width="300" height="88" rx="9" stroke-width="1.2"/>
+        <text x="38" y="323" class="svg-eyebrow dim" font-size="11">S3 LISTOBJECTS</text>
+        <text x="38" y="346" class="svg-title ink" font-size="16">Bucket Listing</text>
+        <text x="38" y="368" class="soft" font-size="12">Answers one question: what actually exists?</text>
+
+        <rect class="accent-fill accent-stroke" x="560" y="140" width="260" height="120" rx="9" stroke-width="1.4"/>
+        <text x="580" y="170" class="svg-eyebrow accentc" font-size="11">LOADER.ROUTE</text>
+        <text x="580" y="194" class="svg-title ink" font-size="16">Plan → Execute</text>
+        <text x="580" y="216" class="soft" font-size="12">Checks the listing first, then</text>
+        <text x="580" y="233" class="soft" font-size="12">downgrades or upgrades each chunk</text>
+
+        <line x1="320" y1="59" x2="558" y2="175" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)" class="dim"/>
+        <text x="410" y="105" font-size="11.5" class="soft">download &amp; verify</text>
+
+        <line x1="320" y1="200" x2="558" y2="200" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)" class="dim"/>
+        <text x="410" y="192" font-size="11.5" class="soft">fill the tail</text>
+
+        <line x1="320" y1="341" x2="558" y2="225" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)" class="dim"/>
+        <text x="392" y="300" font-size="11.5" class="soft">checked first — decides routing</text>
+
+        <line x1="820" y1="200" x2="855" y2="200" stroke="currentColor" stroke-width="1.4" marker-end="url(#a1)" class="accentc"/>
+        <text x="700" y="120" font-size="12" text-anchor="middle" class="accentc">[]Kline — contiguous, verified</text>
+      </svg>
+      </div>
+      <figcaption>The loader never trusts one source alone — it asks the bucket what exists before deciding whether to download an archive or fall back to REST.</figcaption>
+    </figure>
+
+    <div class="callout">
+      <h4>Binance's own sharp edges</h4>
+      <ul>
+        <li><strong>An unknown symbol isn't a 404.</strong> A misspelt prefix returns HTTP 200 and an empty, well-formed listing — indistinguishable from "this pair simply has no data yet."</li>
+        <li><strong>The plain hostname lies.</strong> Asking <code>data.binance.vision</code> for a listing returns its HTML file-browser page, not XML — only the regional S3 endpoint answers correctly.</li>
+        <li><strong>A failed lookup is never read as an empty one.</strong> The library treats "the bucket didn't answer" and "the bucket answered with nothing" as two different, non-interchangeable outcomes.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <div class="kicker"><span class="num">§2</span></div>
+    <h2>The pipeline: plan, execute, reduce</h2>
+    <div class="prose">
+      <p>Every request goes through the same three stages. <strong>Plan</strong> is
+      pure arithmetic — no network calls at all — turning a date range into a flat
+      list of chunks. <strong>Execute</strong> is the only stage that touches the
+      network: a bounded pool of workers fetches each chunk, with duplicate work
+      collapsed automatically. <strong>Reduce</strong> stitches the results back into
+      one ordered, gap-free slice.</p>
+      <p>Keeping the pool <strong>flat</strong> — one queue of same-sized chunks,
+      never a group nested inside another — is what makes the concurrency limit
+      actually hold. A limit with an outer unit (a month) waiting on inner ones (its
+      days) can deadlock the moment the outer unit is holding a permit it isn't
+      using.</p>
+    </div>
+
+    <figure>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 900 250" role="img" aria-label="Pipeline diagram: a Request enters Plan, which produces chunks; chunks enter Execute, a bounded worker pool with deduplication, producing raw klines; raw klines enter Reduce, which merges and trims to produce the final ordered slice of klines.">
+        <defs>
+          <marker id="a2" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+          </marker>
+        </defs>
+
+        <text x="20" y="26" font-size="12.5" class="dim">Request</text>
+        <line x1="20" y1="70" x2="55" y2="70" stroke="currentColor" class="dim" stroke-width="1.2" marker-end="url(#a2)"/>
+
+        <text x="90" y="46" font-size="12" class="accentc" font-weight="700">1</text>
+        <rect class="teal-fill teal-stroke" x="60" y="55" width="230" height="105" rx="9" stroke-width="1.2"/>
+        <text x="175" y="90" class="svg-title ink" font-size="16" text-anchor="middle">Plan</text>
+        <text x="175" y="112" class="tealc" font-size="11" text-anchor="middle">pure · no I/O</text>
+        <text x="175" y="132" class="soft" font-size="11" text-anchor="middle">range → sorted chunks</text>
+
+        <line x1="290" y1="107" x2="345" y2="107" stroke="currentColor" class="dim" stroke-width="1.2" marker-end="url(#a2)"/>
+        <text x="317" y="97" font-size="11" text-anchor="middle" class="soft">chunks</text>
+
+        <text x="365" y="46" font-size="12" class="accentc" font-weight="700">2</text>
+        <rect class="accent-fill accent-stroke" x="345" y="55" width="230" height="105" rx="9" stroke-width="1.4"/>
+        <text x="460" y="90" class="svg-title ink" font-size="16" text-anchor="middle">Execute</text>
+        <text x="460" y="112" class="accentc" font-size="11" text-anchor="middle">bounded pool + singleflight</text>
+        <text x="460" y="132" class="soft" font-size="11" text-anchor="middle">the only stage on the network</text>
+
+        <line x1="575" y1="107" x2="630" y2="107" stroke="currentColor" class="dim" stroke-width="1.2" marker-end="url(#a2)"/>
+        <text x="602" y="97" font-size="11" text-anchor="middle" class="soft">raw klines</text>
+
+        <text x="650" y="46" font-size="12" class="accentc" font-weight="700">3</text>
+        <rect class="teal-fill teal-stroke" x="630" y="55" width="230" height="105" rx="9" stroke-width="1.2"/>
+        <text x="745" y="90" class="svg-title ink" font-size="16" text-anchor="middle">Reduce</text>
+        <text x="745" y="112" class="tealc" font-size="11" text-anchor="middle">pure · merge &amp; trim</text>
+        <text x="745" y="132" class="soft" font-size="11" text-anchor="middle">drop out-of-range, dedup inline</text>
+
+        <line x1="860" y1="107" x2="895" y2="107" stroke="currentColor" class="accentc" stroke-width="1.4" marker-end="url(#a2)"/>
+        <text x="878" y="185" font-size="12" text-anchor="end" class="accentc">[]Kline, no gaps</text>
+      </svg>
+      </div>
+      <figcaption>Only the middle stage speaks HTTP — planning and reducing are ordinary, fully-tested functions with nothing to mock.</figcaption>
+    </figure>
+  </section>
+
+  <section id="download">
+    <div class="kicker"><span class="num">§3</span></div>
+    <h2>Downloading</h2>
+    <div class="prose">
+      <p>All network traffic goes through <strong>one shared <code>http.Client</code></strong>
+      for the life of the process, so TCP and TLS handshakes — 100–200 ms apiece —
+      happen once per host, not once per archive. Every response body is read to
+      completion before it's closed, because a half-read body forces Go to drop the
+      connection instead of pooling it for reuse.</p>
+      <p>Archives are <strong>hashed as they stream</strong>: one copy, written
+      simultaneously to disk and into a running SHA-256, so verifying every download
+      costs nothing extra. The 91-byte <code>.CHECKSUM</code> sidecar is fetched
+      first, so an unpublished month costs one tiny request instead of a large
+      transfer that ends in a 404.</p>
+    </div>
+
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>Retry policy</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">Attempts</td><td>4 — 500 ms, doubling, capped at 8 s (~3.5 s total)</td></tr>
+          <tr><td class="mono">Jitter</td><td>Full jitter: a uniform draw from <span class="m">[0, ceiling)</span>, so forty workers hit with a 503 don't retry in lockstep</td></tr>
+          <tr><td class="mono">Retried</td><td>Transport errors, 408, 425, 429, 500, 502, 503, 504</td></tr>
+          <tr><td class="mono">Never retried</td><td><strong>404</strong> above all — the most common non-200 response here, and a fact rather than a hiccup</td></tr>
+          <tr><td class="mono">Retry-After</td><td>Honoured as a floor, clamped to <span class="m">[500 ms, 30 s]</span>, then jittered on top</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="parse">
+    <div class="kicker"><span class="num">§4</span></div>
+    <h2>Parsing</h2>
+    <div class="prose">
+      <p>An archive is a ZIP holding one CSV with twelve columns. Reading it is easy;
+      trusting it is not, and three things about it were bugs in the implementation
+      this library replaces. <strong>The header is sniffed per file</strong> — spot
+      archives carry none, futures archives do. <strong>The timestamp unit is
+      detected per row</strong>, because Binance switched from milliseconds to
+      microseconds on 2025-01-01 mid-file. And <strong>every candle is checked</strong>
+      against the interval grid and the price relationships that must hold between
+      its eight decimal fields — low is the lowest of the four prices, nothing is
+      negative, taker-buy volume can't exceed the total.</p>
+      <p>Three intervals anchor their grid somewhere other than the Unix epoch —
+      getting this wrong turns a valid candle into a rejected one, silently.</p>
+    </div>
+
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>Interval</th><th>Grid anchor</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">1s … 1d</td><td>Multiples of the interval from midnight UTC</td></tr>
+          <tr><td class="mono">3d</td><td>Three-day multiples from <span class="m">1970-01-02</span> — doesn't restart monthly</td></tr>
+          <tr><td class="mono">1w</td><td>Monday 00:00 UTC</td></tr>
+          <tr><td class="mono">1mo</td><td>The 1st of the month, 00:00 UTC</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="cache">
+    <div class="kicker"><span class="num">§5</span></div>
+    <h2>Two-tier caching</h2>
+    <div class="prose">
+      <p><strong>Tier 1</strong> is the archive exactly as Binance sent it — ZIP plus
+      checksum sidecar. <strong>Tier 2</strong> is a derived Parquet file, its footer
+      stamped with the archive's hash and the codec version that built it. A hit
+      compares that stamp against the sidecar's hash and reads Parquet columns
+      directly — the archive itself is never opened, which is what makes a hit ten
+      times cheaper than a cold parse.</p>
+      <p>Every write lands in a temp file first, then a rename — so a crash mid-write
+      leaves either the old file or the new one, never a torn one. And a lookup
+      registers in-flight <strong>before</strong> any I/O starts, so a saturated pool
+      can't let two workers download the same archive twice.</p>
+    </div>
+
+    <figure>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Two-tier cache diagram. Tier 1 is the ZIP archive with its checksum sidecar. On a miss, the archive is decoded in 62 milliseconds and written to a Parquet file, tier 2. On a hit, the sidecar hash is compared directly against the Parquet footer stamp and columns are read in 6.1 milliseconds, without opening the archive at all.">
+        <defs>
+          <marker id="a3" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+          </marker>
+        </defs>
+
+        <text x="20" y="26" class="svg-eyebrow dim" font-size="11">TIER 1 — ON DISK, AS BINANCE SENT IT</text>
+        <rect class="box-fill box-stroke" x="20" y="42" width="190" height="64" rx="8" stroke-width="1.2"/>
+        <text x="115" y="68" class="svg-title ink" font-size="13.5" text-anchor="middle">ZIP archive</text>
+        <text x="115" y="88" class="soft" font-size="11" text-anchor="middle">93 MB, worst case</text>
+
+        <rect class="box-fill box-stroke" x="20" y="126" width="190" height="64" rx="8" stroke-width="1.2"/>
+        <text x="115" y="152" class="svg-title ink" font-size="13.5" text-anchor="middle">.CHECKSUM</text>
+        <text x="115" y="172" class="soft" font-size="11" text-anchor="middle">91 bytes — SHA-256</text>
+
+        <rect class="teal-fill teal-stroke" x="640" y="80" width="200" height="140" rx="9" stroke-width="1.3"/>
+        <text x="740" y="30" class="svg-eyebrow dim" font-size="11" text-anchor="middle">TIER 2 — DERIVED, OURS</text>
+        <text x="740" y="112" class="svg-title ink" font-size="14.5" text-anchor="middle">Parquet file</text>
+        <text x="740" y="134" class="soft" font-size="11" text-anchor="middle">footer stamp:</text>
+        <text x="740" y="150" class="soft" font-size="11" text-anchor="middle">archive hash + CodecVersion</text>
+
+        <rect class="accent-fill accent-stroke" x="310" y="42" width="200" height="64" rx="8" stroke-width="1.2"/>
+        <text x="410" y="68" class="svg-title ink" font-size="13" text-anchor="middle">decode CSV</text>
+        <text x="410" y="87" class="accentc" font-size="11" text-anchor="middle">62 ms/month, 1 alloc/row</text>
+
+        <line x1="210" y1="74" x2="308" y2="74" stroke="currentColor" class="accentc" stroke-width="1.3" marker-end="url(#a3)"/>
+        <text x="259" y="60" font-size="10.5" text-anchor="middle" class="accentc">miss</text>
+
+        <line x1="510" y1="74" x2="638" y2="115" stroke="currentColor" class="accentc" stroke-width="1.3" marker-end="url(#a3)"/>
+        <text x="580" y="80" font-size="10.5" text-anchor="middle" class="accentc">write, atomic rename</text>
+
+        <polyline points="115,190 115,240 700,240 700,222" fill="none" stroke="currentColor" class="tealc" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#a3)"/>
+        <text x="410" y="260" font-size="11.5" text-anchor="middle" class="tealc">hit: hashes match → 6.1 ms columnar read, archive never opened</text>
+      </svg>
+      </div>
+      <figcaption>A cache hit only reads two small files. The 93 MB archive is touched exactly once — the day it first arrives.</figcaption>
+    </figure>
+  </section>
+
+  <section id="rest">
+    <div class="kicker"><span class="num">§6</span></div>
+    <h2>The REST tail, and its fallback ladder</h2>
+    <div class="prose">
+      <p>Archives lag real time by about a day, so the plan never assumes an archive
+      exists — it asks the listing, and falls back when reality disagrees. A month
+      that isn't published becomes its days; a day that isn't published becomes a
+      paginated REST range, which always answers — 200 and an empty array rather than
+      a 404 — so the ladder never runs out of rungs.</p>
+    </div>
+
+    <figure>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 660 480" role="img" aria-label="Fallback ladder. A missing monthly archive substitutes down into its daily archives; a missing daily archive substitutes down into a REST range, which always answers. A dashed arrow shows the reverse: daily chunks consolidate back up into a monthly archive once at least half the month is wanted and the month is confirmed to exist.">
+        <defs>
+          <marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+          </marker>
+          <marker id="a4d" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+          </marker>
+        </defs>
+
+        <rect class="box-fill box-stroke" x="130" y="20" width="340" height="86" rx="9" stroke-width="1.2"/>
+        <text x="150" y="46" class="svg-title ink" font-size="14.5">Monthly archive</text>
+        <text x="150" y="66" class="soft" font-size="11.5">BTCUSDT-1mo-2024-03.zip</text>
+        <rect class="rose-fill rose-stroke" x="150" y="76" width="118" height="20" rx="10" stroke-width="1"/>
+        <text x="209" y="90" class="rosec" font-size="10.5" text-anchor="middle">✕ not published</text>
+
+        <line x1="300" y1="108" x2="300" y2="168" stroke="currentColor" class="dim" stroke-width="1.3" marker-end="url(#a4)"/>
+        <text x="315" y="142" font-size="11.5" class="soft">substitute → 31 days</text>
+
+        <rect class="box-fill box-stroke" x="130" y="176" width="340" height="96" rx="9" stroke-width="1.2"/>
+        <text x="150" y="200" class="svg-title ink" font-size="14.5">Daily archives ×31</text>
+        <rect class="box-fill box-stroke" x="150" y="212" width="46" height="30" rx="5" stroke-width="1"/>
+        <rect class="box-fill box-stroke" x="204" y="212" width="46" height="30" rx="5" stroke-width="1"/>
+        <rect class="rose-fill rose-stroke" x="258" y="212" width="46" height="30" rx="5" stroke-width="1"/>
+        <text x="281" y="232" class="rosec" font-size="13" text-anchor="middle">✕</text>
+        <text x="330" y="232" class="soft" font-size="13">… one day missing</text>
+
+        <line x1="300" y1="274" x2="300" y2="334" stroke="currentColor" class="dim" stroke-width="1.3" marker-end="url(#a4)"/>
+        <text x="315" y="308" font-size="11.5" class="soft">substitute → REST range</text>
+
+        <rect class="teal-fill teal-stroke" x="130" y="342" width="340" height="86" rx="9" stroke-width="1.2"/>
+        <text x="150" y="368" class="svg-title ink" font-size="14.5">REST range</text>
+        <text x="150" y="388" class="tealc" font-size="11.5">Always answers — 200 + empty,</text>
+        <text x="150" y="405" class="tealc" font-size="11.5">never a 404. The ladder ends here.</text>
+
+        <polyline points="480,224 560,224 560,63 472,63" fill="none" stroke="currentColor" class="accentc" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#a4d)"/>
+        <text x="568" y="145" font-size="11" class="accentc" transform="rotate(90 568 145)" text-anchor="middle">consolidate: month exists &amp; ≥50% wanted</text>
+      </svg>
+      </div>
+      <figcaption>Downgrading runs before fetching, from the listing alone — no request is spent discovering a 404. Consolidating back up to a month is checked first, so a bad guess can't cascade into re-fetching the whole month as days.</figcaption>
+    </figure>
+
+    <div class="callout">
+      <h4>The one endpoint with a quota</h4>
+      <ul>
+        <li><strong>6000 request-weight per minute, per IP.</strong> One klines call costs 2. The library paces itself at 40/s against a ceiling of 100, deliberately leaving most of the budget for anything else on the same machine.</li>
+        <li><strong>429 means slow down; 418 means stop.</strong> Ignoring a 429 for too long earns an IP ban running two minutes to three days — punishing the address, not the process, so it can lock out a live trading bot sharing the host.</li>
+        <li><strong>The forming candle is always dropped.</strong> REST returns the interval currently in progress; its volume is still moving, so it's held back until <code>intervalEnd(OpenTime)</code> has actually passed.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="orchestration">
+    <div class="kicker"><span class="num">§7</span></div>
+    <h2>Concurrency, without the deadlock</h2>
+    <div class="prose">
+      <p>The worker pool is deliberately <strong>flat</strong> — every chunk, whether
+      it's a whole month or a REST page, competes for the same set of permits.
+      Nesting a limit inside a limit is the classic way to deadlock: an outer task
+      can hold a permit while merely waiting on its own inner tasks to get one.</p>
+      <p>Permits are handed out in chunk order, by a single producer, before any
+      worker starts — which is what lets <code>Stream</code> consume results in order
+      while bounding memory to the concurrency limit rather than the length of the
+      range. And a partly-wanted month is fetched whole only once <strong>at least
+      half of it</strong> is actually requested and the listing confirms it exists —
+      below that threshold, days are cheaper; above it, one archive beats fifty
+      separate requests.</p>
+    </div>
+  </section>
+
+  <section id="layout">
+    <div class="kicker"><span class="num">§8</span></div>
+    <h2>Why the package layout looks the way it does</h2>
+    <div class="prose">
+      <p>The obvious layout — every internal piece under <code>internal/</code> —
+      doesn't compile. The loader needs to call the planner, and the planner needs
+      the same <code>Kline</code> and <code>Interval</code> types the loader exports:
+      that's an import cycle. The fix wasn't a workaround, it was a rule: <strong>a
+      package moves under <code>internal/</code> only if it needs no domain types at
+      all.</strong></p>
+      <p><code>plan</code> and <code>vision</code> qualify — one does calendar
+      arithmetic, the other speaks raw URLs and bytes — so the compiler itself
+      guarantees neither can ever import the root package back. <code>codec</code>,
+      <code>cache</code> and <code>restapi</code> need <code>Kline</code> directly, so
+      they stay in the root package, just unexported — invisible to consumers either
+      way, but documented with their real field names instead of rendering as a bare
+      type alias.</p>
+    </div>
+
+    <figure>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 760 400" role="img" aria-label="Package layout diagram. The root package binancedata calls down into internal/plan and internal/vision. Neither of those can import the root package back, because doing so would need domain types they deliberately don't have — the compiler refuses the cycle.">
+        <defs>
+          <marker id="a5" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+          </marker>
+        </defs>
+
+        <rect class="accent-fill accent-stroke" x="190" y="20" width="380" height="92" rx="9" stroke-width="1.3"/>
+        <text x="380" y="48" class="svg-title ink" font-size="15" text-anchor="middle">root package — binancedata</text>
+        <text x="380" y="70" class="accentc" font-size="11.5" text-anchor="middle">Kline · Loader · Interval</text>
+        <text x="380" y="88" class="accentc" font-size="11.5" text-anchor="middle">codec · cache · restapi (unexported)</text>
+
+        <line x1="300" y1="112" x2="230" y2="216" stroke="currentColor" class="dim" stroke-width="1.3" marker-end="url(#a5)"/>
+        <text x="215" y="170" font-size="11" class="soft" text-anchor="end">calls Expand /</text>
+        <text x="215" y="184" font-size="11" class="soft" text-anchor="end">Substitute</text>
+
+        <line x1="460" y1="112" x2="530" y2="216" stroke="currentColor" class="dim" stroke-width="1.3" marker-end="url(#a5)"/>
+        <text x="545" y="170" font-size="11" class="soft">calls List /</text>
+        <text x="545" y="184" font-size="11" class="soft">Download</text>
+
+        <rect class="box-fill box-stroke" x="60" y="224" width="280" height="110" rx="9" stroke-width="1.2"/>
+        <text x="80" y="252" class="svg-title ink" font-size="14">internal/plan</text>
+        <text x="80" y="273" class="soft" font-size="11.5">pure calendar math — imports</text>
+        <text x="80" y="288" class="soft" font-size="11">errors, fmt, time only</text>
+        <rect class="teal-fill teal-stroke" x="80" y="298" width="130" height="20" rx="10" stroke-width="1"/>
+        <text x="145" y="312" class="tealc" font-size="10" text-anchor="middle">no domain types</text>
+
+        <rect class="box-fill box-stroke" x="420" y="224" width="280" height="110" rx="9" stroke-width="1.2"/>
+        <text x="440" y="252" class="svg-title ink" font-size="14">internal/vision</text>
+        <text x="440" y="273" class="soft" font-size="11.5">every HTTP call — listing,</text>
+        <text x="440" y="288" class="soft" font-size="11.5">downloads, REST pagination</text>
+        <rect class="teal-fill teal-stroke" x="440" y="298" width="130" height="20" rx="10" stroke-width="1"/>
+        <text x="505" y="312" class="tealc" font-size="10" text-anchor="middle">URLs &amp; bytes only</text>
+
+        <polyline points="60,300 30,300 30,60 188,60" fill="none" stroke="currentColor" class="rosec" stroke-width="1.2" stroke-dasharray="4 4"/>
+        <circle cx="30" cy="180" r="9" class="rose-fill rose-stroke" stroke-width="1"/>
+        <text x="30" y="184" class="rosec" font-size="11" text-anchor="middle">✕</text>
+        <text x="45" y="180" font-size="10.5" class="rosec">would cycle — refused</text>
+        <text x="45" y="193" font-size="10.5" class="rosec">by the compiler</text>
+      </svg>
+      </div>
+      <figcaption>internal/vision has the same one-way relationship as internal/plan, omitted on the right to keep the diagram legible.</figcaption>
+    </figure>
+  </section>
+
+  <section id="correctness">
+    <div class="kicker"><span class="num">§9</span></div>
+    <h2>Errors and correctness</h2>
+    <div class="prose">
+      <p>Six sentinel errors cover everything the pipeline can tell a caller, always
+      compared with <code>errors.Is</code>, never <code>==</code>.</p>
+    </div>
+
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>Sentinel</th><th>Means</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">ErrNotAvailable</td><td>A 404 — a fact about Binance's calendar, not a failure</td></tr>
+          <tr><td class="mono">ErrChecksum</td><td>Downloaded bytes don't match the published SHA-256</td></tr>
+          <tr><td class="mono">ErrCorruptArchive</td><td>A row breaks the interval grid or the price relationships</td></tr>
+          <tr><td class="mono">ErrInvalidRequest</td><td>The request itself is malformed — always the caller's to fix</td></tr>
+          <tr><td class="mono">ErrRateLimited</td><td>Back off — Binance said slow down</td></tr>
+          <tr><td class="mono">ErrIPBanned</td><td>Stop. A 2 min – 3 day address ban; always paired with ErrRateLimited</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Ten requirements the test suite pins down</h3>
+    <div class="checklist">
+      <div class="checkrow"><div class="check">✓</div><span class="txt">The end of a request range resolves <strong>per call</strong>, never once at construction</span><span class="m">stage 2</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">Month-boundary comparisons anchor on the 1st — no silently dropped tail days</span><span class="m">stage 2</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">Every day in range is covered by exactly one chunk — no silent gaps</span><span class="m">stage 2</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">A 404 on one archive degrades just that chunk; REST's 404 means something else</span><span class="m">stage 7</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">Dedup registers <strong>before</strong> any concurrency permit is acquired</span><span class="m">stage 7</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">Header presence is sniffed per file, never assumed from the market</span><span class="m">stage 3</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">The timestamp unit (ms / µs) is detected per row</span><span class="m">stage 3</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">One shared http.Client for the whole process</span><span class="m">stage 4</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">Checksums are verified, not merely stored</span><span class="m">stage 4→8</span></div>
+      <div class="checkrow"><div class="check">✓</div><span class="txt">Cache writes are atomic — temp file, then rename</span><span class="m">stage 5</span></div>
+    </div>
+  </section>
+
+  <section id="api">
+    <div class="kicker"><span class="num">§10</span></div>
+    <h2>What it looks like to call</h2>
+    <div class="prose">
+      <p>The public surface is small on purpose: a <code>Loader</code>, a
+      <code>Request</code>, and three ways to consume the result — <code>Fetch</code>
+      for one range, <code>FetchAll</code> for many at once (deduplicated across the
+      whole batch for free), and <code>Stream</code> for a range too large to hold in
+      memory at once.</p>
+    </div>
+
+    <div class="code">loader, _ := binancedata.NewLoader(
+    binancedata.WithCacheDir(<span class="st">"./cache"</span>),
+    binancedata.WithConcurrency(<span class="tp">8</span>),
+)
+
+klines, err := loader.Fetch(ctx, binancedata.Request{
+    Symbol:   <span class="st">"BTC/USDT"</span>,
+    Interval: binancedata.Interval1h,
+    Market:   binancedata.MarketSpot,
+    Start:    time.Date(<span class="tp">2024</span>, <span class="tp">1</span>, <span class="tp">1</span>, <span class="tp">0</span>, <span class="tp">0</span>, <span class="tp">0</span>, <span class="tp">0</span>, time.UTC),
+    End:      time.Date(<span class="tp">2024</span>, <span class="tp">12</span>, <span class="tp">31</span>, <span class="tp">23</span>, <span class="tp">59</span>, <span class="tp">59</span>, <span class="tp">999999999</span>, time.UTC),
+})</div>
+    <p class="prose" style="margin-top:14px; font-size: 13.5px; color: var(--ink-faint); max-width: 62ch;">A request is closed on both ends — <code>End</code> is the open time of the last candle you want, so <code>Start == End</code> legally asks for exactly one.</p>
+  </section>
+
+  <footer>
+    <p>Built from scratch in Go · module <code style="font-family: var(--font-mono);">github.com/algo-one/binance-data-downloader</code></p>
+    <p class="status">9 of 9 stages complete — remaining step is the v0.1.0 tag</p>
+  </footer>
+
+</div>
