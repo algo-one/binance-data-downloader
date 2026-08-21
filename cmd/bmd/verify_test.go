@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	binancedata "github.com/algo-one/binance-data-downloader"
@@ -151,9 +152,10 @@ func TestVerifyRemovesFailedArchives(t *testing.T) {
 	}
 
 	f := &fakeLoader{entries: []binancedata.CacheEntry{{
-		Path: archive,
-		Size: 8,
-		Err:  fmt.Errorf("mismatch: %w", binancedata.ErrChecksum),
+		Path:    archive,
+		Sidecar: sidecar,
+		Size:    8,
+		Err:     fmt.Errorf("mismatch: %w", binancedata.ErrChecksum),
 	}}}
 	f.install(t)
 
@@ -201,6 +203,141 @@ func TestVerifyWithoutRmRemovesNothing(t *testing.T) {
 
 	if _, err := os.Stat(archive); err != nil {
 		t.Errorf("the archive was removed without -rm: %v", err)
+	}
+}
+
+// TestVerifyKeepsAnArchiveItCouldNotRead is the one -rm must not get wrong.
+//
+// CacheEntry.Err carries three different outcomes, and only one of them means
+// the data is bad. An archive the walk could not read — a flaky external volume
+// answering EIO, a file left mode 0600 by another user — is very probably
+// intact, and deleting it on that evidence throws away up to 93 MB over a
+// transient failure. On a volume having a bad day it throws away the cache.
+func TestVerifyKeepsAnArchiveItCouldNotRead(t *testing.T) {
+	dir := t.TempDir()
+
+	archive := filepath.Join(dir, "BTCUSDT-1h-2024-01-15.zip")
+	sidecar := archive + ".CHECKSUM"
+
+	for _, path := range []string{archive, sidecar} {
+		if err := os.WriteFile(path, []byte("contents"), 0o644); err != nil {
+			t.Fatalf("seeding %s: %v", path, err)
+		}
+	}
+
+	// What hashFile returns when the io.Copy fails part-way through: an I/O
+	// error, wrapping nothing this tool has a sentinel for.
+	f := &fakeLoader{entries: []binancedata.CacheEntry{{
+		Path:    archive,
+		Sidecar: sidecar,
+		Size:    8,
+		Err:     &os.PathError{Op: "read", Path: archive, Err: syscall.EIO},
+	}}}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	if err := run(t.Context(), []string{"verify", "-rm"}, &stdout, &stderr); err == nil {
+		t.Fatal("run returned nil; a failed archive is still a failure")
+	}
+
+	for _, path := range []string{archive, sidecar} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was removed on a read failure: %v", filepath.Base(path), err)
+		}
+	}
+
+	if !strings.Contains(stdout.String(), "not removed: BTCUSDT-1h-2024-01-15.zip") {
+		t.Errorf("stdout = %q, want it to say the archive was kept and why", stdout.String())
+	}
+}
+
+// TestVerifyRemovesAHalfWrittenEntry covers the other removable case. The cache
+// writes the archive first and the sidecar second, so a crash between the two
+// leaves an archive nothing can ever verify. The read path already treats it as
+// a miss, which makes deleting it free.
+func TestVerifyRemovesAHalfWrittenEntry(t *testing.T) {
+	dir := t.TempDir()
+
+	archive := filepath.Join(dir, "BTCUSDT-1h-2024-01-15.zip")
+	sidecar := archive + ".CHECKSUM"
+
+	if err := os.WriteFile(archive, []byte("contents"), 0o644); err != nil {
+		t.Fatalf("seeding the archive: %v", err)
+	}
+
+	// The sidecar is deliberately not written: this is what readSidecar returns
+	// when it is not there.
+	f := &fakeLoader{entries: []binancedata.CacheEntry{{
+		Path:    archive,
+		Sidecar: sidecar,
+		Size:    8,
+		Err:     &os.PathError{Op: "open", Path: sidecar, Err: os.ErrNotExist},
+	}}}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	if err := run(t.Context(), []string{"verify", "-rm"}, &stdout, &stderr); err == nil {
+		t.Fatal("run returned nil; a failed archive is still a failure")
+	}
+
+	if _, err := os.Stat(archive); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the archive survived -rm; err = %v", err)
+	}
+
+	// The sidecar was already gone, and removeEntry says nothing about a file
+	// that was not there — that absence is why the entry was reported at all.
+	if strings.Contains(stdout.String(), "not removed") {
+		t.Errorf("stdout = %q, want the half-written entry removed", stdout.String())
+	}
+}
+
+// TestRemovable states the rule in one place, since it is the whole decision
+// -rm makes and the failure mode for getting it wrong is deleting good data.
+func TestRemovable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "a checksum mismatch is what -rm is for",
+			err:  fmt.Errorf("cache: a.zip hashes to abc, sidecar says def: %w", binancedata.ErrChecksum),
+			want: true,
+		},
+		{
+			name: "a missing sidecar leaves an entry nothing can verify",
+			err:  &os.PathError{Op: "open", Path: "/cache/a.zip.CHECKSUM", Err: os.ErrNotExist},
+			want: true,
+		},
+		{
+			name: "an I/O error says nothing about the data",
+			err:  &os.PathError{Op: "read", Path: "/cache/a.zip", Err: syscall.EIO},
+			want: false,
+		},
+		{
+			name: "so does a permission error",
+			err:  &os.PathError{Op: "open", Path: "/cache/a.zip", Err: os.ErrPermission},
+			want: false,
+		},
+		{
+			name: "a sidecar that will not parse leaves the archive unjudged",
+			err:  errors.New("cache: a.zip.CHECKSUM: sidecar names b.zip"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := removable(tt.err); got != tt.want {
+				t.Errorf("removable(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

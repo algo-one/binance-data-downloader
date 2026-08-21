@@ -73,7 +73,12 @@ Flags:
 		}
 	}
 
-	l, err := newLoader(common.options(stderr)...)
+	opts, err := common.options(fs, stderr)
+	if err != nil {
+		return err
+	}
+
+	l, err := newLoader(opts...)
 	if err != nil {
 		return err
 	}

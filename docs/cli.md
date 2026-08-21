@@ -42,8 +42,8 @@ bmd download \
 | `-market` | `spot` (the only implemented value today) |
 | `-out` | A file, a directory, or `-` for stdout. Default: a generated name here |
 | `-format` | `csv`, `json` or `parquet` |
-| `-cache-dir` | Where the two-tier cache lives |
-| `-concurrency` | Parallel chunk fetches (default 8) |
+| `-cache-dir` | Where the two-tier cache lives. Rejected if given as an empty string |
+| `-concurrency` | Parallel chunk fetches (default 8). Must be at least 1 |
 | `-quiet` | Print nothing to stderr but errors — no progress, no summary |
 | `-verbose` | Log what the pipeline is doing to stderr |
 
@@ -148,6 +148,13 @@ and makes no parallel fetches. A flag a command advertises and then ignores
 costs a debugging session to discover, so each command registers only what it
 honours.
 
+The same rule applies to a flag's *value*. `-concurrency -4` and `-concurrency 0`
+are usage errors rather than silent falls back to the default, and so is
+`-cache-dir ""` — which is what `-cache-dir "$CACHE_DIR"` becomes when the
+variable is unset. Defaulting quietly there is the dangerous reading: the caller
+believes they named a directory, and on `bmd verify -rm` the default is the
+user's real cache.
+
 `-since 2024-01-01` bounds the answer *and* its cost. The bucket listing is
 seeked to it, so asking about one year is a single round trip where asking about
 a pair's whole history can be seven.
@@ -176,6 +183,22 @@ one-line summary on stderr.
 replaces them. The derived parquet is left alone: it carries the archive's
 published hash in its footer, so it is still valid data, and the cache is
 documented to keep serving from tier 2 when tier 1 has been pruned.
+
+It does not delete everything it reports, and the distinction matters more than
+it looks. A failure is only a reason to throw away up to 93 MB when it is a fact
+about the *data*:
+
+| What went wrong | `-rm` |
+| --- | --- |
+| The hash does not match the sidecar | **removes** — the bytes are not what Binance published |
+| The sidecar is missing | **removes** — the cache writes the archive first, so this is a crash between the two writes; what is left can never be verified and the read path already ignores it |
+| The file could not be read — `EIO`, `EACCES` | **keeps**, and says `not removed` |
+| The sidecar will not parse | **keeps**, and says `not removed` |
+
+The last two are facts about the disk, not about the archive, and the archive is
+very probably intact. Deleting on a transient read error turns one bad moment on
+a flaky volume into a re-download — and if the volume is what is having the bad
+moment, into a re-download of the whole cache.
 
 Tier 2 is not walked, because it does not need to be. Every read checks the
 parquet footer against the archive's hash and the codec version and rebuilds

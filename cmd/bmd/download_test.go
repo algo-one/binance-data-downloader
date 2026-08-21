@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	binancedata "github.com/algo-one/binance-data-downloader"
 )
 
 // TestDownloadEndIsInclusive is the flag-parsing half of the decision the
@@ -295,6 +298,42 @@ func TestDownloadRejectsBadFlags(t *testing.T) {
 			},
 			want: `-market "futures"`,
 		},
+		{
+			// The flag package takes the next argument as the value whether or
+			// not it starts with a dash, so this parses cleanly and the number
+			// reaches the code that has to judge it. Left unjudged it ran at
+			// the default 8 and said nothing.
+			name: "a negative concurrency",
+			args: []string{
+				"-symbol", "BTCUSDT", "-interval", "1h", "-start", "2024-01-01",
+				"-concurrency", "-4",
+			},
+			want: "-concurrency -4: must be at least 1",
+		},
+		{
+			// Zero is the flag's declared default, which is how "not given" is
+			// spelled internally — but typing it is not the same as omitting
+			// it, and the help text says the default is 8.
+			name: "an explicit zero concurrency",
+			args: []string{
+				"-symbol", "BTCUSDT", "-interval", "1h", "-start", "2024-01-01",
+				"-concurrency", "0",
+			},
+			want: "-concurrency 0: must be at least 1",
+		},
+		{
+			// What `-cache-dir "$CACHE_DIR"` does when the variable is unset.
+			// Silently falling back to the default cache is the dangerous
+			// reading of it, because the caller believes they named a
+			// directory — and on `bmd verify -rm` the default cache is the
+			// user's real one.
+			name: "an empty cache dir",
+			args: []string{
+				"-symbol", "BTCUSDT", "-interval", "1h", "-start", "2024-01-01",
+				"-cache-dir", "",
+			},
+			want: "-cache-dir is empty",
+		},
 	}
 
 	for _, tt := range tests {
@@ -320,6 +359,111 @@ func TestDownloadRejectsBadFlags(t *testing.T) {
 				t.Error("the loader was asked for candles despite the bad flags")
 			}
 		})
+	}
+}
+
+// TestDownloadHonoursTheFlagsItAccepts is the other half of the rule the table
+// above enforces. Rejecting a bad -concurrency is only worth anything if a good
+// one still reaches the loader — an over-strict check and a silently dropped
+// value are the same defect seen from opposite sides.
+//
+// An Option is opaque, so what is asserted is that both flags produced one.
+// docs/architecture.md states the rule they are counted against: every option a
+// constructor accepts must be honoured, and an accepted-and-ignored setting is
+// a defect rather than a stub.
+func TestDownloadHonoursTheFlagsItAccepts(t *testing.T) {
+	f := &fakeLoader{klines: testKlines(t, 1)}
+	f.install(t)
+
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+
+	err := run(t.Context(), []string{
+		"download",
+		"-symbol", "BTCUSDT",
+		"-interval", "1h",
+		"-start", "2024-01-15",
+		"-end", "2024-01-15",
+		"-concurrency", "4",
+		"-cache-dir", t.TempDir(),
+		"-quiet",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// -cache-dir and -concurrency, and nothing else: -quiet suppresses the
+	// progress callback and there is no -verbose, so a third option here would
+	// mean something was added without this test being told.
+	if got := len(f.gotOptions); got != 2 {
+		t.Errorf("newLoader got %d options, want 2 (-cache-dir and -concurrency)", got)
+	}
+}
+
+// TestDownloadSummaryStartsOnItsOwnLine covers the one thing about the progress
+// display that only shows up on a real terminal.
+//
+// On a tty every redraw is "\r", the line, and no newline, so when the last one
+// returns the cursor is sitting at the end of it. Whatever is printed next
+// begins at that column. The summary therefore has to wait for done() to
+// release the line — and a deferred done() does not, because a defer runs after
+// the function body, which is to say after the summary. The visible result was
+// one run-together line:
+//
+//	[60/60] monthly archive 2024-03-31  720 candlesBTCUSDT 1h: wrote 720 ...
+//
+// newProgress is replaced rather than isTerminal because the reporter has to
+// have drawn something for done() to owe a newline at all: it checks active,
+// which only a report sets. Reporting at construction stands in for the
+// library's callback, which in a real run has fired many times by this point.
+func TestDownloadSummaryStartsOnItsOwnLine(t *testing.T) {
+	f := &fakeLoader{klines: testKlines(t, 1)}
+	f.install(t)
+
+	t.Chdir(t.TempDir())
+
+	original := newProgress
+	t.Cleanup(func() { newProgress = original })
+
+	newProgress = func(w io.Writer, _ bool) *progress {
+		p := &progress{w: w, tty: true}
+
+		p.report(binancedata.Progress{
+			Done: 1, Total: 1, Source: binancedata.SourceDailyArchive,
+			Start:  mustDate(t, "2024-01-15"),
+			Klines: 1,
+		})
+
+		return p
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	err := run(t.Context(), []string{
+		"download",
+		"-symbol", "BTCUSDT",
+		"-interval", "1h",
+		"-start", "2024-01-15",
+		"-end", "2024-01-15",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Split on the newline the display owes, not on every line: what is being
+	// asserted is that one was written between the redraw and the summary.
+	before, after, found := strings.Cut(stderr.String(), "\n")
+	if !found {
+		t.Fatalf("stderr = %q, want a newline releasing the progress line", stderr.String())
+	}
+
+	if !strings.HasPrefix(before, "\r") || !strings.Contains(before, "1 candles") {
+		t.Errorf("the first line is %q, want the progress redraw", before)
+	}
+
+	if !strings.HasPrefix(after, "BTCUSDT 1h: wrote") {
+		t.Errorf("the summary is %q, want it at the start of a line of its own", after)
 	}
 }
 

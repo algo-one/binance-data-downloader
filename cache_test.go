@@ -1231,6 +1231,72 @@ func TestVerifyReportsAMissingSidecarAsSomethingElse(t *testing.T) {
 	}
 }
 
+// TestVerifyNamesBothHalvesOfAnEntry covers CacheEntry.Sidecar.
+//
+// It exists so that a caller acting on a failed entry — bmd verify -rm is the
+// one in this repository — can name both files without knowing that Binance's
+// sidecar suffix is ".CHECKSUM" and that it is appended to the whole file name
+// rather than replacing the extension. A caller that derives the path instead
+// has copied a rule it cannot see change, and the failure mode when the two
+// disagree is silent: the archive is deleted and the orphan is left behind,
+// because os.Remove on a name nothing matches returns ErrNotExist.
+//
+// The second case is the one worth having. The field has to be filled in before
+// anything can fail, or the entry that most needs both names — the one whose
+// sidecar could not be read — is the entry that does not carry them.
+func TestVerifyNamesBothHalvesOfAnEntry(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, p cachePaths)
+	}{
+		{
+			name:  "a healthy entry",
+			setup: func(*testing.T, cachePaths) {},
+		},
+		{
+			name: "an entry whose sidecar is gone",
+			setup: func(t *testing.T, p cachePaths) {
+				t.Helper()
+
+				if err := os.Remove(p.sidecar); err != nil {
+					t.Fatalf("removing the sidecar: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, _, _, p := warmCache(t)
+			tt.setup(t, p)
+
+			entries, err := collectVerify(t, c)
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+
+			if len(entries) != 1 {
+				t.Fatalf("verified %d entries, want 1", len(entries))
+			}
+
+			if got := entries[0].Path; got != p.archive {
+				t.Errorf("Path = %q, want %q", got, p.archive)
+			}
+
+			// Against the path the cache's own writer used, not against the
+			// same expression recomputed here — that would agree with a wrong
+			// answer.
+			if got := entries[0].Sidecar; got != p.sidecar {
+				t.Errorf("Sidecar = %q, want %q", got, p.sidecar)
+			}
+		})
+	}
+}
+
 // TestVerifyKeepsGoingAfterABadArchive is the property that separates this from
 // the read path. A reader stops at the first failure; a report that stopped
 // would tell you about one bad file and leave you to discover the rest one run

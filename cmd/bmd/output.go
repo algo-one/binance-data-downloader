@@ -30,13 +30,23 @@ const (
 	formatParquet = "parquet"
 )
 
-// outputFilePerm is what a downloaded file ends up as, before the umask.
+// outputFilePerm is what a downloaded file ends up as.
 //
 // os.CreateTemp makes its file readable only by the owner, which is right for a
-// temporary file and wrong for output somebody asked for: 0644 is what an
-// ordinary shell redirect would produce, and market data from a public bucket
-// is not a secret. The cache uses the same value for the same reason — see
-// cacheFilePerm.
+// temporary file and wrong for output somebody asked for: market data from a
+// public bucket is not a secret, and a CSV that the tool you were going to load
+// it with cannot read is not an output. The cache uses the same value for the
+// same reason — see cacheFilePerm.
+//
+// It is applied with os.Chmod, which sets the mode outright, so — unlike a
+// shell redirect, and unlike the mode you pass to os.OpenFile — **the process
+// umask does not filter it**. Under `umask 077`, where every other file you
+// create lands 0600, a downloaded file is still 0644. That is worth knowing
+// before assuming otherwise, and it is the state of things rather than an
+// oversight: writing atomically means creating a temporary file, os.CreateTemp
+// hardcodes 0600, and Go has no portable way to read the umask back — syscall.
+// Umask does not exist on Windows and is process-global, so consulting it means
+// setting it, which races every other goroutine creating a file.
 const outputFilePerm fs.FileMode = 0o644
 
 // stdoutPath is the -out value meaning "write to standard output". It is the
@@ -375,6 +385,16 @@ func writeFileAtomically(path string, write func(io.Writer) error) (err error) {
 // scribble binary into somebody's session. os.File's mode carries the answer,
 // so this needs no dependency — a character device is a terminal for these
 // purposes, and anything that is not an *os.File certainly is not one.
+//
+// It is deliberately not perfectly accurate: /dev/null is a character device
+// and is not a terminal. Both callers are choosing how to *format* output, so
+// the cost of being wrong there is a redraw sequence written to a sink that
+// discards it, which is why a real terminal check, with the dependency it
+// needs, has not been worth it.
+//
+// Nothing in the test suite reaches the terminal branch through this function,
+// because a test writes to a bytes.Buffer and a bytes.Buffer is not an
+// *os.File. That gap is covered at newProgress instead, which is the seam.
 func isTerminal(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {

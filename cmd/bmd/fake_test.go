@@ -42,6 +42,13 @@ type fakeLoader struct {
 	// download tests are actually about: the flags became this request.
 	gotRequest binancedata.Request
 	gotQuery   binancedata.AvailabilityQuery
+
+	// gotOptions records what newLoader was handed. An Option is an opaque
+	// interface, so there is nothing to read out of one — but counting them is
+	// enough to tell a flag that produced an option from a flag that was
+	// quietly dropped, which is the failure commonFlags.options exists to
+	// prevent.
+	gotOptions []binancedata.Option
 }
 
 func (f *fakeLoader) Stream(_ context.Context, req binancedata.Request) iter.Seq2[binancedata.Kline, error] {
@@ -93,7 +100,11 @@ func (f *fakeLoader) install(t *testing.T) {
 
 	original := newLoader
 
-	newLoader = func(...binancedata.Option) (loader, error) { return f, nil }
+	newLoader = func(opts ...binancedata.Option) (loader, error) {
+		f.gotOptions = opts
+
+		return f, nil
+	}
 
 	t.Cleanup(func() { newLoader = original })
 }

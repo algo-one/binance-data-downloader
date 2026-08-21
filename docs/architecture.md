@@ -878,9 +878,10 @@ func (a Availability) MonthlyGaps() []time.Time
 func (a Availability) DailyGaps() []time.Time
 
 type CacheEntry struct {
-    Path string // the archive on disk
-    Size int64
-    Err  error  // nil if it hashes to what its sidecar says
+    Path    string // the archive on disk, absolute
+    Sidecar string // its .CHECKSUM file, absolute; always set
+    Size    int64
+    Err     error  // nil if it hashes to what its sidecar says
 }
 
 type Progress struct {

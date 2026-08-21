@@ -58,7 +58,12 @@ Flags:
 		return usagef("unexpected argument %q; every value is given with a flag", fs.Arg(0))
 	}
 
-	l, err := newLoader(common.options(stderr)...)
+	opts, err := common.options(fs, stderr)
+	if err != nil {
+		return err
+	}
+
+	l, err := newLoader(opts...)
 	if err != nil {
 		return err
 	}
@@ -99,7 +104,16 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 		_, _ = fmt.Fprintf(stdout, "%s: %v\n", entry.Path, entry.Err)
 
 		if remove {
-			removeEntry(stdout, stderr, entry)
+			if removable(entry.Err) {
+				removeEntry(stdout, stderr, entry)
+			} else {
+				// Said out loud, and on stdout beside the failure it belongs
+				// to. A -rm that silently declines to remove something looks
+				// from the outside exactly like a -rm that failed to.
+				_, _ = fmt.Fprintf(stdout,
+					"not removed: %s (not a checksum failure — the archive may be intact)\n",
+					filepath.Base(entry.Path))
+			}
 		}
 	}
 
@@ -120,6 +134,34 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 	return nil
 }
 
+// removable reports whether a failed entry is one that -rm should delete.
+//
+// Not every failure is a reason to delete 93 MB, and CacheEntry.Err documents
+// which are. Two are:
+//
+//   - ErrChecksum. The bytes on disk are not what Binance published, so they
+//     are worthless by definition and the next download replaces them. This is
+//     the case -rm exists for.
+//   - os.ErrNotExist. Half the entry is already gone — the sidecar the cache
+//     writes second, most often, after a crash between the two writes. What is
+//     left can never be verified and the read path already ignores it, so
+//     removing it costs nothing and reclaims the space.
+//
+// Everything else is kept, and that is the whole point of this function. An
+// EIO from a flaky external volume, an EACCES on a file that belongs to another
+// user, a sidecar whose contents will not parse: in every one of those the
+// archive may be perfectly good, and the failure is a fact about the disk or
+// about the sidecar rather than about the data. Deleting on those turns a
+// transient read error into a re-download of a file that was never damaged —
+// and on a cache that lives on the volume having the bad day, into a great many
+// of them at once.
+func removable(err error) bool {
+	// os.ErrNotExist rather than fs.ErrNotExist, which is the same value: this
+	// file names its FlagSets fs, so importing io/fs here would shadow the
+	// package inside every command in it.
+	return errors.Is(err, binancedata.ErrChecksum) || errors.Is(err, os.ErrNotExist)
+}
+
 // removeEntry deletes a failed archive and the sidecar naming it.
 //
 // Both, because they are one cache entry: an archive with no sidecar and a
@@ -129,8 +171,15 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 // archive's published hash in its footer, so it is still valid data built from
 // the bytes Binance served, and the cache is documented to keep serving from
 // tier 2 when tier 1 has been pruned.
+//
+// The sidecar's path comes from the entry rather than from ".CHECKSUM" spelled
+// out here. The suffix is Binance's naming rule, the library already knows it,
+// and a second copy of it in the CLI would go wrong silently if the two ever
+// disagreed: os.Remove on a name nothing matches returns ErrNotExist, which the
+// switch below treats as expected, so the archive would go and the orphan would
+// stay without a word.
 func removeEntry(stdout, stderr io.Writer, entry binancedata.CacheEntry) {
-	for _, path := range []string{entry.Path, entry.Path + ".CHECKSUM"} {
+	for _, path := range []string{entry.Path, entry.Sidecar} {
 		err := os.Remove(path)
 
 		switch {

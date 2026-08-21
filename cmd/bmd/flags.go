@@ -145,7 +145,54 @@ func (c *commonFlags) registerVerbose(fs *flag.FlagSet) {
 // rejects a non-positive count and WithCacheDir rejects an empty directory —
 // correctly, since both are caller errors in a Go program — so "the flag was
 // not given" has to be expressed by not calling the option at all.
-func (c *commonFlags) options(stderr io.Writer) []binancedata.Option {
+//
+// # Why this returns an error, and why it needs the FlagSet
+//
+// Because "left out" and "rejected" are different answers to different
+// questions, and testing the value alone cannot tell them apart. A bare
+// `if c.concurrency > 0` covers both: it skips the option when the flag was
+// absent, which is right, and it *also* skips it when somebody typed
+// -concurrency -4, which is not — that runs at the default 8 and says nothing,
+// which is the accepted-and-ignored setting docs/architecture.md calls a defect
+// rather than a stub.
+//
+// The distinction lives in the FlagSet rather than in the value. fs.Visit walks
+// only the flags actually set on the command line, so it separates "-cache-dir
+// was never given" from "-cache-dir was given as an empty string", which the
+// string itself cannot. That second case is not hypothetical: it is what
+// `bmd verify -cache-dir "$CACHE_DIR" -rm` does when CACHE_DIR is unset, and
+// silently defaulting there points a deleting command at the user's real cache.
+//
+// Visit also only ever sees flags this command registered, so the switch below
+// needs no guard for `bmd verify` having no -concurrency: it was never
+// registered, so it can never have been set.
+func (c *commonFlags) options(fs *flag.FlagSet, stderr io.Writer) ([]binancedata.Option, error) {
+	// Visit takes a func with no error return and cannot be stopped early, so
+	// the first failure is captured here and the rest of the walk is skipped.
+	var bad error
+
+	fs.Visit(func(f *flag.Flag) {
+		if bad != nil {
+			return
+		}
+
+		switch f.Name {
+		case "cache-dir":
+			if c.cacheDir == "" {
+				bad = usagef(`-cache-dir is empty; omit it entirely for the default cache directory`)
+			}
+
+		case "concurrency":
+			if c.concurrency < 1 {
+				bad = usagef("-concurrency %d: must be at least 1", c.concurrency)
+			}
+		}
+	})
+
+	if bad != nil {
+		return nil, bad
+	}
+
 	var opts []binancedata.Option
 
 	if c.cacheDir != "" {
@@ -162,7 +209,7 @@ func (c *commonFlags) options(stderr io.Writer) []binancedata.Option {
 		}))))
 	}
 
-	return opts
+	return opts, nil
 }
 
 // newLoader builds the real loader. It is a variable rather than a function so

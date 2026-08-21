@@ -123,3 +123,46 @@ Everything still works, because `removeEntry` resolves against the same working 
 But a caller who stores or forwards the path, or a `bmd verify` run whose output is read
 after a `cd`, gets a path that no longer resolves. Either `filepath.Abs` the root in
 `verify`, or soften the doc comment.
+
+---
+
+## Resolution
+
+Verified 2026-08-21 against the code, not taken on trust. **Five of the six hold
+and were applied. One does not**, and it is recorded below rather than quietly
+skipped.
+
+Three were reproduced before anything was changed — two as failing tests, one by
+running the built binary — and each was then watched failing again against the
+unfixed code.
+
+| # | Verdict | What changed |
+| --- | --- | --- |
+| 1 | **Confirmed**, mechanism corrected | `download` calls `progress.done()` explicitly before the summary; the `defer` stays for the error paths. The review describes the summary "overwriting the prefix" of the progress line, which would need it to start with `\r` — it does not, so what actually happened was concatenation: `[60/60] monthly archive 2024-03-31  720 candlesBTCUSDT 1h: wrote 720 ...`. `newProgress` is now a var so a test can reach the terminal branch at all; `TestDownloadSummaryStartsOnItsOwnLine` fails against the deferred call with `the summary is "\n"` |
+| 2 | **Confirmed**, reproduced | Reproduced against the built binary: an intact archive at mode 000 was deleted, sidecar and all, on `permission denied`. Removal is now gated on the new `removable`, which passes `ErrChecksum` and `os.ErrNotExist` — a bad hash, or half an entry that can never be verified — and keeps everything else with a `not removed` line beside the failure. `TestVerifyKeepsAnArchiveItCouldNotRead` and a table over the five error shapes |
+| 3 | **Confirmed** | Reproduced: `-concurrency -4` got past parsing, `Validate` and `newLoader`, which proves `WithConcurrency` was never called with it. `commonFlags.options` now takes the `FlagSet` and returns an error, so the check cannot be skipped. It uses `fs.Visit`, which separates "not given" from "given as empty" — the difference the string alone cannot carry, and the one that decides whether `-cache-dir "$CACHE_DIR"` with the variable unset points a `-rm` at the user's real cache. `-concurrency 0` is rejected too, for the same reason |
+| 4 | **Confirmed**, and the same bug found in the library | Measured under `umask 077`: `os.Chmod(0644)` gives `-rw-r--r--` where a shell redirect gives `-rw-------`. The behaviour is kept and the comment now says what it does — `os.Chmod` is not umask-filtered, and Go has no portable way to read the umask back, since `syscall.Umask` is absent on Windows and is process-global. `cache.go` made the identical false claim ("the process umask applies on top, as always") over a const block covering both a `MkdirAll` mode, where it is true, and a `Chmod` mode, where it is not |
+| 5 | **Confirmed**, different fix | The defect is real and the failure mode is silent, as described. The suggested fix is not taken: `cmd/bmd` imports only the root package, and `docs/cli.md` opens by claiming anything the CLI does can be done from Go code — which importing `internal/vision` would make false, since a consumer cannot. `CacheEntry` carries `Sidecar` instead, filled in before anything can fail, so the CLI needs no copy of Binance's naming rule and neither does any other caller |
+| 6 | **Does not hold** — see below | Nothing changed |
+
+### Why #6 does not hold
+
+The finding claims `CacheEntry.Path` is relative whenever `WithCacheDir` was
+given a relative path, and predicts that `bmd verify -cache-dir ./cache` prints
+`cache/spot/…zip`.
+
+`newCache` resolves the root before storing it — `cache.go:147`, "Resolved once,
+here, rather than on every path built from it" — so `WalkDir` is handed an
+absolute root and every path it yields is absolute. Run against the built
+binary, `bmd verify -cache-dir ./relcache` prints the absolute path. The only
+other construction of a `cache` is a test using `t.TempDir()`, which is absolute
+as well. The doc comment was accurate and is unchanged.
+
+### Also fixed, not in the review
+
+`cache.go`'s `cacheFilePerm` comment carried the same false umask claim as #4.
+It predates Stage 8 and was fairly out of the review's scope, but it is the
+sentence `cmd/bmd/output.go` cross-references as "the same reason", so leaving
+one right and the other wrong would have been worse than either.
+
+`mise run ci` is green: 0 lint issues, 875 tests under `-race`, up from 859.

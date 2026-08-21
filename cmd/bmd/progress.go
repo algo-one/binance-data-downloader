@@ -42,7 +42,18 @@ type progress struct {
 // decide whether to register a progress callback at all, and a library that is
 // not calling back is cheaper than one calling into a function that discards
 // its argument.
-func newProgress(w io.Writer, quiet bool) *progress {
+//
+// # Why it is a variable
+//
+// For the same reason newLoader is — so a test can replace it — and here that
+// is the only way to reach the terminal branch at all. Every test in this
+// package writes to a bytes.Buffer, a bytes.Buffer is not an *os.File, so
+// isTerminal answers false and tty is false in the whole suite. The half that
+// goes untested that way is not a cosmetic one: it is the half that leaves the
+// cursor sitting mid-line with no newline after it, which is what makes *when*
+// done() is called matter. A summary printed before it lands on the end of the
+// progress line, and no assertion here could see that until this became a var.
+var newProgress = func(w io.Writer, quiet bool) *progress {
 	if quiet {
 		return nil
 	}

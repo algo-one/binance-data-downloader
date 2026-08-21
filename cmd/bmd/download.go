@@ -85,14 +85,20 @@ Flags:
 		return usagef("-format parquet writes binary; give -out a file, or redirect stdout")
 	}
 
-	opts := common.options(stderr)
+	opts, err := common.options(fs, stderr)
+	if err != nil {
+		return err
+	}
 
-	if progress := newProgress(stderr, common.quiet); progress != nil {
+	progress := newProgress(stderr, common.quiet)
+	if progress != nil {
 		opts = append(opts, binancedata.WithProgress(progress.report))
 
-		// The progress display owns the last line on the terminal until the
-		// command is done with it. Finishing it before anything else is
-		// printed is what stops a summary landing halfway through a redraw.
+		// The deferred call is for the paths that leave without reaching the
+		// summary — a fetch that failed, a cancelled context — where the error
+		// main is about to print would otherwise land on the progress line.
+		// The success path releases the line explicitly below instead, because
+		// a defer runs *after* the summary rather than before it.
 		defer progress.done()
 	}
 
@@ -109,6 +115,17 @@ Flags:
 	if err != nil {
 		return err
 	}
+
+	// The progress display owns the last line on the terminal until this point.
+	// On a terminal its last redraw ended with \r and the line, and no newline,
+	// so the cursor is sitting at the end of it — anything printed now would be
+	// appended to "[60/60] monthly archive 2024-03-31  720 candles" rather than
+	// starting a line of its own. done() releases it, and it has to be called
+	// here rather than left to the defer above, which runs after the summary.
+	//
+	// Calling it twice is harmless: it clears active, and it is nil-safe, so
+	// this needs no guard for -quiet having suppressed the display entirely.
+	progress.done()
 
 	// The summary goes to stderr even when the data went to a file, so that
 	// `bmd download -out - > candles.csv` produces a file with nothing in it

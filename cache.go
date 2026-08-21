@@ -61,7 +61,18 @@ const (
 	// every byte came from a public bucket — and one of the stated benefits of
 	// tier 2 being parquet is that other tools can read it. A file this
 	// library's own CLI can read but pandas cannot would forfeit that for no
-	// gain. The process umask applies on top, as always.
+	// gain.
+	//
+	// The two are not reached the same way, and the difference is easy to state
+	// wrongly. cacheDirPerm goes to os.MkdirAll, which creates, so the process
+	// umask filters it: under umask 077 a cache directory is 0700. cacheFilePerm
+	// goes to os.Chmod, which sets a mode outright and is *not* umask-filtered,
+	// so a cache file is 0644 whatever the umask says. That asymmetry is a
+	// consequence of writing atomically — os.CreateTemp hardcodes 0600, so the
+	// mode has to be set after the fact — and it is left as it is on purpose,
+	// because the reason above is about the file rather than about the caller's
+	// default. A private umask should not quietly make the parquet tier
+	// unreadable to the tools it exists for.
 	cacheDirPerm  fs.FileMode = 0o755
 	cacheFilePerm fs.FileMode = 0o644
 
@@ -710,7 +721,8 @@ func writeAtomic(path string, write func(io.Writer) error) error {
 	}
 
 	// CreateTemp makes the file readable only by its owner, which is right for
-	// a temporary file and wrong for a cache entry.
+	// a temporary file and wrong for a cache entry. Chmod rather than a mode on
+	// creation, and so deliberately not umask-filtered — see cacheFilePerm.
 	if err := os.Chmod(tmp, cacheFilePerm); err != nil {
 		return fmt.Errorf("cache: setting permissions on %s: %w", tmp, err)
 	}
@@ -851,6 +863,20 @@ type CacheEntry struct {
 	// Path is the archive's absolute path on disk.
 	Path string
 
+	// Sidecar is the absolute path of the .CHECKSUM file that names this
+	// archive's published hash. It is always set, including when reading it is
+	// what failed, because a caller acting on a failed entry needs to name both
+	// halves of it.
+	//
+	// It is a field rather than something a caller derives, and the reason is
+	// worth stating: deriving it means knowing that the suffix is ".CHECKSUM"
+	// and that it is appended to the whole file name rather than replacing the
+	// extension. That is Binance's naming rule, not this library's, and a
+	// caller who hardcodes it has taken on a rule it cannot see change. The
+	// cost of the rule moving is silent — a delete that removes the archive and
+	// leaves an orphan — which is the kind of coupling a field cheaply removes.
+	Sidecar string
+
 	// Size is the archive's size in bytes, which is what makes a progress
 	// display possible: hashing is proportional to it.
 	Size int64
@@ -861,11 +887,19 @@ type CacheEntry struct {
 	//
 	//   - wrapping [ErrChecksum]: the bytes on disk are not what Binance
 	//     published. Delete the file; the next fetch downloads it again.
-	//   - a missing sidecar: not corruption. The cache writes the archive
-	//     first and the sidecar second, so a crash between the two leaves
-	//     exactly this, and the read path already treats it as a cache miss.
-	//   - anything else: an I/O failure reading the file, which is a fact
-	//     about the disk rather than about the data.
+	//   - wrapping [fs.ErrNotExist]: half an entry. The cache writes the
+	//     archive first and the sidecar second, so a crash between the two
+	//     leaves exactly this. It is not corruption, and the read path already
+	//     treats it as a cache miss — but what is left cannot be verified or
+	//     used, so deleting it is safe and reclaims the space.
+	//   - anything else: an I/O failure reading one of the two files, or a
+	//     sidecar whose contents will not parse. This is a fact about the disk
+	//     rather than about the data, and the archive may be perfectly good.
+	//     Do not delete on this one; report it and let a person look.
+	//
+	// Compare with [errors.Is], never with ==. The first two cases are
+	// deliberately distinguishable that way, because "delete it" and "leave it
+	// alone" is the decision every caller of [Loader.VerifyCache] has to make.
 	Err error
 }
 
@@ -955,7 +989,10 @@ func (c *cache) verify(ctx context.Context) iter.Seq2[CacheEntry, error] {
 // Every failure lands in the returned entry rather than being returned, because
 // this function's caller is a walk that must not stop for a bad file.
 func verifyArchive(path string, d fs.DirEntry) CacheEntry {
-	entry := CacheEntry{Path: path}
+	// Both paths are filled in before anything can fail, so every return below
+	// — including the ones that never get as far as opening the sidecar —
+	// describes a whole cache entry rather than half of one.
+	entry := CacheEntry{Path: path, Sidecar: path + vision.ChecksumSuffix}
 
 	info, err := d.Info()
 	if err != nil {
@@ -970,7 +1007,7 @@ func verifyArchive(path string, d fs.DirEntry) CacheEntry {
 	// 93 MB, so a cache entry missing its sidecar costs one open instead of a
 	// full hash to diagnose. readSidecar also checks that the sidecar names
 	// this archive, which catches a file copied out of the wrong directory.
-	want, err := readSidecar(path+vision.ChecksumSuffix, filepath.Base(path))
+	want, err := readSidecar(entry.Sidecar, filepath.Base(path))
 	if err != nil {
 		entry.Err = err
 
