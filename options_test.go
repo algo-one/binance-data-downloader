@@ -257,6 +257,41 @@ func TestReportWithoutACallbackIsSafe(t *testing.T) {
 	l.report(Progress{}) // must not panic
 }
 
+// optionFunc is the only implementation of [Option] there is, and the compiler
+// is the right place to say so. If the adapter's method ever stops matching the
+// interface — a renamed method, a changed signature — this line fails to
+// compile rather than every With* function failing one by one.
+var _ Option = optionFunc(nil)
+
+// TestOptionsApplyInTheOrderWritten pins the rule that makes a list of options
+// composable: they are applied left to right, so a later one overrides an
+// earlier one and a caller can append to a shared base slice.
+//
+// Worth a test of its own rather than trusting the loop, because the ordering
+// is load-bearing for [fakeBinance.loader] in loader_test.go, which builds a
+// base list and lets each test override entries in it. A constructor that
+// applied options in any other order would leave those tests silently reading
+// the base value.
+func TestOptionsApplyInTheOrderWritten(t *testing.T) {
+	t.Parallel()
+
+	l, err := NewLoader(
+		WithConcurrency(2),
+		WithConcurrency(5),
+		withOfflineHosts(),
+	)
+	if err != nil {
+		t.Fatalf("NewLoader: %v", err)
+	}
+
+	// The semaphore is a buffered channel sized to the concurrency limit, so
+	// its capacity is the setting as the loader actually holds it rather than
+	// as the config recorded it.
+	if got := cap(l.sem); got != 5 {
+		t.Errorf("concurrency %d, want 5 — the last option written should win", got)
+	}
+}
+
 // countingTransport counts the requests that pass through it and forwards them
 // unchanged. It is how "the supplied client was actually used" becomes a
 // measurement rather than an assertion about a struct field.

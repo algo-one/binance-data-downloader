@@ -57,13 +57,60 @@ import (
 // it down. See [WithConcurrency].
 const defaultConcurrency = 8
 
-// Option configures a [Loader]. See [NewLoader].
+// Option configures a [Loader]. See [NewLoader] and the With* functions below.
 //
-// The pointer receiver is unexported, so this type can be named by callers but
-// only constructed by the With* functions in this file. That is deliberate: it
-// keeps the configuration struct private, which means fields can be added,
-// renamed or removed without it being a breaking change.
-type Option func(*loaderConfig) error
+// An Option is something you receive from a With* function and hand to
+// [NewLoader]. There is nothing else to know about it, and nothing outside this
+// package can build one — which is the whole reason it is an interface.
+//
+// # Why an interface, when an option is plainly a function
+//
+// The obvious spelling is a named function type, and that is what this was
+// until Stage 9:
+//
+//	type Option func(*loaderConfig) error
+//
+// It compiles to the same thing and callers write the same code. What it also
+// does is publish a signature naming loaderConfig — a type no other package can
+// see, let alone write down — so the generated documentation renders the
+// declaration as an instruction the reader is unable to follow. The private
+// configuration struct leaks out through the one place it was supposed to stay
+// behind.
+//
+// An interface whose only method is unexported renders instead as a named type
+// with its contents filtered out, which is honest rather than teasing. It also
+// makes the type closed by construction: apply is unexported, so no other
+// package can satisfy Option even by accident, and this package stays free to
+// add a method to it later without breaking a single caller.
+//
+// This is the same reasoning that kept the domain types out of internal/ in
+// Stage 2. An identifier the documentation names but the reader cannot reach is
+// worse than one it never mentions.
+type Option interface {
+	// apply mutates the configuration, or rejects what it was given.
+	//
+	// The pointer is why an option can be a mutation rather than a
+	// copy-and-return: every option in a call to NewLoader writes into the
+	// same struct, in the order written.
+	apply(*loaderConfig) error
+}
+
+// optionFunc adapts a plain function to [Option].
+//
+// This is the standard Go move for giving an interface a function
+// implementation — http.HandlerFunc is the same trick, and so is
+// slog.HandlerOptions' cousin in every options-carrying library — and it is why
+// each With* function below is still a one-line closure. Attaching a method to
+// a *named function type* is what satisfies the interface; the closure itself
+// carries the argument that was captured.
+//
+// It is unexported on purpose. Exporting it would hand back the ability to
+// write an arbitrary Option, and with it a pointer to loaderConfig, undoing
+// everything the interface was for.
+type optionFunc func(*loaderConfig) error
+
+// apply implements [Option] by calling the function itself.
+func (f optionFunc) apply(c *loaderConfig) error { return f(c) }
 
 // loaderConfig is the accumulated result of applying every [Option].
 //
@@ -162,7 +209,7 @@ func (c loaderConfig) validate() error {
 // file with a missing key would silently write to somewhere its author did not
 // choose.
 func WithCacheDir(dir string) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		if dir == "" {
 			return fmt.Errorf("loader: cache dir is empty "+
 				"(omit WithCacheDir entirely for the default): %w", ErrInvalidRequest)
@@ -171,7 +218,7 @@ func WithCacheDir(dir string) Option {
 		c.cacheDir = dir
 
 		return nil
-	}
+	})
 }
 
 // WithConcurrency sets how many chunks are fetched at once. The default is
@@ -184,7 +231,7 @@ func WithCacheDir(dir string) Option {
 // Turn it *down* for 1s data. Each worker holds one decoded archive, and a
 // month of 1s candles is around 810 MB — see [defaultConcurrency].
 func WithConcurrency(n int) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		if n < 1 {
 			return fmt.Errorf("loader: concurrency %d: must be at least 1: %w", n, ErrInvalidRequest)
 		}
@@ -192,7 +239,7 @@ func WithConcurrency(n int) Option {
 		c.concurrency = n
 
 		return nil
-	}
+	})
 }
 
 // WithHTTPClient supplies the [http.Client] used for every request.
@@ -211,7 +258,7 @@ func WithConcurrency(n int) Option {
 // archive on a slow link is far too large to catch a hung connection. Use the
 // context instead: it is per call and the caller owns it.
 func WithHTTPClient(client *http.Client) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		if client == nil {
 			return fmt.Errorf("loader: http client is nil "+
 				"(omit WithHTTPClient entirely for the default): %w", ErrInvalidRequest)
@@ -220,7 +267,7 @@ func WithHTTPClient(client *http.Client) Option {
 		c.client = client
 
 		return nil
-	}
+	})
 }
 
 // WithProgress registers a function called once for each chunk of work that
@@ -235,7 +282,7 @@ func WithHTTPClient(client *http.Client) Option {
 // The cost of that promise is that fn is on the critical path: a slow callback
 // stalls the pool. Keep it to a counter, a progress bar or a channel send.
 func WithProgress(fn func(Progress)) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		if fn == nil {
 			return fmt.Errorf("loader: progress function is nil: %w", ErrInvalidRequest)
 		}
@@ -243,7 +290,7 @@ func WithProgress(fn func(Progress)) Option {
 		c.progress = fn
 
 		return nil
-	}
+	})
 }
 
 // WithLogger sets the structured logger. The default discards everything.
@@ -255,7 +302,7 @@ func WithProgress(fn func(Progress)) Option {
 // than logged, since a library that logs an error and returns it has reported
 // it twice.
 func WithLogger(l *slog.Logger) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		if l == nil {
 			return fmt.Errorf("loader: logger is nil "+
 				"(omit WithLogger entirely to discard log output): %w", ErrInvalidRequest)
@@ -264,7 +311,7 @@ func WithLogger(l *slog.Logger) Option {
 		c.logger = l
 
 		return nil
-	}
+	})
 }
 
 // The options below are unexported, and every one of them exists so that a test
@@ -293,11 +340,11 @@ func withOfflineHosts() Option {
 // withTestHosts aims the three transports at test servers. An empty string
 // leaves that host at its real default.
 func withTestHosts(listing, download, api string) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		c.listBaseURL, c.downloadBaseURL, c.apiBaseURL = listing, download, api
 
 		return nil
-	}
+	})
 }
 
 // withClock replaces the source of "now".
@@ -307,21 +354,21 @@ func withTestHosts(listing, download, api string) Option {
 // clock and are tested inside a testing/synctest bubble instead; see the note
 // on the loader's gate for why the two are not the same question.
 func withClock(now func() time.Time) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		c.now = now
 
 		return nil
-	}
+	})
 }
 
 // withPolicy replaces the retry policy, so that a test can keep production's
 // four attempts without spending production's 3.5 seconds of backoff.
 func withPolicy(p vision.Policy) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		c.policy = p
 
 		return nil
-	}
+	})
 }
 
 // withPauseBounds replaces the clamp a Retry-After is squeezed into.
@@ -330,22 +377,22 @@ func withPolicy(p vision.Policy) Option {
 // sit out several of them per run. Production values are the constants in
 // loader.go; this changes the bounds, never the rule that they are applied.
 func withPauseBounds(minPause, maxPause time.Duration) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		c.minPause, c.maxPause = minPause, maxPause
 
 		return nil
-	}
+	})
 }
 
 // withLimiter replaces the REST rate limiter. Tests that are not about pacing
 // pass an enormous one, so that an assertion about pagination does not also
 // depend on a token-bucket calculation.
 func withLimiter(lim *rate.Limiter) Option {
-	return func(c *loaderConfig) error {
+	return optionFunc(func(c *loaderConfig) error {
 		c.limiter = lim
 
 		return nil
-	}
+	})
 }
 
 // Source says where a chunk of candles came from.

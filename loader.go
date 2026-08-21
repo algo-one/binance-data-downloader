@@ -139,10 +139,17 @@ func NewLoader(opts ...Option) (*Loader, error) {
 		if opt == nil {
 			// A nil Option is almost always a conditional that returned
 			// nothing on one branch. Saying so beats a nil dereference.
+			//
+			// Option is an interface, so this compares the interface value
+			// itself — nil only when the caller passed a literal nil or an
+			// unset Option variable, which are exactly the two mistakes worth
+			// naming. An interface holding a nil optionFunc would slip past
+			// it, and cannot occur: optionFunc is unexported and every With*
+			// function returns a live closure.
 			return nil, fmt.Errorf("loader: option %d is nil: %w", i, ErrInvalidRequest)
 		}
 
-		if err := opt(&cfg); err != nil {
+		if err := opt.apply(&cfg); err != nil {
 			return nil, err
 		}
 	}
