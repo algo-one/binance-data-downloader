@@ -2,10 +2,12 @@ package binancedata
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"os"
 	"path/filepath"
 	"slices"
@@ -838,4 +840,178 @@ func syncDir(dir string) {
 
 	_ = d.Sync()
 	_ = d.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Verification on demand
+// ---------------------------------------------------------------------------
+
+// CacheEntry is one cached archive and what verifying it found.
+type CacheEntry struct {
+	// Path is the archive's absolute path on disk.
+	Path string
+
+	// Size is the archive's size in bytes, which is what makes a progress
+	// display possible: hashing is proportional to it.
+	Size int64
+
+	// Err is nil when the archive's bytes hash to the value in its .CHECKSUM
+	// sidecar. Otherwise it says why not, and the three answers call for
+	// different responses:
+	//
+	//   - wrapping [ErrChecksum]: the bytes on disk are not what Binance
+	//     published. Delete the file; the next fetch downloads it again.
+	//   - a missing sidecar: not corruption. The cache writes the archive
+	//     first and the sidecar second, so a crash between the two leaves
+	//     exactly this, and the read path already treats it as a cache miss.
+	//   - anything else: an I/O failure reading the file, which is a fact
+	//     about the disk rather than about the data.
+	Err error
+}
+
+// verify re-hashes every archive under the cache root against its .CHECKSUM
+// sidecar, yielding one [CacheEntry] per archive in directory order.
+//
+// [Loader.VerifyCache] is the exported door to it, and carries the part of this
+// comment a caller needs. What follows is why it is written the way it is.
+//
+// This is the on-demand half of correctness requirement 9. The read path
+// deliberately does not do it: verification is paid once, at download, and
+// re-hashing a 93 MB archive on every read would cost more than the CSV parse
+// the whole second tier exists to avoid. That leaves one gap — a file that was
+// correct when written and rotted afterwards — and this is how it is closed,
+// when a caller decides to spend the I/O.
+//
+// # What the two error channels mean
+//
+// The yielded error is the one that ends iteration: the cache directory could
+// not be walked, or the context was cancelled. A per-archive verdict is not
+// that, and does not stop anything — reporting every bad file is the entire
+// job, so a mismatch arrives in [CacheEntry.Err] with a nil error beside it.
+// This is the same split [Loader.Stream] uses.
+//
+// # What it does not check
+//
+// The second tier. A parquet file carries the source archive's hash and the
+// codec version in its footer, and the read path checks both on every read and
+// rebuilds when either fails — so tier 2 is verified continuously by the code
+// that uses it, and a scan here would only repeat work that already happens.
+// Tier 1 is the tier nothing re-reads, which is why it is the tier this walks.
+//
+// An empty cache yields nothing and no error. So does a cache directory that
+// was never created, since a cache with no files in it is exactly what that is.
+func (c *cache) verify(ctx context.Context) iter.Seq2[CacheEntry, error] {
+	return func(yield func(CacheEntry, error) bool) {
+		root := c.root
+
+		// WalkDir over Walk: it reads directory entries lazily and hands back
+		// a fs.DirEntry, so it does not stat every file it passes. On a cache
+		// of a hundred thousand archives that is the difference between one
+		// syscall per file and two.
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				// A directory that vanished under us, or one we cannot read.
+				// Returning it stops the walk, which is the honest outcome:
+				// a report that silently skipped a subtree would say the cache
+				// is clean when part of it was never looked at.
+				return err
+			}
+
+			if d.IsDir() || filepath.Ext(path) != archiveExt {
+				return nil
+			}
+
+			// Checked per file rather than per directory: hashing is the
+			// expensive part, and a cancelled caller should not wait out one
+			// more 93 MB archive.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			entry := verifyArchive(path, d)
+
+			if !yield(entry, nil) {
+				// The consumer broke out of the range loop. fs.SkipAll ends
+				// the walk without reporting an error, which is right: nothing
+				// failed, somebody stopped asking.
+				return fs.SkipAll
+			}
+
+			return nil
+		})
+
+		switch {
+		case err == nil, errors.Is(err, fs.ErrNotExist):
+			// A cache directory that does not exist yet holds no bad files.
+			return
+		default:
+			yield(CacheEntry{}, fmt.Errorf("cache: verifying %s: %w", root, err))
+		}
+	}
+}
+
+// verifyArchive re-hashes one archive and compares it with its sidecar.
+//
+// Every failure lands in the returned entry rather than being returned, because
+// this function's caller is a walk that must not stop for a bad file.
+func verifyArchive(path string, d fs.DirEntry) CacheEntry {
+	entry := CacheEntry{Path: path}
+
+	info, err := d.Info()
+	if err != nil {
+		entry.Err = err
+
+		return entry
+	}
+
+	entry.Size = info.Size()
+
+	// The sidecar first, and deliberately so: it is 91 bytes against up to
+	// 93 MB, so a cache entry missing its sidecar costs one open instead of a
+	// full hash to diagnose. readSidecar also checks that the sidecar names
+	// this archive, which catches a file copied out of the wrong directory.
+	want, err := readSidecar(path+vision.ChecksumSuffix, filepath.Base(path))
+	if err != nil {
+		entry.Err = err
+
+		return entry
+	}
+
+	sum, err := hashFile(path)
+	if err != nil {
+		entry.Err = err
+
+		return entry
+	}
+
+	if sum != want {
+		entry.Err = fmt.Errorf("cache: %s hashes to %s, sidecar says %s: %w",
+			filepath.Base(path), sum, want, ErrChecksum)
+	}
+
+	return entry
+}
+
+// hashFile returns the SHA-256 of a file's contents, in lowercase hex.
+//
+// io.Copy into the hash rather than os.ReadFile into memory: an archive can be
+// 93 MB, and there is no reason for any of it to be resident at once. io.Copy
+// reuses a 32 KB buffer, and sha256.New's Write is what consumes it.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	// %x on a byte slice is lowercase hex, which is the case Binance publishes
+	// its sidecars in and the case ReadChecksum normalises to.
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }

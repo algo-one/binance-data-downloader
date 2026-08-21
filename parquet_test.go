@@ -1059,3 +1059,154 @@ func TestReadKlinesRejectsOversizedRowGroups(t *testing.T) {
 		t.Fatalf("readKlines = %v, want an error wrapping errCacheStale", err)
 	}
 }
+
+// TestWriteParquetMatchesTheCacheFormat is the claim [WriteParquet]'s doc
+// comment makes, tested rather than asserted: an exported file and a cache
+// entry differ in their footer metadata and in nothing else.
+//
+// It matters because the two are written by different call paths that happen to
+// share a schema, and "happen to" is the part that rots. If someone later adds
+// a writer option to one and not the other, or reorders a column, this fails
+// while every other test in the file keeps passing.
+//
+// The rows are read back with parquet-go's own generic reader rather than with
+// readKlines, on purpose. readKlines checks the stamp first and would reject an
+// export by design, and the reader used here is the one a third party reaches
+// for — so this also stands in for "DuckDB can open it".
+func TestWriteParquetMatchesTheCacheFormat(t *testing.T) {
+	t.Parallel()
+
+	klines := hourlyFixture(t)
+
+	var export, cached bytes.Buffer
+
+	rows, err := WriteParquet(t.Context(), &export, collectSeq(klines))
+	if err != nil {
+		t.Fatalf("WriteParquet: %v", err)
+	}
+
+	if rows != len(klines) {
+		t.Errorf("WriteParquet wrote %d rows, want %d", rows, len(klines))
+	}
+
+	if _, err := writeKlines(t.Context(), &cached, collectSeq(klines), testStamp(), len(klines)); err != nil {
+		t.Fatalf("writeKlines: %v", err)
+	}
+
+	exported := readAllRows(t, export.Bytes())
+	cachedRows := readAllRows(t, cached.Bytes())
+
+	if len(exported) != len(cachedRows) {
+		t.Fatalf("export holds %d rows, cache entry holds %d", len(exported), len(cachedRows))
+	}
+
+	// parquetRow is an array-and-integer struct with no pointers in it, so ==
+	// is the correct comparison here — unlike Kline, where it is a trap.
+	for i := range exported {
+		if exported[i] != cachedRows[i] {
+			t.Fatalf("row %d differs:\n export %+v\n cached %+v", i, exported[i], cachedRows[i])
+		}
+	}
+
+	ef := openParquet(t, export.Bytes())
+	cf := openParquet(t, cached.Bytes())
+
+	if got, want := ef.Schema().String(), cf.Schema().String(); got != want {
+		t.Errorf("schemas differ:\n export %s\n cached %s", got, want)
+	}
+
+	// The documented difference, in both directions.
+	for _, key := range []string{metaSourceFile, metaSourceSHA256} {
+		if value, ok := ef.Lookup(key); ok {
+			t.Errorf("the export carries %s = %q; it has no single source archive to name", key, value)
+		}
+
+		if _, ok := cf.Lookup(key); !ok {
+			t.Errorf("the cache entry is missing %s", key)
+		}
+	}
+
+	// And the two keys an export can honestly claim.
+	if got, err := lookupInt(ef, metaCodecVersion); err != nil || got != CodecVersion {
+		t.Errorf("export %s = %d (err %v), want %d", metaCodecVersion, got, err, CodecVersion)
+	}
+
+	if got, err := lookupInt(ef, metaRows); err != nil || got != len(klines) {
+		t.Errorf("export %s = %d (err %v), want %d", metaRows, got, err, len(klines))
+	}
+}
+
+// TestWriteParquetIsReproducible is the export half of what
+// TestWriteKlinesIsReproducible pins for the cache: the same candles written
+// twice produce the same bytes, so an export can be checksummed, cached by a
+// build system, or diffed between two runs.
+func TestWriteParquetIsReproducible(t *testing.T) {
+	t.Parallel()
+
+	klines := hourlyFixture(t)
+
+	write := func() []byte {
+		var buf bytes.Buffer
+
+		if _, err := WriteParquet(t.Context(), &buf, collectSeq(klines)); err != nil {
+			t.Fatalf("WriteParquet: %v", err)
+		}
+
+		return buf.Bytes()
+	}
+
+	if first, second := write(), write(); !bytes.Equal(first, second) {
+		t.Fatalf("two exports of the same candles differ: %d and %d bytes", len(first), len(second))
+	}
+}
+
+// TestWriteParquetPropagatesDecodeErrors checks the path that matters most for
+// a CLI: the candles arrive from Loader.Stream, which reports a failure by
+// yielding an error rather than by returning one, and an export that swallowed
+// it would write a short file and report success.
+func TestWriteParquetPropagatesDecodeErrors(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("boom")
+
+	seq := func(yield func(Kline, error) bool) {
+		yield(hourlyFixture(t)[0], nil)
+		yield(Kline{}, boom)
+	}
+
+	var buf bytes.Buffer
+
+	rows, err := WriteParquet(t.Context(), &buf, seq)
+	if !errors.Is(err, boom) {
+		t.Errorf("WriteParquet error = %v, want it to wrap boom", err)
+	}
+
+	if rows != 1 {
+		t.Errorf("WriteParquet reported %d rows written before the error, want 1", rows)
+	}
+}
+
+// readAllRows reads a parquet file back through parquet-go's generic reader,
+// which is what a consumer outside this repository would use.
+func readAllRows(t *testing.T, data []byte) []parquetRow {
+	t.Helper()
+
+	rows, err := parquet.Read[parquetRow](bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("parquet.Read: %v", err)
+	}
+
+	return rows
+}
+
+// openParquet opens a file for its footer alone.
+func openParquet(t *testing.T, data []byte) *parquet.File {
+	t.Helper()
+
+	f, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("parquet.OpenFile: %v", err)
+	}
+
+	return f
+}

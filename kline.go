@@ -45,6 +45,25 @@ import (
 // value 2.6 million times over. Go's static typing means a slice cannot quietly
 // acquire rows from a different symbol the way a concatenated DataFrame can.
 //
+// # JSON field names
+//
+// Every field carries a snake_case json tag, so encoding/json emits open_time
+// rather than OpenTime. Three reasons, in order of how much they matter.
+//
+// The names are the ones Binance itself uses and the ones the Python
+// implementation this replaces wrote, so a file produced here drops into an
+// existing pipeline without a rename step. They are also stable in a way Go
+// field names are not: a field renamed for clarity would silently change the
+// wire format of every consumer, and a tag makes that a deliberate act rather
+// than a side effect. And the tags live on the type rather than on a private
+// copy inside the CLI, because a caller marshalling a Kline in their own code
+// should get the same document `bmd download --format json` writes.
+//
+// The decimals marshal as JSON *strings*, which is udecimal's own choice and
+// the right one: a quote volume can reach twenty significant digits, and a bare
+// JSON number that wide loses its tail in any consumer that parses into a
+// float64 — which is most of them, JavaScript included.
+//
 // # Field order
 //
 // Struct fields are laid out in declaration order and padded to keep each one
@@ -58,39 +77,39 @@ type Kline struct {
 	// OpenTime is the instant the interval began, and is the candle's
 	// identity: it is what deduplication, sorting and range filtering key on.
 	// Always UTC.
-	OpenTime time.Time
+	OpenTime time.Time `json:"open_time"`
 
 	// CloseTime is the last instant included in the interval, as Binance
 	// reports it. Note that it is inclusive and lands one millisecond (or,
 	// since 2025, one microsecond) before the next candle's OpenTime, rather
 	// than being equal to it.
-	CloseTime time.Time
+	CloseTime time.Time `json:"close_time"`
 
 	// Open, High, Low and Close are the first, highest, lowest and last trade
 	// prices within the interval.
-	Open  udecimal.Decimal
-	High  udecimal.Decimal
-	Low   udecimal.Decimal
-	Close udecimal.Decimal
+	Open  udecimal.Decimal `json:"open"`
+	High  udecimal.Decimal `json:"high"`
+	Low   udecimal.Decimal `json:"low"`
+	Close udecimal.Decimal `json:"close"`
 
 	// Volume is the quantity traded, denominated in the base asset — the BTC
 	// of BTCUSDT.
-	Volume udecimal.Decimal
+	Volume udecimal.Decimal `json:"volume"`
 
 	// QuoteVolume is the same trading denominated in the quote asset, the
 	// USDT of BTCUSDT. This is the field that reaches twenty significant
 	// digits and rules out float64 for the whole struct.
-	QuoteVolume udecimal.Decimal
+	QuoteVolume udecimal.Decimal `json:"quote_volume"`
 
 	// TakerBuyBaseVolume and TakerBuyQuoteVolume are the portion of Volume and
 	// QuoteVolume where the buyer was the taker — the aggressor crossing the
 	// spread. The sell-side portion is the remainder, so Binance does not
 	// publish it separately.
-	TakerBuyBaseVolume  udecimal.Decimal
-	TakerBuyQuoteVolume udecimal.Decimal
+	TakerBuyBaseVolume  udecimal.Decimal `json:"taker_buy_base_volume"`
+	TakerBuyQuoteVolume udecimal.Decimal `json:"taker_buy_quote_volume"`
 
 	// Trades is the number of individual trades aggregated into this candle.
-	Trades int64
+	Trades int64 `json:"trades"`
 }
 
 // Equal reports whether two candles are the same in every field.

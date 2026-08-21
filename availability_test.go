@@ -745,3 +745,228 @@ func TestFetchArchiveIndexRejectsAnIntervalWithNoArchives(t *testing.T) {
 		t.Errorf("an empty bucket must not be an error: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Loader.Available
+// ---------------------------------------------------------------------------
+
+// TestAvailableReportsWhatTheBucketListed is the library half of `bmd list`.
+//
+// The interesting case is the hole. The fixture publishes January, February and
+// April but not March, which is not invented for the test — BTCUSDT-1mo-2024-03
+// genuinely does not exist while its neighbours do, and it is the single
+// finding that rules out predicting availability from a calendar. A result that
+// merely reported "January to April" would be wrong in a way no user could see.
+func TestAvailableReportsWhatTheBucketListed(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeBinance{
+		months: []string{
+			"BTCUSDT-1mo-2024-01.zip",
+			"BTCUSDT-1mo-2024-02.zip",
+			// 2024-03 is missing, exactly as it is in the real bucket.
+			"BTCUSDT-1mo-2024-04.zip",
+		},
+	}
+	l := f.loader(t, utc(2026, 8, 20))
+
+	got, err := l.Available(t.Context(), AvailabilityQuery{
+		Symbol: "BTC/USDT", Interval: Interval1mo, Market: MarketSpot,
+	})
+	if err != nil {
+		t.Fatalf("Available: %v", err)
+	}
+
+	if got.Symbol != "BTCUSDT" {
+		t.Errorf("Symbol = %q, want the normalised BTCUSDT", got.Symbol)
+	}
+
+	want := []time.Time{utc(2024, 1, 1), utc(2024, 2, 1), utc(2024, 4, 1)}
+	if !slices.EqualFunc(got.Monthly, want, time.Time.Equal) {
+		t.Errorf("Monthly = %v, want %v", got.Monthly, want)
+	}
+
+	// 1mo has no daily archives at all, so no listing was made for them and
+	// the field is nil rather than empty.
+	if got.Daily != nil {
+		t.Errorf("Daily = %v, want nil for a monthly-only interval", got.Daily)
+	}
+
+	if gaps := got.MonthlyGaps(); !slices.EqualFunc(gaps, []time.Time{utc(2024, 3, 1)}, time.Time.Equal) {
+		t.Errorf("MonthlyGaps() = %v, want [2024-03-01]", gaps)
+	}
+
+	// The frontier sits one period past the last archive, not past the hole.
+	if want := utc(2024, 5, 1); !got.ArchivesThrough.Equal(want) {
+		t.Errorf("ArchivesThrough = %s, want %s", got.ArchivesThrough, want)
+	}
+
+	// One granularity, one listing. 1mo publishes no dailies, and asking for
+	// them anyway would be a round trip spent to be told nothing.
+	if calls := f.listCalls.Load(); calls != 1 {
+		t.Errorf("made %d listing requests, want 1", calls)
+	}
+
+	if calls := f.archiveCalls.Load(); calls != 0 {
+		t.Errorf("made %d archive requests, want 0 — Available downloads nothing", calls)
+	}
+}
+
+// TestAvailableOnASymbolThatNeverTradedIsNotAnError pins the distinction the
+// whole listing layer is arranged around: an empty answer and a failed lookup
+// must not arrive looking the same. S3 answers an unknown prefix with HTTP 200
+// and an empty result, so "this pair does not exist" is a fact, reported with a
+// nil error and nothing in it.
+func TestAvailableOnASymbolThatNeverTradedIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeBinance{} // the bucket holds nothing
+	l := f.loader(t, utc(2026, 8, 20))
+
+	got, err := l.Available(t.Context(), AvailabilityQuery{
+		Symbol: "NOPEUSDT", Interval: Interval1h, Market: MarketSpot,
+	})
+	if err != nil {
+		t.Fatalf("Available: %v", err)
+	}
+
+	if len(got.Monthly) != 0 || len(got.Daily) != 0 {
+		t.Errorf("got %d monthly and %d daily archives, want none", len(got.Monthly), len(got.Daily))
+	}
+
+	if !got.ArchivesThrough.IsZero() {
+		t.Errorf("ArchivesThrough = %s, want the zero time", got.ArchivesThrough)
+	}
+
+	// Both granularities were asked, because 1h publishes both.
+	if calls := f.listCalls.Load(); calls != 2 {
+		t.Errorf("made %d listing requests, want 2", calls)
+	}
+}
+
+// TestAvailableSinceBoundsTheListing checks that Since is a seek and not a
+// filter. The fake honours the marker, so a Since that reached the bucket
+// removes archives from the answer; one that was applied afterwards would
+// produce the same slice, which is why the request count is asserted too.
+func TestAvailableSinceBoundsTheListing(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeBinance{months: archiveNames("BTCUSDT", Interval1h, aggMonthly, utc(2024, 1, 1), 6)}
+	l := f.loader(t, utc(2026, 8, 20))
+
+	got, err := l.Available(t.Context(), AvailabilityQuery{
+		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
+		Since: utc(2024, 4, 1),
+	})
+	if err != nil {
+		t.Fatalf("Available: %v", err)
+	}
+
+	want := []time.Time{utc(2024, 4, 1), utc(2024, 5, 1), utc(2024, 6, 1)}
+	if !slices.EqualFunc(got.Monthly, want, time.Time.Equal) {
+		t.Errorf("Monthly = %v, want %v", got.Monthly, want)
+	}
+
+	// The month named by Since is included. The S3 marker is exclusive, so the
+	// index trims the key back to its date prefix before using it; getting
+	// that wrong drops exactly the period the caller asked to start at.
+	if len(got.Monthly) == 0 || !got.Monthly[0].Equal(utc(2024, 4, 1)) {
+		t.Error("Since excluded the month it names")
+	}
+}
+
+// TestAvailableRejectsBadQueries keeps the validation where it can be reached
+// without a network: every case here fails before a request is made.
+func TestAvailableRejectsBadQueries(t *testing.T) {
+	t.Parallel()
+
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query AvailabilityQuery
+	}{
+		{
+			name:  "an empty symbol",
+			query: AvailabilityQuery{Interval: Interval1h, Market: MarketSpot},
+		},
+		{
+			name:  "a malformed symbol",
+			query: AvailabilityQuery{Symbol: "BTC USDT", Interval: Interval1h, Market: MarketSpot},
+		},
+		{
+			name:  "an unset interval",
+			query: AvailabilityQuery{Symbol: "BTCUSDT", Market: MarketSpot},
+		},
+		{
+			name:  "an unset market",
+			query: AvailabilityQuery{Symbol: "BTCUSDT", Interval: Interval1h},
+		},
+		{
+			name: "a non-UTC since",
+			query: AvailabilityQuery{
+				Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
+				Since: time.Date(2024, 1, 1, 0, 0, 0, 0, newYork),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := &fakeBinance{}
+			l := f.loader(t, utc(2026, 8, 20))
+
+			if _, err := l.Available(t.Context(), tt.query); !errors.Is(err, ErrInvalidRequest) {
+				t.Errorf("error = %v, want it to wrap ErrInvalidRequest", err)
+			}
+
+			if calls := f.listCalls.Load(); calls != 0 {
+				t.Errorf("made %d listing requests, want 0 — validation runs before any I/O", calls)
+			}
+		})
+	}
+}
+
+// TestGaps covers the walk directly, including the two shapes that have no
+// interior to inspect.
+func TestGaps(t *testing.T) {
+	t.Parallel()
+
+	day := func(d int) time.Time { return utc(2024, 1, d) }
+	next := func(t time.Time) time.Time { return t.AddDate(0, 0, 1) }
+
+	tests := []struct {
+		name      string
+		published []time.Time
+		want      []time.Time
+	}{
+		{name: "nothing published", published: nil},
+		{name: "one archive has no interior", published: []time.Time{day(1)}},
+		{name: "two adjacent archives", published: []time.Time{day(1), day(2)}},
+		{
+			name:      "one hole",
+			published: []time.Time{day(1), day(3)},
+			want:      []time.Time{day(2)},
+		},
+		{
+			name:      "several holes, and a run of them",
+			published: []time.Time{day(1), day(4), day(5), day(8)},
+			want:      []time.Time{day(2), day(3), day(6), day(7)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := gaps(tt.published, next); !slices.EqualFunc(got, tt.want, time.Time.Equal) {
+				t.Errorf("gaps() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

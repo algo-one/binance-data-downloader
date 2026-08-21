@@ -227,50 +227,14 @@ func writeKlines(
 	w := parquet.NewGenericWriter[parquetRow](dst, parquetWriterOptions()...)
 
 	out := make([]Kline, 0, sizeHint)
-	batch := make([]parquetRow, 0, parquetBatchRows)
 
-	for k, err := range seq {
-		if err != nil {
-			// The decoder's errors already wrap ErrCorruptArchive and name the
-			// row; passing one through unchanged keeps that intact. Note that
-			// nothing is flushed or renamed on this path, so a corrupt archive
-			// leaves no cache entry behind.
-			return nil, err
-		}
-
-		row, err := k.toParquetRow()
-		if err != nil {
-			return nil, fmt.Errorf("parquet: writing %q: %w", stamp.SourceFile, err)
-		}
-
-		out = append(out, k)
-		batch = append(batch, row)
-
-		if len(batch) == cap(batch) {
-			if _, err := w.Write(batch); err != nil {
-				return nil, fmt.Errorf("parquet: writing %q: %w", stamp.SourceFile, err)
-			}
-
-			// Reslicing to zero length keeps the backing array, so the loop
-			// allocates exactly one batch for the whole file.
-			batch = batch[:0]
-		}
-	}
-
-	if len(batch) > 0 {
-		if _, err := w.Write(batch); err != nil {
-			return nil, fmt.Errorf("parquet: writing %q: %w", stamp.SourceFile, err)
-		}
-	}
-
-	// Cancellation is checked once, after the rows and before the footer.
-	// Checking it inside the loop would be pointless: the loop's own source is
-	// [decodeArchive], which already stops on a cancelled context, so by the
-	// time control reaches here a cancelled caller has already stopped
-	// decoding. What this catches is the case where the last row arrived just
-	// as the caller gave up, and it costs one atomic load per file.
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if _, err := writeRows(ctx, w, seq, &out); err != nil {
+		// writeRows returns its errors unwrapped so that each caller can name
+		// its own destination. A decoder error arrives here already wrapping
+		// ErrCorruptArchive and naming the row, and %w keeps that intact.
+		// Note that nothing is flushed or renamed on this path, so a corrupt
+		// archive leaves no cache entry behind.
+		return nil, fmt.Errorf("parquet: writing %q: %w", stamp.SourceFile, err)
 	}
 
 	// The stamp is written after the rows because one of its four values is not
@@ -290,6 +254,133 @@ func writeKlines(
 	}
 
 	return out, nil
+}
+
+// writeRows streams seq into w in batches and returns how many rows it wrote.
+//
+// If collect is non-nil, every candle is appended to it as well. That is what
+// the cache wants — it is filling a cache entry for a caller who asked for
+// these candles, so decoding the archive once and keeping the result costs
+// nothing — and it is exactly what an export does *not* want, since holding
+// five years of candles to write them to a file the caller is not going to read
+// back is 820 MB spent for no reason. One parameter, two behaviours, one loop.
+//
+// Errors come back unwrapped. The two callers write to different kinds of
+// destination — a cache entry named after an archive, and whatever io.Writer a
+// user handed [WriteParquet] — so each wraps with the name it can supply, and a
+// message never says "writing" twice.
+func writeRows(
+	ctx context.Context,
+	w *parquet.GenericWriter[parquetRow],
+	seq iter.Seq2[Kline, error],
+	collect *[]Kline,
+) (int, error) {
+	batch := make([]parquetRow, 0, parquetBatchRows)
+	rows := 0
+
+	for k, err := range seq {
+		if err != nil {
+			return rows, err
+		}
+
+		row, err := k.toParquetRow()
+		if err != nil {
+			return rows, err
+		}
+
+		if collect != nil {
+			*collect = append(*collect, k)
+		}
+
+		batch = append(batch, row)
+		rows++
+
+		if len(batch) == cap(batch) {
+			if _, err := w.Write(batch); err != nil {
+				return rows, err
+			}
+
+			// Reslicing to zero length keeps the backing array, so the loop
+			// allocates exactly one batch for the whole file.
+			batch = batch[:0]
+		}
+	}
+
+	if len(batch) > 0 {
+		if _, err := w.Write(batch); err != nil {
+			return rows, err
+		}
+	}
+
+	// Cancellation is checked once, after the rows and before the footer.
+	// Checking it inside the loop would be pointless: the loop's own source is
+	// [decodeArchive], which already stops on a cancelled context, so by the
+	// time control reaches here a cancelled caller has already stopped
+	// decoding. What this catches is the case where the last row arrived just
+	// as the caller gave up, and it costs one atomic load per file.
+	if err := ctx.Err(); err != nil {
+		return rows, err
+	}
+
+	return rows, nil
+}
+
+// WriteParquet writes candles to w as a parquet file, and returns how many it
+// wrote.
+//
+// It is the export half of the format the cache stores its second tier in: same
+// schema, same column types, same writer settings, so a file written here and a
+// file written by the cache differ only in their footer metadata. Reach for it
+// when you want candles on disk in a form a query engine can read — DuckDB,
+// Polars, pandas, Spark — without going through CSV and its float64s.
+//
+//	f, err := os.Create("btcusdt-1h-2024.parquet")
+//	// ...
+//	n, err := binancedata.WriteParquet(ctx, f, loader.Stream(ctx, req))
+//
+// # Why it takes an iterator
+//
+// Because [Loader.Stream] produces one, and the pair of them is what lets a
+// range larger than memory reach a file. A []Kline parameter would have forced
+// the whole range to exist at once, which is the thing Stream is for avoiding —
+// five years of one-minute candles is about 820 MB of Kline. A caller who
+// *does* have a slice can pass slices.All(klines) with an error-free adapter,
+// which is a cheap wrapper; the reverse is not cheap at all.
+//
+// # What it does not write
+//
+// No source stamp. The cache binds each tier-2 file to the archive it was built
+// from with a SHA-256 in the footer, because a derived file that cannot prove
+// its provenance is one the read path would have to accept on trust. An export
+// has no single archive behind it — a year's worth of candles comes from twelve
+// archives and possibly the REST API — so there is nothing honest to put there,
+// and inventing a value would make a file that reads as a cache entry without
+// being one. The codec version and the row count are written, because both are
+// true of any file this function produces.
+//
+// # Errors
+//
+// Nothing is written to w after an error, but what was already written stays
+// written: parquet puts its footer last, so an interrupted export leaves bytes
+// no reader will accept rather than a short file that looks complete. If that
+// matters, write to a temporary file and rename it once this returns nil —
+// which is what the cache does, and for exactly this reason.
+func WriteParquet(ctx context.Context, w io.Writer, seq iter.Seq2[Kline, error]) (int, error) {
+	pw := parquet.NewGenericWriter[parquetRow](w, parquetWriterOptions()...)
+
+	rows, err := writeRows(ctx, pw, seq, nil)
+	if err != nil {
+		return rows, fmt.Errorf("parquet: exporting: %w", err)
+	}
+
+	pw.SetKeyValueMetadata(metaCodecVersion, strconv.Itoa(CodecVersion))
+	pw.SetKeyValueMetadata(metaRows, strconv.Itoa(rows))
+
+	if err := pw.Close(); err != nil {
+		return rows, fmt.Errorf("parquet: exporting: %w", err)
+	}
+
+	return rows, nil
 }
 
 // parquetWriterOptions is every writer setting this package pins.

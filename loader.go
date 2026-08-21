@@ -1142,3 +1142,41 @@ func (g *gate) wait(ctx context.Context) error {
 		}
 	}
 }
+
+// VerifyCache re-hashes every archive in this Loader's cache against the
+// .CHECKSUM sidecar Binance published with it, yielding one [CacheEntry] per
+// archive:
+//
+//	for entry, err := range loader.VerifyCache(ctx) {
+//	    if err != nil {
+//	        return err // the cache directory could not be walked
+//	    }
+//	    if entry.Err != nil {
+//	        fmt.Println(entry.Path, entry.Err)
+//	    }
+//	}
+//
+// It is the on-demand half of the library's integrity guarantee. Archives are
+// verified once, when they are downloaded, and never again: re-hashing a 93 MB
+// file on every read would cost more than the CSV parse the second cache tier
+// exists to avoid. That leaves one gap — a file that was correct when written
+// and was damaged afterwards — and this is how it is closed, whenever a caller
+// decides to spend the I/O.
+//
+// # Two error channels, two meanings
+//
+// The yielded error ends the iteration: the cache directory could not be
+// walked, or ctx was cancelled. A bad *archive* is not that and does not stop
+// anything, because reporting every bad file is the whole job — it arrives in
+// [CacheEntry.Err] with a nil error beside it. This is the same split
+// [Loader.Stream] uses, and the loop above is the shape both want.
+//
+// Nothing is deleted, downloaded or repaired. What to do about a mismatch is
+// the caller's decision, and the cache heals itself either way: an archive that
+// is removed is downloaded again on the next request for it.
+//
+// A cache directory that does not exist yet yields nothing and no error, since
+// that is indistinguishable from a cache with no files in it.
+func (l *Loader) VerifyCache(ctx context.Context) iter.Seq2[CacheEntry, error] {
+	return l.cache.verify(ctx)
+}

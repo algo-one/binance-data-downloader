@@ -2,6 +2,7 @@ package binancedata
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -1092,5 +1093,271 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+// collectVerify drains the verification walk into its entries and its
+// terminating error, so each test below can state only what makes it different.
+func collectVerify(t *testing.T, c *cache) ([]CacheEntry, error) {
+	t.Helper()
+
+	var entries []CacheEntry
+
+	for entry, err := range c.verify(t.Context()) {
+		if err != nil {
+			return entries, err
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+// TestVerifyAcceptsAHealthyCache is the baseline: a cache filled by the normal
+// path verifies clean, and the walk finds the archive rather than the two files
+// sitting beside it.
+func TestVerifyAcceptsAHealthyCache(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	entries, err := collectVerify(t, c)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("verified %d entries, want 1 — the sidecar and the parquet are not archives", len(entries))
+	}
+
+	if entries[0].Path != p.archive {
+		t.Errorf("verified %q, want %q", entries[0].Path, p.archive)
+	}
+
+	if entries[0].Err != nil {
+		t.Errorf("a freshly written archive did not verify: %v", entries[0].Err)
+	}
+
+	// Size is what a progress display divides by, so a zero here would be a
+	// silently useless report rather than a wrong one.
+	if entries[0].Size <= 0 {
+		t.Errorf("Size = %d, want the archive's real size", entries[0].Size)
+	}
+}
+
+// TestVerifyDetectsRot is the reason the command exists. The bytes are damaged
+// after they were written and verified, which is the one failure the read path
+// cannot see: tier 2 answers from the parquet file and never opens the archive
+// again.
+//
+// One byte is changed rather than the file being replaced, because that is what
+// bit rot looks like and because a check that only catches wholesale
+// replacement would pass on it.
+func TestVerifyDetectsRot(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	body, err := os.ReadFile(p.archive)
+	if err != nil {
+		t.Fatalf("reading the archive: %v", err)
+	}
+
+	// Flip one bit in the middle of the file, keeping its length identical so
+	// that nothing but the hash can notice.
+	body[len(body)/2] ^= 0x01
+
+	if err := os.WriteFile(p.archive, body, cacheFilePerm); err != nil {
+		t.Fatalf("damaging the archive: %v", err)
+	}
+
+	entries, err := collectVerify(t, c)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("verified %d entries, want 1", len(entries))
+	}
+
+	if !errors.Is(entries[0].Err, ErrChecksum) {
+		t.Errorf("entry error = %v, want it to wrap ErrChecksum", entries[0].Err)
+	}
+}
+
+// TestVerifyReportsAMissingSidecarAsSomethingElse keeps two conditions apart
+// that a single "bad" flag would merge.
+//
+// The cache writes the archive first and its sidecar second, so a crash between
+// the two leaves an archive with no sidecar — a cache entry that is incomplete,
+// not corrupt, and that the read path already handles by fetching again. A
+// report that called it a checksum mismatch would send someone looking for a
+// failing disk.
+func TestVerifyReportsAMissingSidecarAsSomethingElse(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	if err := os.Remove(p.sidecar); err != nil {
+		t.Fatalf("removing the sidecar: %v", err)
+	}
+
+	entries, err := collectVerify(t, c)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("verified %d entries, want 1", len(entries))
+	}
+
+	if entries[0].Err == nil {
+		t.Fatal("an archive with no sidecar verified clean")
+	}
+
+	if errors.Is(entries[0].Err, ErrChecksum) {
+		t.Errorf("error = %v, want something other than ErrChecksum: nothing mismatched, "+
+			"the sidecar is absent", entries[0].Err)
+	}
+
+	if !errors.Is(entries[0].Err, fs.ErrNotExist) {
+		t.Errorf("error = %v, want it to wrap fs.ErrNotExist so a caller can tell what is missing",
+			entries[0].Err)
+	}
+}
+
+// TestVerifyKeepsGoingAfterABadArchive is the property that separates this from
+// the read path. A reader stops at the first failure; a report that stopped
+// would tell you about one bad file and leave you to discover the rest one run
+// at a time.
+func TestVerifyKeepsGoingAfterABadArchive(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	// A second and third archive beside the real one, in the same directory:
+	// one whose sidecar lies about its contents, one that is fine.
+	dir := filepath.Dir(p.archive)
+
+	for _, a := range []struct {
+		name string
+		body string
+		sum  string
+	}{
+		{name: "BTCUSDT-1h-2024-01-16.zip", body: "not a zip", sum: strings.Repeat("0", 64)},
+		{name: "BTCUSDT-1h-2024-01-17.zip", body: "also not a zip", sum: ""},
+	} {
+		path := filepath.Join(dir, a.name)
+
+		if err := os.WriteFile(path, []byte(a.body), cacheFilePerm); err != nil {
+			t.Fatalf("writing %s: %v", a.name, err)
+		}
+
+		sum := a.sum
+		if sum == "" {
+			sum = fmt.Sprintf("%x", sha256.Sum256([]byte(a.body)))
+		}
+
+		sidecar := fmt.Sprintf("%s  %s", sum, a.name)
+		if err := os.WriteFile(path+vision.ChecksumSuffix, []byte(sidecar), cacheFilePerm); err != nil {
+			t.Fatalf("writing the sidecar for %s: %v", a.name, err)
+		}
+	}
+
+	entries, err := collectVerify(t, c)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	if len(entries) != 3 {
+		t.Fatalf("verified %d entries, want 3 — a bad archive must not end the walk", len(entries))
+	}
+
+	bad := 0
+
+	for _, e := range entries {
+		if e.Err != nil {
+			bad++
+
+			if !errors.Is(e.Err, ErrChecksum) {
+				t.Errorf("%s: error = %v, want it to wrap ErrChecksum", filepath.Base(e.Path), e.Err)
+			}
+		}
+	}
+
+	if bad != 1 {
+		t.Errorf("found %d bad archives, want exactly 1", bad)
+	}
+}
+
+// TestVerifyOnAnEmptyCacheIsQuiet covers the two shapes of "nothing to report",
+// which must both be silence rather than an error: a cache directory that has
+// been created and holds nothing, and one that was never created at all.
+func TestVerifyOnAnEmptyCacheIsQuiet(t *testing.T) {
+	t.Parallel()
+
+	dl, _ := newFixtureServer(t, nil)
+
+	for _, tt := range []struct {
+		name string
+		root func(t *testing.T) string
+	}{
+		{
+			name: "an empty directory",
+			root: func(t *testing.T) string { return t.TempDir() },
+		},
+		{
+			name: "a directory that does not exist",
+			root: func(t *testing.T) string { return filepath.Join(t.TempDir(), "never-created") },
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, err := newCache(tt.root(t), dl)
+			if err != nil {
+				t.Fatalf("newCache: %v", err)
+			}
+
+			entries, err := collectVerify(t, c)
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+
+			if len(entries) != 0 {
+				t.Errorf("verified %d entries, want none", len(entries))
+			}
+		})
+	}
+}
+
+// TestVerifyStopsOnBreak checks that a consumer leaving the range loop early
+// ends the walk rather than being reported as a failure. fs.SkipAll is what
+// makes that distinction, and getting it wrong turns "I have seen enough" into
+// an error message.
+func TestVerifyStopsOnBreak(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, _ := warmCache(t)
+
+	seen := 0
+
+	for _, err := range c.verify(t.Context()) {
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+
+		seen++
+
+		break
+	}
+
+	if seen != 1 {
+		t.Errorf("saw %d entries before breaking, want 1", seen)
 	}
 }

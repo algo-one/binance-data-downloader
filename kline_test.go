@@ -1,6 +1,7 @@
 package binancedata
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -238,5 +239,63 @@ func TestColumnHelpersOnEmptyInput(t *testing.T) {
 	}
 	if got := OpenTimes([]Kline{}); len(got) != 0 {
 		t.Errorf("OpenTimes(empty) returned %d values, want 0", len(got))
+	}
+}
+
+// TestKlineJSON pins the wire format, because it is a contract two audiences
+// depend on and neither of them can see a struct tag.
+//
+// The field names are what `bmd download --format json` writes and what any
+// caller marshalling a Kline gets. Renaming a Go field is then free, and
+// renaming a *tag* is a breaking change nobody can make by accident — which is
+// the whole point of writing them down here.
+//
+// The assertion that matters most is the least obvious: every decimal is
+// quoted. A twenty-digit quote volume expressed as a bare JSON number survives
+// Go's own decoder and loses its tail in almost every other one, because the
+// JSON number type is a float64 in JavaScript, in Python's json, and in most
+// column stores. A quoted string cannot be silently rounded on its way in.
+func TestKlineJSON(t *testing.T) {
+	t.Parallel()
+
+	k := testKline(t)
+
+	// QuoteVolume is deliberately replaced with the widest value ever measured
+	// in real Binance data — 20 significant digits, from docs/numbers.md — so
+	// this test fails if the encoding ever starts going through a float64.
+	k.QuoteVolume = dec(t, "118661604939.99255335")
+
+	got, err := json.Marshal(k)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	const want = `{` +
+		`"open_time":"2024-01-15T12:00:00Z",` +
+		`"close_time":"2024-01-15T12:59:59.999Z",` +
+		`"open":"42150.01",` +
+		`"high":"42380",` +
+		`"low":"42090.55",` +
+		`"close":"42311.99",` +
+		`"volume":"1234.56789012",` +
+		`"quote_volume":"118661604939.99255335",` +
+		`"taker_buy_base_volume":"600.12345678",` +
+		`"taker_buy_quote_volume":"25389411.87654321",` +
+		`"trades":98765}`
+
+	if string(got) != want {
+		t.Errorf("json.Marshal(kline) =\n\t%s\nwant\n\t%s", got, want)
+	}
+
+	// And it round-trips. A format that can be written but not read back is
+	// half a format, and udecimal's UnmarshalJSON accepts both the quoted and
+	// unquoted spellings, so this also proves the quoting costs nothing.
+	var back Kline
+	if err := json.Unmarshal(got, &back); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	if !back.Equal(k) {
+		t.Errorf("round trip changed the candle:\n got %+v\nwant %+v", back, k)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -447,4 +448,220 @@ func nextAfterLatest(set map[time.Time]bool, advance func(time.Time) time.Time) 
 	}
 
 	return advance(latest)
+}
+
+// ---------------------------------------------------------------------------
+// The public view: what Binance publishes
+// ---------------------------------------------------------------------------
+
+// AvailabilityQuery names what to ask the bucket about. It is the input to
+// [Loader.Available].
+//
+// It is a struct rather than four parameters for the same reason [Request] is:
+// three of the fields are required and one is not, and a struct says which is
+// which at the call site. It is a *separate* struct from Request because Request
+// carries a Start and an End that this question has no use for, and a type whose
+// fields are silently ignored is the kind of API that teaches callers to stop
+// trusting the ones that are not.
+type AvailabilityQuery struct {
+	// Symbol is the trading pair, in any spelling [NormalizeSymbol] accepts.
+	Symbol string
+
+	// Interval is the candle period. Required; the zero value is invalid.
+	Interval Interval
+
+	// Market selects the Binance market. Required; the zero value is invalid.
+	Market Market
+
+	// Since bounds the answer, and bounds its cost. The bucket listing is
+	// seeked with a marker built from it, so asking about 2024 onwards is one
+	// round trip where asking about everything is seven for a pair that has
+	// traded since 2017. Optional; the zero value means the whole history.
+	//
+	// It is not a filter applied afterwards. Archives before it are not
+	// listed, so they are absent from the result rather than excluded from it,
+	// and [Availability.ArchivesThrough] is the only field a Since cannot
+	// affect — the frontier is at the far end.
+	Since time.Time
+}
+
+// validate checks the query and returns the normalised symbol.
+//
+// Returning the normalised value rather than writing it back into the receiver
+// is the same shape [Request.resolve] uses, and for the same reason: a value
+// normalised in two places is one that gets normalised in only one of them.
+func (q AvailabilityQuery) validate() (string, error) {
+	symbol, err := NormalizeSymbol(q.Symbol)
+	if err != nil {
+		return "", err // already wraps ErrInvalidRequest and names the symbol
+	}
+
+	if !q.Interval.IsValid() {
+		return "", fmt.Errorf("interval: %w", ErrInvalidRequest)
+	}
+
+	if !q.Market.IsValid() {
+		return "", fmt.Errorf("market: %w", ErrInvalidRequest)
+	}
+
+	if !q.Since.IsZero() {
+		if err := requireUTC("since", q.Since); err != nil {
+			return "", err
+		}
+	}
+
+	return symbol, nil
+}
+
+// Availability is what Binance publishes for one symbol and interval: which
+// archives exist, and where the archives stop and the REST API takes over.
+//
+// It answers the question a caller cannot answer from a calendar — "how far
+// back does this pair go, and is anything missing in the middle?" — and it
+// answers it by asking the bucket rather than by inferring. Binance is not
+// contractually bound to publish on any schedule, and it demonstrably has
+// holes: BTCUSDT-1mo-2024-03.zip does not exist while 2024-02 and 2024-04 both
+// do. No date arithmetic predicts that.
+type Availability struct {
+	// Symbol, Interval and Market echo the query, with the symbol normalised.
+	// They are here so that a result can be passed around, logged or printed
+	// without its question having to travel beside it.
+	Symbol   string
+	Interval Interval
+	Market   Market
+
+	// Monthly and Daily hold the start instant of every archive the bucket
+	// listed, ascending: midnight UTC on the 1st for a month, midnight UTC for
+	// a day. Both are nil for a symbol that never traded — which is a fact
+	// about Binance, not an error, and is why [Loader.Available] returns it
+	// with a nil error.
+	//
+	// Daily is always nil for the three intervals Binance publishes monthly
+	// only: 3d, 1w and 1mo.
+	Monthly []time.Time
+	Daily   []time.Time
+
+	// ArchivesThrough is the first instant no archive covers. Everything at or
+	// after it has to come from the REST API, and it is the frontier the
+	// planner uses. The zero time means there are no archives at all.
+	ArchivesThrough time.Time
+}
+
+// MonthlyGaps returns the months missing between the first and last monthly
+// archive. DailyGaps does the same for days.
+//
+// Only the interior counts. Periods after the last archive are not gaps — they
+// are the part of history that has not been published yet, which is what
+// [Availability.ArchivesThrough] is for — and there is nothing before the first
+// archive to have a hole in.
+//
+// A non-empty result is the case that breaks calendar-based implementations,
+// and it is why this library lists the bucket at all.
+func (a Availability) MonthlyGaps() []time.Time {
+	return gaps(a.Monthly, func(t time.Time) time.Time { return t.AddDate(0, 1, 0) })
+}
+
+// DailyGaps returns the days missing between the first and last daily archive.
+// See [Availability.MonthlyGaps].
+func (a Availability) DailyGaps() []time.Time {
+	return gaps(a.Daily, func(t time.Time) time.Time { return t.AddDate(0, 0, 1) })
+}
+
+// gaps walks the grid from the first published period to the last and collects
+// the ones that are absent.
+//
+// It rebuilds a set from the slice rather than taking one, because the slice is
+// what the caller has and rebuilding it is O(n) against an O(n) walk. advance
+// supplies the grid step, which is what lets months and days share the walk:
+// AddDate(0, 1, 0) on the 1st of a month is always the 1st of the next one, and
+// no duration constant can say that.
+func gaps(published []time.Time, advance func(time.Time) time.Time) []time.Time {
+	if len(published) < 2 {
+		return nil // nothing can be missing between fewer than two things
+	}
+
+	set := make(map[time.Time]bool, len(published))
+	for _, t := range published {
+		set[t] = true
+	}
+
+	first, last := published[0], published[len(published)-1]
+
+	var out []time.Time
+
+	for t := advance(first); t.Before(last); t = advance(t) {
+		if !set[t] {
+			out = append(out, t)
+		}
+	}
+
+	return out
+}
+
+// Available reports what Binance publishes for one symbol and interval.
+//
+// It is the library half of `bmd list`, and it costs one bucket listing per
+// granularity — two for most intervals, one for the three that have no daily
+// archives. Nothing is downloaded and no candle is parsed.
+//
+// An empty result with a nil error is the honest answer for a symbol that never
+// traded: the bucket answered, and it said there is nothing there. That is a
+// different outcome from an error, which means the bucket did not answer, and
+// the two must not arrive looking the same — see the note on [vision.Lister]'s
+// three outcomes in docs/architecture.md.
+//
+// The call takes a permit from the Loader's concurrency limit for the same
+// reason the plan phase does: it is I/O, and a limit that only covers downloads
+// is a limit that a hundred concurrent list calls walk straight past.
+func (l *Loader) Available(ctx context.Context, q AvailabilityQuery) (Availability, error) {
+	symbol, err := q.validate()
+	if err != nil {
+		return Availability{}, err
+	}
+
+	if err := l.sem.acquire(ctx); err != nil {
+		return Availability{}, err
+	}
+	defer l.sem.release()
+
+	index, err := fetchArchiveIndex(ctx, l.lister, q.Market, symbol, q.Interval, q.Since)
+	if err != nil {
+		return Availability{}, err
+	}
+
+	l.logger.DebugContext(ctx, "availability",
+		"symbol", symbol, "interval", q.Interval.String(),
+		"monthly", len(index.months), "daily", len(index.days),
+		"archivesThrough", index.through)
+
+	return Availability{
+		Symbol:          symbol,
+		Interval:        q.Interval,
+		Market:          q.Market,
+		Monthly:         sortedTimes(index.months),
+		Daily:           sortedTimes(index.days),
+		ArchivesThrough: index.through,
+	}, nil
+}
+
+// sortedTimes turns one of the index's sets into an ascending slice.
+//
+// Go randomises map iteration order deliberately, so the sort is not tidying up
+// after a coincidence — it is the only thing that makes two calls agree with
+// each other. A nil slice for an empty set is intentional: len and range treat
+// nil and empty identically, and nil is what a caller gets from a zero
+// Availability, so the two spellings never both need handling.
+func sortedTimes(set map[time.Time]bool) []time.Time {
+	if len(set) == 0 {
+		return nil
+	}
+
+	out := make([]time.Time, 0, len(set))
+	for t := range set {
+		out = append(out, t)
+	}
+
+	slices.SortFunc(out, func(a, b time.Time) int { return a.Compare(b) })
+
+	return out
 }

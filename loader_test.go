@@ -2382,3 +2382,70 @@ func TestLadderRecoversAnArchiveThatVanished(t *testing.T) {
 		t.Error("the fallback never reached the REST API")
 	}
 }
+
+// TestVerifyCacheSeesWhatFetchWrote joins the two halves that the cache-level
+// tests exercise separately: candles fetched through the public API, then
+// checked through the public API, with nothing in between knowing about the
+// other.
+//
+// It is worth having as well as the cache tests because it is the only place
+// that proves Loader.VerifyCache looks in the directory WithCacheDir named. A
+// walk over the wrong root reports a clean cache, which is the most reassuring
+// possible way for this feature to be broken.
+func TestVerifyCacheSeesWhatFetchWrote(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	f := &fakeBinance{days: archiveNames("BTCUSDT", Interval1h, aggDaily, utc(2024, 1, 15), 1)}
+	l := f.loader(t, utc(2026, 8, 20), WithCacheDir(dir))
+
+	if _, err := l.Fetch(t.Context(), Request{
+		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
+	}); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	verify := func() []CacheEntry {
+		t.Helper()
+
+		var out []CacheEntry
+
+		for entry, err := range l.VerifyCache(t.Context()) {
+			if err != nil {
+				t.Fatalf("VerifyCache: %v", err)
+			}
+
+			out = append(out, entry)
+		}
+
+		return out
+	}
+
+	entries := verify()
+
+	if len(entries) != 1 {
+		t.Fatalf("verified %d archives, want the 1 that Fetch downloaded", len(entries))
+	}
+
+	if entries[0].Err != nil {
+		t.Fatalf("the archive Fetch just wrote does not verify: %v", entries[0].Err)
+	}
+
+	if !strings.HasPrefix(entries[0].Path, dir) {
+		t.Errorf("verified %q, which is not under the configured cache dir %q", entries[0].Path, dir)
+	}
+
+	// Damage it and confirm the same call now says so. Truncation rather than
+	// deletion: a missing file is not a checksum failure, and this test is
+	// about the failure that hashing exists to catch.
+	if err := os.Truncate(entries[0].Path, entries[0].Size/2); err != nil {
+		t.Fatalf("truncating the archive: %v", err)
+	}
+
+	if entries = verify(); len(entries) != 1 || !errors.Is(entries[0].Err, ErrChecksum) {
+		t.Fatalf("after truncation: %d entries, first error %v; want 1 wrapping ErrChecksum",
+			len(entries), entries[0].Err)
+	}
+}
