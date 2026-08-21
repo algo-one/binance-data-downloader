@@ -211,6 +211,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "verify":
 		return verify(ctx, args, stdout, stderr)
 
+	case "cache":
+		return cacheReport(ctx, args, stdout, stderr)
+
+	case "prune":
+		return prune(ctx, args, stdout, stderr)
+
 	case "help":
 		writeUsage(stdout)
 
@@ -240,6 +246,8 @@ Usage:
 Commands:
   download    Download candles for a symbol and time range
   list        Show what Binance publishes for a symbol and interval
+  cache       Show what the cache holds and what can be reclaimed
+  prune       Delete cached archives the cache no longer reads
   verify      Re-hash cached archives against their checksums
   help        Show this help
 
@@ -253,6 +261,8 @@ Examples:
   bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
   bmd download -symbol BTC/USDT -interval 1d -start 2024-01-01 -format json -out -
   bmd list -symbol BTC/USDT -interval 1h
+  bmd cache
+  bmd prune -n
   bmd verify
 
 Dates are UTC. A bare -end date includes that whole day.

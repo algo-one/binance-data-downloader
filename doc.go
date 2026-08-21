@@ -34,12 +34,14 @@
 // to hold at once, and [Loader.FetchAll] runs several requests under one
 // concurrency budget, downloading whatever they have in common exactly once.
 //
-// Three more calls answer questions that are not "give me candles".
+// Five more calls answer questions that are not "give me candles".
 // [Loader.Available] reports what Binance actually publishes for a symbol and
 // interval, holes included — the archives have them, and no calendar predicts
 // which. [Loader.VerifyCache] re-hashes cached archives against the checksums
-// they were published with. [WriteParquet] writes candles in the same format
-// the cache stores its second tier in, for a query engine to read.
+// they were published with. [Loader.CacheUsage] measures what the cache holds,
+// and [Loader.PruneArchives] reclaims the part of it that reads no longer need.
+// [WriteParquet] writes candles in the same format the cache stores its second
+// tier in, for a query engine to read.
 //
 // # Examples
 //
@@ -79,6 +81,11 @@
 // Tier 2 records the SHA-256 of the tier-1 archive it was built from in its
 // Parquet footer, so a cached Parquet can be trusted without re-hashing the
 // ZIP. In the steady state nothing is ever rebuilt. See docs/caching.md.
+//
+// A read never opens tier 1, so tier 1 can be deleted to reclaim disk — about
+// 40% of a cache, since the Parquet is the larger of the two files. That is what
+// [Loader.PruneArchives] does, and it costs a download rather than a decode on
+// the one path that still needs an archive: rebuilding.
 //
 // # A note on numbers
 //

@@ -194,11 +194,38 @@ builds the same archive through two independent caches and compares the bytes.
 **Free corruption detection.** Parquet writes a CRC32 per data page, so a
 damaged tier-2 file is caught on read and rebuilt from tier 1.
 
-**Optional archive pruning.** Tier 1 is only needed to build or rebuild, so a
-`--prune-archives` flag could reclaim half the disk — at the cost of
-re-downloading if `CodecVersion` ever bumps. A flag, never the default. The read
-path already supports it: a hit needs the sidecar and the Parquet, never the
-archive, so a pruned cache serves every read that does not need a rebuild.
+**Optional archive pruning.** Tier 1 is only needed to build or rebuild, so it
+can be deleted to reclaim disk — at the cost of re-downloading if `CodecVersion`
+ever bumps. A command, never the default. The read path has always supported it:
+a hit needs the sidecar and the Parquet, never the archive, so a pruned cache
+serves every read that does not need a rebuild.
+
+This is built, as `Loader.PruneArchives` and `bmd prune`. Two things about it
+were settled by measurement rather than by the obvious guess.
+
+**It reclaims about 40%, not half and not most.** Measured on BTCUSDT `1m` for
+2024-01: 2,169,570 bytes of archive against 3,226,820 of Parquet and an 88-byte
+sidecar. Tier 2 is the *larger* tier — snappy against the zip's deflate, and
+fixed-width `DECIMAL(38,8)` against text — which is the 2× disk cost this
+document already quotes at the top, seen from the other side. An earlier draft of
+this line said the archive was the bulk of an entry; it is not.
+
+**What may be deleted is decided by the reader's own rule.** An archive goes only
+when the Parquet beside it would be accepted by a read: same source hash, same
+`CodecVersion`, same schema. That is not a similar rule, it is `checkParquet` —
+the same two footer gates `cache.load` opens with — so the pruner and the reader
+cannot drift into disagreeing about which files are usable. The invariant that
+buys is worth stating plainly: **every read that succeeds before a prune succeeds
+after it.**
+
+One residual is accepted rather than closed. The gates read the footer, not the
+pages, so bit rot inside a data page is caught by Parquet's per-page CRC on a
+later read and not by the prune. That entry then needs a download instead of a
+decode — the same cost class as a `CodecVersion` bump, and the alternative was
+decoding every cached file to answer a question about disk space.
+
+`bmd cache` reports what `bmd prune` would free, from the same predicate, so the
+number in the report is the number the command delivers.
 
 ## Integrity
 

@@ -4,7 +4,8 @@
 `binancedata.Request` or an option passed to `binancedata.NewLoader`, and the
 CLI holds no logic of its own beyond turning text into those values and candles
 into a file. Anything you can do here you can do from Go code, and vice versa —
-`bmd verify` is `Loader.VerifyCache`, `bmd list` is `Loader.Available`, and
+`bmd verify` is `Loader.VerifyCache`, `bmd list` is `Loader.Available`,
+`bmd cache` is `Loader.CacheUsage`, `bmd prune` is `Loader.PruneArchives`, and
 `--format parquet` is `binancedata.WriteParquet`.
 
 ## Build
@@ -158,6 +159,96 @@ user's real cache.
 `-since 2024-01-01` bounds the answer *and* its cost. The bucket listing is
 seeked to it, so asking about one year is a single round trip where asking about
 a pair's whole history can be seven.
+
+## `bmd cache`
+
+```bash
+bmd cache
+bmd cache -cache-dir ~/.cache/bmd
+```
+
+```
+/Users/ivan/Library/Caches/bmd
+
+  archives   412  852.5 MB
+  sidecars   412   35.4 KB
+   parquet   412    1.2 GB
+     total  1236    2.1 GB
+
+846.2 MB in 409 archives can be freed with 'bmd prune'
+```
+
+Reports what the cache holds, by tier. Nothing is downloaded, written or
+deleted.
+
+The last line is why the command exists, and why it costs slightly more than a
+size walk: deciding what is reclaimable means opening the Parquet beside each
+archive and reading its footer. That is one open and one seek per archive —
+against the full re-hash `bmd verify` pays — and it is what makes the report
+answer "is pruning worth it?" rather than merely reciting sizes.
+
+**Tier 2 is the bigger tier.** That surprises most people, including an earlier
+draft of this documentation. A Parquet file is larger than the archive it was
+built from — snappy where the zip uses deflate, fixed-width `DECIMAL(38,8)`
+where the CSV uses text — because it is the tier that gets read. Measured on
+BTCUSDT `1m` for 2024-01: 2.2 MB of archive, 3.2 MB of Parquet. So pruning
+reclaims about 40% of a cache, not most of it.
+
+An `other` row appears only when there is something in it. It counts files that
+are none of the three, which in a healthy cache is nothing at all — the one
+ordinary cause is a process killed mid-write, since every cache write goes to a
+temporary file in its destination directory and nothing ever collects the
+leftovers.
+
+## `bmd prune`
+
+```bash
+bmd prune                         # delete archives the cache no longer reads
+bmd prune -n                      # say what would go, delete nothing
+bmd prune -cache-dir ~/.cache/bmd
+bmd prune -quiet                  # exceptions only, no summary
+```
+
+Deletes cached archives that the Parquet tier no longer needs, and **only the
+archive** — the `.CHECKSUM` sidecar and the Parquet both stay. That is not
+tidiness: the Parquet is what reads are served from, and the hash in the sidecar
+is what the Parquet is validated against, so deleting either would strand the
+entry as surely as deleting both.
+
+The guarantee is worth stating plainly: **every read that succeeds before a
+prune succeeds after it.** A cache hit reads the sidecar and the Parquet footer
+and opens the archive neither to decode nor to re-hash it, and an archive is
+deleted only when that read would succeed — checked with the same code the read
+path uses, so the two cannot drift apart.
+
+`-n` reaches every verdict and deletes nothing. Run it first, or run `bmd cache`,
+which reports the same number from the same rule.
+
+### What it costs
+
+A download later, in the one case tier 1 is still needed: rebuilding. That
+happens when `CodecVersion` changes — the parser moved, so every cached Parquet
+has to be built again — or when a Parquet file fails one of its per-page
+checksums. Either would have been a local decode with the archive on disk and
+becomes a fetch without it.
+
+This is why pruning is a command and never something the cache does on its own.
+Spending somebody's bandwidth is not a decision a cache should take by itself.
+
+### What it prints
+
+The removals are the expected outcome and there can be thousands of them, so
+they are counted in the summary rather than listed. stdout carries the
+exceptions, one per line, the same split `bmd verify` uses:
+
+| Line on stdout | Meaning |
+| --- | --- |
+| `kept NAME: reason` | The Parquet cannot serve this range on its own, so the archive is the only copy there is. Usually a Parquet that was never built, or one built by an older `CodecVersion` |
+| `PATH: error` | The archive was prunable and deleting it failed |
+
+A kept archive is a verdict and exits 0. A failed delete is a failure and exits
+1, because a script that prunes to make room needs to know the room is not
+there.
 
 ## `bmd verify`
 

@@ -938,28 +938,14 @@ func (c *cache) verify(ctx context.Context) iter.Seq2[CacheEntry, error] {
 	return func(yield func(CacheEntry, error) bool) {
 		root := c.root
 
-		// WalkDir over Walk: it reads directory entries lazily and hands back
-		// a fs.DirEntry, so it does not stat every file it passes. On a cache
-		// of a hundred thousand archives that is the difference between one
-		// syscall per file and two.
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				// A directory that vanished under us, or one we cannot read.
-				// Returning it stops the walk, which is the honest outcome:
-				// a report that silently skipped a subtree would say the cache
-				// is clean when part of it was never looked at.
-				return err
-			}
-
-			if d.IsDir() || filepath.Ext(path) != archiveExt {
+		// The walk itself — including the per-file cancellation check, which
+		// matters most here of the three callers: hashing is the expensive
+		// part, and a cancelled caller should not wait out one more 93 MB
+		// archive — lives in walkCacheFiles. See it for why a missing cache
+		// root is not an error.
+		err := walkCacheFiles(ctx, root, func(path string, d fs.DirEntry) error {
+			if filepath.Ext(path) != archiveExt {
 				return nil
-			}
-
-			// Checked per file rather than per directory: hashing is the
-			// expensive part, and a cancelled caller should not wait out one
-			// more 93 MB archive.
-			if err := ctx.Err(); err != nil {
-				return err
 			}
 
 			entry := verifyArchive(path, d)
@@ -973,12 +959,7 @@ func (c *cache) verify(ctx context.Context) iter.Seq2[CacheEntry, error] {
 
 			return nil
 		})
-
-		switch {
-		case err == nil, errors.Is(err, fs.ErrNotExist):
-			// A cache directory that does not exist yet holds no bad files.
-			return
-		default:
+		if err != nil {
 			yield(CacheEntry{}, fmt.Errorf("cache: verifying %s: %w", root, err))
 		}
 	}
@@ -1051,4 +1032,343 @@ func hashFile(path string) (string, error) {
 	// %x on a byte slice is lowercase hex, which is the case Binance publishes
 	// its sidecars in and the case ReadChecksum normalises to.
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// ---------------------------------------------------------------------------
+// Disk accounting and pruning
+// ---------------------------------------------------------------------------
+
+// CacheUsage is what a cache directory holds, counted in files and bytes.
+//
+// The four size categories are disjoint and cover every file under the root, so
+// they sum to [CacheUsage.Total]. Prunable is not one of them: it is a subset of
+// Archives, counted again because it is the number a caller deciding whether to
+// prune actually wants.
+type CacheUsage struct {
+	// Root is the directory these numbers describe, absolute.
+	Root string
+
+	// Archives and ArchiveCount are tier 1 — the .zip files exactly as Binance
+	// served them.
+	//
+	// This is the smaller of the two tiers, which is worth knowing before
+	// deciding what pruning is worth. Measured on BTCUSDT 1m for 2024-01: the
+	// archive is 2,169,570 bytes and the parquet built from it is 3,226,820, so
+	// tier 1 is about 40% of the entry. Tier 2 is larger on purpose — snappy
+	// where the zip uses deflate, and fixed-width DECIMAL(38,8) where the CSV
+	// uses text — because it is the tier that is read, and docs/caching.md
+	// costs the whole trade at roughly 2× the archive alone.
+	Archives     int64
+	ArchiveCount int
+
+	// Sidecars and SidecarCount are the .CHECKSUM files. Ninety-one bytes each,
+	// so they will never matter to a disk-space decision, and they are counted
+	// separately anyway because of what they mean: the hash in a sidecar is what
+	// the parquet beside it is validated against, so a sidecar is the one part
+	// of tier 1 that pruning must leave behind. Deleting them would strand
+	// tier 2 exactly as deleting tier 2 would.
+	Sidecars     int64
+	SidecarCount int
+
+	// Parquet and ParquetCount are tier 2 — the derived files that reads
+	// actually hit.
+	Parquet      int64
+	ParquetCount int
+
+	// Other and OtherCount are every file under the root that is none of the
+	// three. Both are zero in a healthy cache, and they are reported rather
+	// than quietly folded into a total because a non-zero value has exactly one
+	// ordinary cause worth knowing about: every cache write goes to a temporary
+	// file in its destination directory, so a process killed mid-write leaves
+	// one behind and nothing ever collects it.
+	Other      int64
+	OtherCount int
+
+	// Prunable and PrunableCount are the archives a prune would delete — those
+	// whose parquet can already serve reads without them. See
+	// [Loader.PruneArchives] for what that means and what it costs.
+	//
+	// This is a subset of Archives and is deliberately not subtracted from it.
+	Prunable      int64
+	PrunableCount int
+}
+
+// Total is every byte under the cache root.
+//
+// It sums the sizes of the files themselves, so expect it to read slightly
+// under du(1), which counts whole filesystem blocks and the directories too.
+func (u CacheUsage) Total() int64 {
+	return u.Archives + u.Sidecars + u.Parquet + u.Other
+}
+
+// PruneOptions controls one prune.
+//
+// It is a struct rather than a bare parameter for the reason [AvailabilityQuery]
+// is: a call reading PruneOptions{DryRun: true} says at the call site what
+// prune(ctx, true) would leave the reader to look up — and this is a call whose
+// second argument decides whether files are deleted.
+type PruneOptions struct {
+	// DryRun decides everything and deletes nothing. Every [PruneResult] comes
+	// back with the verdict it would have acted on, and Removed false
+	// throughout.
+	DryRun bool
+}
+
+// PruneResult is one archive a prune considered, and what it decided.
+//
+// The three outcomes are distinguishable without comparing anything to a
+// sentinel: Kept non-nil means the archive is still needed, Removed true means
+// it is gone, and Err non-nil means it should have gone and would not.
+type PruneResult struct {
+	// Path is the archive's absolute path.
+	Path string
+
+	// Size is its size in bytes — what pruning it reclaims, and what it still
+	// occupies if it was kept.
+	Size int64
+
+	// Kept says why this archive was not pruned, and is nil when it was
+	// prunable.
+	//
+	// A non-nil value is not a failure. The ordinary cause is an archive whose
+	// parquet has not been built yet, or was built by an older [CodecVersion]:
+	// in both cases tier 1 is the only copy of that data there is, and deleting
+	// it would turn a rebuild into a download.
+	Kept error
+
+	// Removed reports whether this call deleted the file. It is false whenever
+	// Kept is non-nil, and false in a dry run even for an archive that was
+	// prunable — which is why a caller totalling "what would this free" must
+	// count Kept == nil rather than Removed.
+	Removed bool
+
+	// Err is set when the archive was prunable and deleting it failed. The
+	// archive is still there; nothing else about the cache changed.
+	Err error
+}
+
+// usage walks the cache root and adds up what is in it.
+//
+// [Loader.CacheUsage] is the exported door. The one thing worth knowing about
+// the cost is that this is not a pure size walk: deciding Prunable opens the
+// parquet beside every archive to read its footer. That is one open and one seek
+// per archive against the full hash `bmd verify` pays, and it is what makes the
+// report answer the question it is run to answer rather than merely reciting
+// sizes.
+func (c *cache) usage(ctx context.Context) (CacheUsage, error) {
+	usage := CacheUsage{Root: c.root}
+
+	err := walkCacheFiles(ctx, c.root, func(path string, d fs.DirEntry) error {
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		size := info.Size()
+
+		// The sidecar case is tested first because it is the one that would be
+		// caught by the wrong arm otherwise. A sidecar is named by appending to
+		// the whole archive name — BTCUSDT-1h-2024-01.zip.CHECKSUM — so its
+		// filepath.Ext is ".CHECKSUM" and not ".zip", but that is Binance's
+		// naming rule rather than ours and it is not this switch's business to
+		// depend on it holding.
+		switch {
+		case strings.HasSuffix(path, vision.ChecksumSuffix):
+			usage.Sidecars += size
+			usage.SidecarCount++
+
+		case filepath.Ext(path) == archiveExt:
+			usage.Archives += size
+			usage.ArchiveCount++
+
+			if archivePrunable(path) == nil {
+				usage.Prunable += size
+				usage.PrunableCount++
+			}
+
+		case filepath.Ext(path) == parquetExt:
+			usage.Parquet += size
+			usage.ParquetCount++
+
+		default:
+			usage.Other += size
+			usage.OtherCount++
+		}
+
+		return nil
+	})
+	if err != nil {
+		return CacheUsage{}, fmt.Errorf("cache: measuring %s: %w", c.root, err)
+	}
+
+	return usage, nil
+}
+
+// prune deletes tier-1 archives that tier 2 no longer needs, yielding one
+// [PruneResult] per archive considered.
+//
+// [Loader.PruneArchives] is the exported door and carries the part of this a
+// caller needs. What follows is why it is safe.
+//
+// # The rule
+//
+// An archive may go when the parquet beside it would be accepted by the read
+// path: same source hash, same [CodecVersion], same schema. That is not a
+// similar rule to the reader's, it is [checkParquet] — the same two gates
+// cache.load opens with — so the two cannot drift into disagreeing about which
+// files are usable.
+//
+// What that buys is stated as an invariant rather than a hope: **every read
+// that succeeds before a prune succeeds after it.** Step 1 of cache.load reads
+// the sidecar and the parquet and touches neither the archive nor the network,
+// and this deletes nothing that step 1 was not already answering from.
+//
+// # What it costs
+//
+// A future one. Tier 1 is what a rebuild is built from, so a pruned cache pays
+// a download wherever it would otherwise have paid a decode — when
+// [CodecVersion] moves, or when a parquet fails a page checksum. That is the
+// trade docs/caching.md describes, and it is why this is a command rather than
+// something the cache does on its own.
+//
+// # Two error channels, as everywhere else here
+//
+// The yielded error ends the iteration: the root could not be walked, or ctx was
+// cancelled. An archive that was kept is not that and stops nothing — it arrives
+// in [PruneResult.Kept] with a nil error beside it, because reporting on every
+// archive is the whole job.
+func (c *cache) prune(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error] {
+	return func(yield func(PruneResult, error) bool) {
+		err := walkCacheFiles(ctx, c.root, func(path string, d fs.DirEntry) error {
+			if filepath.Ext(path) != archiveExt || strings.HasSuffix(path, vision.ChecksumSuffix) {
+				return nil
+			}
+
+			result := PruneResult{Path: path}
+
+			// Size is read before the verdict so that a kept archive still
+			// reports what it is occupying. A caller explaining why a prune
+			// freed nothing needs that number as much as the freed one.
+			info, err := d.Info()
+			if err != nil {
+				result.Kept = err
+			} else {
+				result.Size = info.Size()
+				result.Kept = archivePrunable(path)
+			}
+
+			if result.Kept == nil && !opts.DryRun {
+				// Only the archive. The sidecar stays because tier 2 is
+				// validated against the hash in it, and the parquet stays
+				// because it is the whole point — see cachePaths for the three
+				// files and CacheUsage.Sidecars for what deleting the wrong one
+				// would cost.
+				if err := os.Remove(path); err != nil {
+					result.Err = err
+				} else {
+					result.Removed = true
+				}
+			}
+
+			if !yield(result, nil) {
+				return fs.SkipAll
+			}
+
+			return nil
+		})
+		if err != nil {
+			yield(PruneResult{}, fmt.Errorf("cache: pruning %s: %w", c.root, err))
+		}
+	}
+}
+
+// archivePrunable reports whether the archive at this path may be deleted,
+// returning nil when it may and the reason it may not otherwise.
+//
+// The two files it consults are derived from the archive's own path rather than
+// from an [archiveRef], because a walk of the cache tree has a path and would
+// have to parse a symbol, an interval and a period back out of it to build one.
+// Deriving downward is the direction that cannot be wrong: cachePaths built
+// these three names from one stem, and this rebuilds the same two from the same
+// stem.
+func archivePrunable(archive string) error {
+	name := filepath.Base(archive)
+
+	// The sidecar first, and not only because it is smaller. Its hash is half
+	// of what the parquet is checked against, so there is no verdict to reach
+	// without it — an archive whose sidecar is missing or unreadable is one
+	// whose tier 2 cannot be validated at all, and therefore one to keep.
+	sum, err := readSidecar(archive+vision.ChecksumSuffix, name)
+	if err != nil {
+		return err
+	}
+
+	return checkParquetFile(
+		strings.TrimSuffix(archive, archiveExt)+parquetExt,
+		parquetStamp{SourceFile: name, SourceSHA256: sum},
+	)
+}
+
+// checkParquetFile is [checkParquet] against a path, and the footer-only sibling
+// of [readParquetFile]: same open, same stat, same reason for needing the size,
+// and it stops before the first row.
+func checkParquetFile(path string, want parquetStamp) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("cache: %s: %w", filepath.Base(path), err)
+	}
+
+	return checkParquet(f, info.Size(), want)
+}
+
+// walkCacheFiles calls fn for every regular file under root, in directory order.
+//
+// It exists because three commands now walk this tree and the interesting part
+// of each is what it does with a file, not the three pieces of boilerplate that
+// get it there: WalkDir reports its own errors through the callback, a cache
+// root that has never been created is an empty cache rather than a fault, and a
+// cancelled caller should not wait out the rest of the tree.
+//
+// WalkDir over Walk, as everywhere here: it hands back an fs.DirEntry and does
+// not stat what it passes, so a caller that only wants archives pays one syscall
+// per file instead of two.
+//
+// A callback returning fs.SkipAll ends the walk without an error, which is how
+// an iterator built on this reports a consumer that stopped asking.
+func walkCacheFiles(ctx context.Context, root string, fn func(path string, d fs.DirEntry) error) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A directory that vanished under us, or one we cannot read.
+			// Returning it stops the walk, which is the honest outcome: a
+			// report that silently skipped a subtree would describe the cache
+			// as smaller, or cleaner, than it was ever able to see.
+			return err
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		return fn(path, d)
+	})
+
+	// A cache directory that does not exist holds no files, which is exactly
+	// what a cache nothing has been written to yet is. Every other failure is
+	// real and belongs to the caller.
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	return nil
 }

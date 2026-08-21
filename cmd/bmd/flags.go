@@ -106,7 +106,13 @@ func parseInstant(field, value string) (t time.Time, dateOnly bool, err error) {
 //
 //	download   -cache-dir  -concurrency  -quiet  -verbose
 //	verify     -cache-dir                -quiet  -verbose
+//	prune      -cache-dir                -quiet  -verbose
+//	cache      -cache-dir                        -verbose
 //	list                                         -verbose
+//
+// `cache` has no -quiet because it has nothing to suppress: its report is its
+// output and goes to stdout, where -quiet would leave a command that printed
+// nothing at all.
 type commonFlags struct {
 	cacheDir    string
 	concurrency int
@@ -233,6 +239,8 @@ type loader interface {
 	Stream(ctx context.Context, req binancedata.Request) iter.Seq2[binancedata.Kline, error]
 	Available(ctx context.Context, q binancedata.AvailabilityQuery) (binancedata.Availability, error)
 	VerifyCache(ctx context.Context) iter.Seq2[binancedata.CacheEntry, error]
+	CacheUsage(ctx context.Context) (binancedata.CacheUsage, error)
+	PruneArchives(ctx context.Context, opts binancedata.PruneOptions) iter.Seq2[binancedata.PruneResult, error]
 }
 
 // parseSymbolInterval is the pair of flags every command that names data takes.

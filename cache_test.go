@@ -1427,3 +1427,435 @@ func TestVerifyStopsOnBreak(t *testing.T) {
 		t.Errorf("saw %d entries before breaking, want 1", seen)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Disk accounting and pruning
+// ---------------------------------------------------------------------------
+
+// collectPrune drains a prune into a slice, the way collectVerify does for the
+// verification walk.
+func collectPrune(t *testing.T, c *cache, opts PruneOptions) ([]PruneResult, error) {
+	t.Helper()
+
+	var results []PruneResult
+
+	for result, err := range c.prune(t.Context(), opts) {
+		if err != nil {
+			return results, err
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+// fileSize is the size of one file, or a fatal test failure.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", filepath.Base(path), err)
+	}
+
+	return info.Size()
+}
+
+// TestCacheUsageCountsEveryTier is the baseline: a cache filled by the normal
+// path is three files, and the report puts each in its own category.
+//
+// The sizes are compared against the files themselves rather than against
+// constants. A hardcoded byte count would have to be updated whenever a fixture
+// or a parquet writer option changed, and would then be asserting that somebody
+// remembered to update it rather than that the walk added the right things up.
+func TestCacheUsageCountsEveryTier(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	usage, err := c.usage(t.Context())
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		gotCount  int
+		gotBytes  int64
+		wantBytes int64
+	}{
+		{"archives", usage.ArchiveCount, usage.Archives, fileSize(t, p.archive)},
+		{"sidecars", usage.SidecarCount, usage.Sidecars, fileSize(t, p.sidecar)},
+		{"parquet", usage.ParquetCount, usage.Parquet, fileSize(t, p.parquet)},
+	}
+
+	for _, tt := range tests {
+		if tt.gotCount != 1 {
+			t.Errorf("%s: counted %d files, want 1", tt.name, tt.gotCount)
+		}
+
+		if tt.gotBytes != tt.wantBytes {
+			t.Errorf("%s: counted %d bytes, want %d", tt.name, tt.gotBytes, tt.wantBytes)
+		}
+	}
+
+	if usage.OtherCount != 0 {
+		t.Errorf("counted %d unrecognised files in a healthy cache, want 0", usage.OtherCount)
+	}
+
+	// The property that makes the four categories worth having: they partition
+	// the directory, so nothing is counted twice and nothing is missed.
+	want := usage.Archives + usage.Sidecars + usage.Parquet
+	if usage.Total() != want {
+		t.Errorf("Total() is %d, want %d", usage.Total(), want)
+	}
+
+	if usage.Root != c.root {
+		t.Errorf("Root is %q, want %q", usage.Root, c.root)
+	}
+}
+
+// TestCacheUsageCountsAStrayFile pins the one category that exists to make a
+// problem visible rather than to describe the design.
+//
+// A cache write goes to a temporary file in its destination directory and is
+// renamed into place, so a process killed between the two leaves exactly this,
+// and nothing ever collects it. Folding it into a total would hide it; leaving
+// it out of one would make the total disagree with the disk.
+func TestCacheUsageCountsAStrayFile(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	stray := filepath.Join(filepath.Dir(p.archive), "cache-1234567890.tmp")
+	if err := os.WriteFile(stray, []byte("interrupted write"), cacheFilePerm); err != nil {
+		t.Fatalf("writing a stray file: %v", err)
+	}
+
+	usage, err := c.usage(t.Context())
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+
+	if usage.OtherCount != 1 {
+		t.Fatalf("counted %d unrecognised files, want 1", usage.OtherCount)
+	}
+
+	if got, want := usage.Other, fileSize(t, stray); got != want {
+		t.Errorf("counted %d unrecognised bytes, want %d", got, want)
+	}
+
+	if usage.ArchiveCount != 1 || usage.ParquetCount != 1 {
+		t.Errorf("a stray file changed the tier counts: %d archives, %d parquet",
+			usage.ArchiveCount, usage.ParquetCount)
+	}
+}
+
+// TestCacheUsageOfAnEmptyCache: a cache directory that was never written to is
+// an empty cache, not a fault. This is the first run on every machine.
+func TestCacheUsageOfAnEmptyCache(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newTestCache(t, nil)
+
+	usage, err := c.usage(t.Context())
+	if err != nil {
+		t.Fatalf("usage of an unwritten cache: %v", err)
+	}
+
+	if usage.Total() != 0 {
+		t.Errorf("an empty cache measures %d bytes, want 0", usage.Total())
+	}
+
+	if usage.Root == "" {
+		t.Error("Root is empty; the report should name the directory it measured")
+	}
+}
+
+// TestPruneRemovesOnlyTheArchive is the shape of the whole feature: of the three
+// files in a cache entry, exactly one goes.
+//
+// The two that stay are not incidental. The parquet is what reads are served
+// from, and the sidecar carries the hash that parquet is validated against — so
+// deleting either would strand the entry as surely as deleting both.
+func TestPruneRemovesOnlyTheArchive(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	size := fileSize(t, p.archive)
+
+	results, err := collectPrune(t, c, PruneOptions{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("considered %d archives, want 1", len(results))
+	}
+
+	got := results[0]
+
+	switch {
+	case got.Kept != nil:
+		t.Fatalf("kept an archive whose parquet is valid: %v", got.Kept)
+	case got.Err != nil:
+		t.Fatalf("removing the archive: %v", got.Err)
+	case !got.Removed:
+		t.Fatal("Removed is false after a prune that was not a dry run")
+	case got.Path != p.archive:
+		t.Errorf("Path is %q, want %q", got.Path, p.archive)
+	case got.Size != size:
+		t.Errorf("Size is %d, want %d", got.Size, size)
+	}
+
+	if _, err := os.Stat(p.archive); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the archive is still there: %v", err)
+	}
+
+	for _, path := range []string{p.sidecar, p.parquet} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("prune removed %s, which reads depend on: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+// TestPrunedCacheStillServesReadsWithoutRequests is the invariant the feature
+// rests on, and the only test here that would matter if the others were deleted:
+// **every read that succeeds before a prune succeeds after it.**
+//
+// It is asserted by counting requests rather than by checking the candles alone.
+// A prune that deleted something a read needed would still return the right
+// answer — by downloading it again — so a test that only compared candles would
+// pass on a cache that had silently started paying for the network on every hit.
+func TestPrunedCacheStillServesReadsWithoutRequests(t *testing.T) {
+	t.Parallel()
+
+	c, requests, want, _ := warmCache(t)
+
+	if _, err := collectPrune(t, c, PruneOptions{}); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	got, err := c.klines(t.Context(), testRef(), testSpec())
+	if err != nil {
+		t.Fatalf("reading from a pruned cache: %v", err)
+	}
+
+	assertSameKlines(t, got, want)
+
+	if n := requests.Load(); n != 2 {
+		t.Errorf("made %d requests in total, want the original 2 — the prune cost a download", n)
+	}
+}
+
+// TestPruneDryRunDeletesNothing pins the flag that makes this command safe to
+// try, including the trap in its result shape: a dry run reaches the verdict
+// (Kept nil) but never acts on it (Removed false), so a caller totalling what
+// would be freed has to count the verdict.
+func TestPruneDryRunDeletesNothing(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, p := warmCache(t)
+
+	results, err := collectPrune(t, c, PruneOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("considered %d archives, want 1", len(results))
+	}
+
+	got := results[0]
+
+	if got.Kept != nil {
+		t.Errorf("a dry run reached the wrong verdict: %v", got.Kept)
+	}
+
+	if got.Removed {
+		t.Error("Removed is true after a dry run")
+	}
+
+	if got.Size != fileSize(t, p.archive) {
+		t.Errorf("Size is %d, want the archive's %d", got.Size, fileSize(t, p.archive))
+	}
+
+	if _, err := os.Stat(p.archive); err != nil {
+		t.Errorf("a dry run deleted the archive: %v", err)
+	}
+}
+
+// TestPruneKeepsWhatTierTwoCannotReplace is the safety property, stated as its
+// contrapositive: pruning is only allowed where the parquet can already answer
+// reads, so every way of making the parquet unusable must keep the archive.
+//
+// The four cases are the four rebuild triggers from docs/caching.md, plus the
+// sidecar — which belongs here because the hash in it is half of what the
+// parquet is checked against, so losing it makes tier 2 unverifiable even though
+// tier 2 itself is intact.
+//
+// Each case is also checked against the read path, and that pairing is the
+// point. "Prune keeps it" and "a read would rebuild from it" have to be the same
+// set: an archive the reader still needs and the pruner deletes is a silent
+// download, which is the failure this whole design is arranged to avoid.
+func TestPruneKeepsWhatTierTwoCannotReplace(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		break_ func(t *testing.T, p cachePaths, klines []Kline)
+	}{
+		{
+			name: "the parquet does not exist",
+			break_: func(t *testing.T, p cachePaths, _ []Kline) {
+				t.Helper()
+
+				if err := os.Remove(p.parquet); err != nil {
+					t.Fatalf("removing the parquet: %v", err)
+				}
+			},
+		},
+		{
+			name: "the parquet is not a parquet file at all",
+			break_: func(t *testing.T, p cachePaths, _ []Kline) {
+				t.Helper()
+
+				if err := os.WriteFile(p.parquet, []byte("torn write"), cacheFilePerm); err != nil {
+					t.Fatalf("corrupting the parquet: %v", err)
+				}
+			},
+		},
+		{
+			name: "the parquet was built by a different codec version",
+			break_: func(t *testing.T, p cachePaths, klines []Kline) {
+				t.Helper()
+
+				sum, err := readSidecar(p.sidecar, p.name)
+				if err != nil {
+					t.Fatalf("reading the sidecar: %v", err)
+				}
+
+				b := rawParquet(t, klines, map[string]string{
+					metaSourceFile:   p.name,
+					metaSourceSHA256: sum,
+					metaCodecVersion: strconv.Itoa(CodecVersion + 1),
+					metaRows:         strconv.Itoa(len(klines)),
+				})
+
+				if err := os.WriteFile(p.parquet, b, cacheFilePerm); err != nil {
+					t.Fatalf("writing a parquet from a newer codec: %v", err)
+				}
+			},
+		},
+		{
+			name: "the parquet was built from a different archive",
+			break_: func(t *testing.T, p cachePaths, klines []Kline) {
+				t.Helper()
+
+				b := rawParquet(t, klines, map[string]string{
+					metaSourceFile:   p.name,
+					metaSourceSHA256: strings.Repeat("ab", 32),
+					metaCodecVersion: strconv.Itoa(CodecVersion),
+					metaRows:         strconv.Itoa(len(klines)),
+				})
+
+				if err := os.WriteFile(p.parquet, b, cacheFilePerm); err != nil {
+					t.Fatalf("writing a stale parquet: %v", err)
+				}
+			},
+		},
+		{
+			name: "the sidecar is gone, so the parquet cannot be validated",
+			break_: func(t *testing.T, p cachePaths, _ []Kline) {
+				t.Helper()
+
+				if err := os.Remove(p.sidecar); err != nil {
+					t.Fatalf("removing the sidecar: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, _, klines, p := warmCache(t)
+
+			tt.break_(t, p, klines)
+
+			results, err := collectPrune(t, c, PruneOptions{})
+			if err != nil {
+				t.Fatalf("prune: %v", err)
+			}
+
+			if len(results) != 1 {
+				t.Fatalf("considered %d archives, want 1", len(results))
+			}
+
+			got := results[0]
+
+			if got.Kept == nil {
+				t.Fatal("pruned an archive that tier 2 cannot replace")
+			}
+
+			if got.Removed {
+				t.Error("Removed is true on an archive that was kept")
+			}
+
+			// A keep must report what it is still occupying: a caller
+			// explaining why a prune freed nothing needs that number.
+			if got.Size == 0 {
+				t.Error("Size is 0 on a kept archive")
+			}
+
+			if _, err := os.Stat(p.archive); err != nil {
+				t.Errorf("the archive was deleted anyway: %v", err)
+			}
+		})
+	}
+}
+
+// TestCacheUsageAgreesWithPrune closes the gap between the two commands.
+//
+// `bmd cache` reports what `bmd prune` would free, so the two have to answer
+// from the same rule. They do — both call archivePrunable — and this is what
+// stops that from being a comment rather than a fact.
+func TestCacheUsageAgreesWithPrune(t *testing.T) {
+	t.Parallel()
+
+	c, _, _, _ := warmCache(t)
+
+	usage, err := c.usage(t.Context())
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+
+	results, err := collectPrune(t, c, PruneOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	var (
+		count int
+		bytes int64
+	)
+
+	for _, r := range results {
+		if r.Kept == nil {
+			count++
+			bytes += r.Size
+		}
+	}
+
+	if usage.PrunableCount != count {
+		t.Errorf("the report counts %d prunable archives, a dry run finds %d",
+			usage.PrunableCount, count)
+	}
+
+	if usage.Prunable != bytes {
+		t.Errorf("the report offers %d bytes, a dry run would free %d", usage.Prunable, bytes)
+	}
+}

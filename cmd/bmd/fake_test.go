@@ -38,6 +38,19 @@ type fakeLoader struct {
 	entries   []binancedata.CacheEntry
 	verifyErr error
 
+	// usage and usageErr are what CacheUsage returns.
+	usage    binancedata.CacheUsage
+	usageErr error
+
+	// results and pruneErr are what PruneArchives yields.
+	results  []binancedata.PruneResult
+	pruneErr error
+
+	// gotPrune records the options PruneArchives was called with, which is the
+	// only way a test can tell a -n that reached the library from one that was
+	// parsed and dropped.
+	gotPrune binancedata.PruneOptions
+
 	// gotRequest records what Stream was asked for, which is what most of the
 	// download tests are actually about: the flags became this request.
 	gotRequest binancedata.Request
@@ -85,6 +98,28 @@ func (f *fakeLoader) VerifyCache(_ context.Context) iter.Seq2[binancedata.CacheE
 
 		if f.verifyErr != nil {
 			yield(binancedata.CacheEntry{}, f.verifyErr)
+		}
+	}
+}
+
+func (f *fakeLoader) CacheUsage(_ context.Context) (binancedata.CacheUsage, error) {
+	return f.usage, f.usageErr
+}
+
+func (f *fakeLoader) PruneArchives(
+	_ context.Context, opts binancedata.PruneOptions,
+) iter.Seq2[binancedata.PruneResult, error] {
+	f.gotPrune = opts
+
+	return func(yield func(binancedata.PruneResult, error) bool) {
+		for _, r := range f.results {
+			if !yield(r, nil) {
+				return
+			}
+		}
+
+		if f.pruneErr != nil {
+			yield(binancedata.PruneResult{}, f.pruneErr)
 		}
 	}
 }

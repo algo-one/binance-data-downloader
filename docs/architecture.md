@@ -1,10 +1,10 @@
 # Architecture
 
-> **Status:** all nine stages are complete — 0 (scaffolding), 1 (domain types),
+> **Status:** all ten stages are complete — 0 (scaffolding), 1 (domain types),
 > 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache), 6 (REST
-> fetcher), 7 (loader orchestration), 8 (CLI) and 9 (documentation and release).
-> Everything described below exists. The remaining step is the v0.1.0 tag
-> itself.
+> fetcher), 7 (loader orchestration), 8 (CLI), 9 (documentation and release) and
+> 10 (cache management). Everything described below exists. The remaining step is
+> the v0.1.0 tag itself.
 
 ## What the library does
 
@@ -859,6 +859,34 @@ func (l *Loader) Available(ctx context.Context, q AvailabilityQuery) (Availabili
 func (l *Loader) VerifyCache(ctx context.Context) iter.Seq2[CacheEntry, error]
 func WriteParquet(ctx context.Context, w io.Writer, seq iter.Seq2[Kline, error]) (int, error)
 
+// Cache management, added after Stage 9. See "Reclaiming disk" below.
+func (l *Loader) CacheUsage(ctx context.Context) (CacheUsage, error)
+func (l *Loader) PruneArchives(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error]
+
+type CacheUsage struct {
+    Root                       string
+    Archives, Sidecars         int64 // bytes, tier 1 and its .CHECKSUM files
+    Parquet, Other             int64 // bytes, tier 2 and anything unrecognised
+    ArchiveCount, SidecarCount int
+    ParquetCount, OtherCount   int
+    Prunable                   int64 // a subset of Archives
+    PrunableCount              int
+}
+
+func (u CacheUsage) Total() int64
+
+type PruneOptions struct {
+    DryRun bool // reach every verdict, delete nothing
+}
+
+type PruneResult struct {
+    Path    string
+    Size    int64
+    Kept    error // why this archive is still needed; nil when it was prunable
+    Removed bool  // false in a dry run even when Kept is nil
+    Err     error // the archive was prunable and deleting it failed
+}
+
 type AvailabilityQuery struct {
     Symbol   string
     Interval Interval
@@ -966,8 +994,8 @@ can consume candles without materialising the range.
 
 ## The command line
 
-`bmd` is three commands over the library, and the interesting part of building
-it was discovering that two of them had nothing to call.
+`bmd` is five commands over the library, and the interesting part of building the
+first three was discovering that two of them had nothing to call.
 
 ### The CLI needed public API before it could be a thin shell
 
@@ -1038,6 +1066,59 @@ the candles describe the same instant.
 archive's hash and the codec version, and rebuilt when either fails, so it is
 verified continuously by the code that uses it. Tier 1 is the only tier nothing
 re-reads, which is what makes it the one worth a command.
+
+## Reclaiming disk
+
+Added after Stage 9, and the last capability `docs/caching.md` described but
+nothing implemented. Two commands: `bmd cache` reports, `bmd prune` acts.
+
+**The read path already allowed it.** Step 1 of `cache.load` reads the sidecar
+and the Parquet and touches neither the archive nor the network, so a cache whose
+archives are gone answers every read that does not need a rebuild —
+`TestCacheServesWithoutTheArchive` has asserted that since Stage 5. What was
+missing was a way to ask for it.
+
+**The prune rule is the reader's rule, not a copy of it.** An archive may go only
+when the Parquet beside it would be accepted by a read, and that question is
+answered by `checkParquet` — `checkStamp` then `checkSchema`, the same two footer
+gates `readKlines` opens with, factored out so both callers use one copy. A
+pruner with its own notion of "usable" is one that drifts, and drifting in the
+permissive direction deletes archives that are about to be needed.
+
+The invariant is stated as a test rather than a comment.
+`TestPrunedCacheStillServesReadsWithoutRequests` prunes, reads, and counts
+requests — because a prune that deleted something a read needed would still
+return the right candles, by downloading them again, so a test comparing only the
+candles would pass on a cache that had silently started paying for the network on
+every hit.
+
+**Only the `.zip` goes.** The sidecar stays because its hash is what validates the
+Parquet, and the Parquet stays because it is what answers reads. Deleting either
+would strand the entry as completely as deleting both, which is why
+`CacheUsage` counts sidecars as their own category despite their being 88 bytes.
+
+**Tier 2 is the larger tier, which is the opposite of the obvious guess.**
+Measured on BTCUSDT `1m` for 2024-01: 2,169,570 bytes of archive against
+3,226,820 of Parquet. So pruning reclaims about 40% of a cache. Three comments
+and one test fixture in the first draft of this feature said "an order of
+magnitude larger" in the wrong direction; `docs/caching.md` had the right number
+("roughly 2×, about 5 MB per symbol-month") from Stage 5 and the draft
+contradicted it. It was caught by running the built binary against a real cache,
+which is the argument for doing that on every stage.
+
+**What is deliberately not closed.** The gates read the footer, not the pages, so
+bit rot inside a data page surfaces on a later read through Parquet's per-page
+CRC rather than during the prune, and that entry then costs a download instead of
+a decode. Closing it means decoding every cached file to answer a question about
+disk space. It is the same cost class as the `CodecVersion` bump that pruning
+already trades away.
+
+**`bmd prune` deletes; `-n` is how you look first.** This is the one place the
+CLI departs from `bmd verify`, whose deletion is opt-in behind `-rm`. A command
+named `prune` that declines to prune unless asked twice is worse, and `-n` is the
+spelling `make` and `rsync` already gave that job. The empty-`-cache-dir` guard
+matters more here than anywhere: `-cache-dir "$CACHE_DIR"` with the variable
+unset is a usage error rather than a silent fall back to the user's real cache.
 
 ## Documentation and release
 
@@ -1223,6 +1304,12 @@ setting is a defect, not a stub.
 | 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | **done** |
 | 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress, `bmd verify`, `bmd list` | **done** |
 | 9 | Docs and release — runnable examples, `Option` as an interface, goreleaser | **done** |
+| 10 | Cache management — `Loader.CacheUsage`, `Loader.PruneArchives`, `bmd cache`, `bmd prune` | **done** |
+
+Stage 10 was not in the original plan. It is the capability `docs/caching.md`
+designed in Stage 5 and left unbuilt, added because the only cache management
+that shipped was `bmd verify -rm`, which deletes corrupt files and nothing else.
+See "Reclaiming disk" above.
 
 ## Dependencies
 

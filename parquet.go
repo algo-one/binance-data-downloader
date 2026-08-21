@@ -406,6 +406,48 @@ func parquetWriterOptions() []parquet.WriterOption {
 	}
 }
 
+// checkParquet reports whether a tier-2 file would be accepted by [readKlines],
+// without reading a single candle out of it.
+//
+// It is the same two gates that function opens with — [checkStamp] against the
+// footer, then [checkSchema] against the column layout — and deliberately
+// nothing after them. Both read only parquet's footer, which sits at the end of
+// the file, so the whole question costs one open and one seek however large the
+// file is.
+//
+// # What it is for, and the gap it leaves
+//
+// Pruning tier 1. An archive may only be deleted when the parquet beside it can
+// serve reads on its own, and "can serve" has to be decided by the same rule the
+// read path uses or the two will drift apart — a prune that is more permissive
+// than the reader deletes archives that are about to be needed again.
+//
+// It is deliberately *not* a full read, and the difference is worth naming
+// because it is the one way a prune can cost something. [readKlines] goes on to
+// decode every page, and parquet checksums each one, so bit rot inside a data
+// page surfaces there and not here. An archive pruned on this evidence whose
+// parquet later fails a page checksum has to be downloaded again.
+//
+// That residual is accepted rather than closed, and the arithmetic is why:
+// closing it means decoding every cached file — 6.1 ms and up to 14 MB resident
+// per symbol-month — to answer a question about disk space. It is also the same
+// cost class as the [CodecVersion] bump that docs/caching.md already documents
+// as pruning's price. What the two gates below do rule out is every *silent*
+// version of the problem: a file from another tool, from another archive, from
+// an older codec, or with its columns in a different order.
+func checkParquet(r io.ReaderAt, size int64, want parquetStamp) error {
+	f, err := parquet.OpenFile(r, size)
+	if err != nil {
+		return fmt.Errorf("parquet: reading %q: %w", want.SourceFile, err)
+	}
+
+	if err := checkStamp(f, want); err != nil {
+		return err
+	}
+
+	return checkSchema(f, want)
+}
+
 // readKlines reads a tier-2 file, after checking that it may be used.
 //
 // The check is the validity rule from docs/caching.md, and it is two

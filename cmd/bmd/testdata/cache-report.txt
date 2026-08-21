@@ -1,0 +1,8 @@
+/home/ivan/.cache/bmd
+
+  archives   412  852.5 MB
+  sidecars   412   35.4 KB
+   parquet   412    1.2 GB
+     total  1236    2.1 GB
+
+846.2 MB in 409 archives can be freed with 'bmd prune'

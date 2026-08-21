@@ -1188,3 +1188,82 @@ func (g *gate) wait(ctx context.Context) error {
 func (l *Loader) VerifyCache(ctx context.Context) iter.Seq2[CacheEntry, error] {
 	return l.cache.verify(ctx)
 }
+
+// CacheUsage measures what this Loader's cache directory holds: bytes and file
+// counts for each tier, and how much of tier 1 a prune would reclaim.
+//
+//	usage, err := loader.CacheUsage(ctx)
+//	if err != nil {
+//	    return err
+//	}
+//	fmt.Printf("%d bytes, %d reclaimable\n", usage.Total(), usage.Prunable)
+//
+// # What it costs
+//
+// One pass over the cache directory, plus one open and one seek per archive to
+// read the footer of the parquet beside it — which is what decides
+// [CacheUsage.Prunable]. Nothing is hashed, nothing is decoded and nothing is
+// downloaded, so this is orders of magnitude cheaper than [Loader.VerifyCache],
+// which reads every archive end to end.
+//
+// A cache directory that does not exist yet measures zero, with no error: that
+// is indistinguishable from a cache nothing has been written to.
+func (l *Loader) CacheUsage(ctx context.Context) (CacheUsage, error) {
+	return l.cache.usage(ctx)
+}
+
+// PruneArchives deletes cached archives that the parquet tier no longer needs,
+// yielding one [PruneResult] per archive considered:
+//
+//	for result, err := range loader.PruneArchives(ctx, binancedata.PruneOptions{}) {
+//	    if err != nil {
+//	        return err // the cache directory could not be walked
+//	    }
+//	    if result.Removed {
+//	        freed += result.Size
+//	    }
+//	}
+//
+// Pass [PruneOptions] with DryRun set to reach every verdict and delete nothing.
+//
+// # What is safe to delete, and why
+//
+// Reads are served from the parquet tier: a hit reads the .CHECKSUM sidecar and
+// the parquet's footer, and opens the archive neither to decode nor to re-hash
+// it. An archive is therefore deletable exactly when the parquet beside it would
+// be accepted by that read — same source hash, same [CodecVersion], same schema
+// — and this checks precisely that, with the same code the read path uses.
+//
+// The guarantee that follows is worth stating plainly: **every read that
+// succeeds before a prune succeeds after it.** Only the .zip is removed. The
+// sidecar stays, because the hash in it is what validates the parquet, and the
+// parquet stays because it is what answers reads.
+//
+// # What it costs
+//
+// A download later, in the one case tier 1 is still needed: rebuilding. That
+// happens when [CodecVersion] moves — the parser changed, so every cached
+// parquet has to be built again — or when a parquet fails one of parquet's
+// per-page checksums. Both would have been a local decode with the archive on
+// disk and become a fetch without it.
+//
+// This is why pruning is something a caller asks for and never something the
+// cache does on its own. It is also worth knowing what there is to gain before
+// spending that future download: tier 1 is about 40% of a cache, not most of it
+// — measured on BTCUSDT 1m for 2024-01, 2,169,570 bytes of archive against
+// 3,226,820 of parquet — because the tier that is read is deliberately the
+// larger one. See [CacheUsage] and docs/caching.md.
+//
+// # Two error channels, two meanings
+//
+// The yielded error ends the iteration: the cache directory could not be walked,
+// or ctx was cancelled. An archive that was *kept* is not that and stops
+// nothing — it arrives in [PruneResult.Kept] with a nil error beside it, because
+// reporting on every archive is the whole job. A keep is not a failure either:
+// the ordinary reason is a parquet that has not been built yet, and the archive
+// is then the only copy of that data on the machine.
+//
+// A cache directory that does not exist yet yields nothing and no error.
+func (l *Loader) PruneArchives(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error] {
+	return l.cache.prune(ctx, opts)
+}
