@@ -221,15 +221,16 @@ func WithCacheDir(dir string) Option {
 	})
 }
 
-// WithConcurrency sets how many chunks are fetched at once. The default is
-// [defaultConcurrency].
+// WithConcurrency sets how many chunks are fetched at once. The default is 8.
 //
 // One number governs the whole loader, not one per call: [Loader.FetchAll]
 // running twenty requests uses the same budget as a single [Loader.Fetch], so
 // the setting means what it says regardless of how the work arrives.
 //
 // Turn it *down* for 1s data. Each worker holds one decoded archive, and a
-// month of 1s candles is around 810 MB — see [defaultConcurrency].
+// month of 1s candles is around 810 MB, so the default of 8 is several
+// gigabytes at that interval. The default is chosen for 1m and coarser, where
+// it costs at most about 110 MB.
 func WithConcurrency(n int) Option {
 	return optionFunc(func(c *loaderConfig) error {
 		if n < 1 {

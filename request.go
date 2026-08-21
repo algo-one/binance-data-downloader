@@ -40,7 +40,7 @@ import (
 // chance to drop a candle or emit it twice, silently.
 //
 // So the conversion from what a caller wrote to what the pipeline uses happens
-// exactly once, in [Request.endExclusive], and the something it adds is one
+// exactly once, in a single unexported method, and the something it adds is one
 // *nanosecond*. That is a unit no Binance timestamp has ever used: the archives
 // publish milliseconds, and microseconds since 2025. Nothing can fall between
 // End and End+1ns, so the conversion cannot gain or lose a candle, and it is

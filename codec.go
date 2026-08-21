@@ -52,7 +52,8 @@ import (
 // is a memory decision. A month of 1s candles is about 2.6 million rows, and a
 // [Kline] is 312 bytes, so materialising one archive would cost 810 MB. Stage 5
 // writes the cache row by row from this iterator and never holds an archive
-// whole; [collectKlines] is there for the callers that genuinely want a slice.
+// whole; an unexported helper collects one into a slice for the callers that
+// genuinely want one.
 const (
 	// CodecVersion identifies the decoding rules implemented in this file. It
 	// is stamped into every derived cache file and compared on read.

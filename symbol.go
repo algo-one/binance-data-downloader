@@ -28,9 +28,8 @@ const (
 //
 // Surrounding whitespace is trimmed, the separators "/" and "-" are removed,
 // and ASCII letters are upper-cased. Anything that survives that and is still
-// not an ASCII letter or digit is an error, as is a result outside
-// [minSymbolLength]..[maxSymbolLength]. The returned error wraps
-// [ErrInvalidRequest].
+// not an ASCII letter or digit is an error, as is a result shorter than 3
+// characters or longer than 20. The returned error wraps [ErrInvalidRequest].
 //
 // Normalising early matters for more than tidiness. The symbol becomes part of
 // a URL, part of a cache path and part of a cache key, so two spellings of one

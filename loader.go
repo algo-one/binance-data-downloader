@@ -209,8 +209,9 @@ func NewLoader(opts ...Option) (*Loader, error) {
 //
 // The one span exempt from that is the one that has not happened yet. A request
 // ending now normally ends part-way through a candle that has not closed, and
-// an unclosed candle is deliberately not returned — see [restFetcher] — so a
-// tail with nothing settled in it is expected rather than missing.
+// an unclosed candle is deliberately not returned — the candle currently
+// forming is dropped rather than reported half-finished — so a tail with
+// nothing settled in it is expected rather than missing.
 //
 // # How far that guarantee reaches
 //
