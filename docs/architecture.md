@@ -1048,7 +1048,7 @@ examples, one deferred API change, and the release machinery.
 
 ### Examples are compiled; only some of them run
 
-`example_test.go` holds fifteen, in `package binancedata_test` so that they can
+`example_test.go` holds sixteen, in `package binancedata_test` so that they can
 reach only exported identifiers — worth having the compiler check in a
 repository where half the code is under `internal/`.
 
@@ -1058,7 +1058,7 @@ example only when it ends in an `// Output:` comment, and an example that calls
 does. So the seven examples over pure logic — `ParseInterval`,
 `NormalizeSymbol`, `Interval.HasDailyArchives`, `Interval.Duration`,
 `Request.Validate`, `Availability.MonthlyGaps`, `Closes` — carry an `// Output:`
-block and are assertions. The eight that hold a `Loader` do not.
+block and are assertions. The nine that hold a `Loader` do not.
 
 Pointing the second group at an `httptest.Server` would make them executable —
 `WithHTTPClient` is public, so a fake transport is reachable from the external
@@ -1256,11 +1256,11 @@ and cross-compilation.
   through, are synthesised in the test itself.
 - **`t.TempDir()`** for all cache tests.
 - **Golden files** for CLI output and for reproducible Parquet.
-- **Runnable examples** double as tests. Seven of the fifteen in
-  `example_test.go` execute with their output checked; all fifteen are compiled,
+- **Runnable examples** double as tests. Seven of the sixteen in
+  `example_test.go` execute with their output checked; all sixteen are compiled,
   and `go vet` binds each example's name to a real identifier, so a rename
   breaks the build. See "Documentation and release" above for why the other
-  eight cannot run.
+  nine cannot run.
 - **`-race`** on every run.
 - **A frozen clock** — time is injected, never read from `time.Now()` inside
   logic, so calendar rules are testable. The retry policy carries its timer and

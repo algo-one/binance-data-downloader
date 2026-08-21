@@ -151,7 +151,7 @@ go doc github.com/algo-one/binance-data-downloader.Loader   # one type
 go run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
 ```
 
-`example_test.go` holds fifteen worked examples, and they are the fastest way in
+`example_test.go` holds sixteen worked examples, and they are the fastest way in
 — seven of them execute on every test run with their output checked, so they
 cannot quietly become wrong.
 
