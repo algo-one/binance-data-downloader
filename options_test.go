@@ -195,7 +195,7 @@ func TestEveryOptionIsHonoured(t *testing.T) {
 
 		if _, err := l.Fetch(t.Context(), Request{
 			Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-			Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+			Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 		}); err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}

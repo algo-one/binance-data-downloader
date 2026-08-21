@@ -8,29 +8,58 @@ import (
 // Request describes one range of candles to fetch: which symbol, at which
 // interval, in which market, over which span of time.
 //
-// # Half-open ranges
+// # Closed ranges
 //
-// Start is included in the range and End is excluded — the range mathematicians
-// write [Start, End). This is the single most important thing to know about
-// this type, because the alternative is so tempting and so quietly wrong.
+// Both ends are included — the range mathematicians write [Start, End]. A
+// candle is in the range when
 //
-// The reason is composition. Ranges get split into months, months into days,
-// days into API pages, and the pieces get merged back together. With half-open
-// ranges, adjacent pieces join with no arithmetic at all:
+//	Start <= OpenTime <= End
+//
+// so End is most usefully read as *the open time of the last candle you want*.
+// For daily candles, End 2024-03-31 returns the candle for the 31st. For hourly
+// candles, End 2024-03-31 returns the one candle that opened at 00:00 on the
+// 31st — because that is the last candle whose open time is at or before the
+// instant named. Ask for the whole day and you are asking for the whole day's
+// last instant: 2024-03-31T23:59:59.999999999Z. The bmd CLI does that expansion
+// for you when --end is written as a bare date, which is the right place for a
+// human-facing convenience.
+//
+// # Where the half-open ranges went
+//
+// They are still here; they are just no longer the caller's problem. Inside the
+// pipeline every boundary is half-open, because ranges are split into months,
+// months into days, days into API pages, and the pieces must join back together
+// with no arithmetic at all:
 //
 //	[Jan 1, Feb 1) + [Feb 1, Mar 1)  =  [Jan 1, Mar 1)
 //
-// The end of one piece *is* the start of the next, so a boundary can only ever
-// be written once and there is nothing to add or subtract. With inclusive ends
-// every seam needs a "+1 of something", and the something changes with the
-// interval — one millisecond before 2025, one microsecond after. Every one of
-// those is a chance to drop a candle or emit it twice, and both failures are
-// silent.
+// The end of one piece *is* the start of the next, so a seam is written once
+// and there is nothing to add or subtract. Inclusive seams would need a "+1 of
+// something" at every join, and the something changes with the interval — one
+// millisecond before 2025, one microsecond after. Every one of those is a
+// chance to drop a candle or emit it twice, silently.
 //
-// So a full year of 2024 is Start 2024-01-01, End 2025-01-01. Asking for
-// End 2024-12-31 gets you every candle up to but not including that final day.
-// The CLI in a later stage will accept a bare --end date and add a day for you,
-// because that is the right place for a human-facing convenience.
+// So the conversion from what a caller wrote to what the pipeline uses happens
+// exactly once, in [Request.endExclusive], and the something it adds is one
+// *nanosecond*. That is a unit no Binance timestamp has ever used: the archives
+// publish milliseconds, and microseconds since 2025. Nothing can fall between
+// End and End+1ns, so the conversion cannot gain or lose a candle, and it is
+// the same single line whichever side of the 2025 switch the data sits on.
+//
+// # What this costs, stated plainly
+//
+// A whole year of 2024 is now
+//
+//	Start: 2024-01-01T00:00:00Z, End: 2024-12-31T23:59:59.999999999Z
+//
+// Writing End 2025-01-01 instead is not an error and will not be reported as
+// one. It asks for the candle that opens exactly at midnight on New Year's Day,
+// which is a real candle living in a different month — so the planner fetches
+// January's archive to get it, and one extra candle arrives at the end of your
+// slice. That is the tax inclusive ends charge, and it is charged to whoever
+// writes the boundary. It is here because the alternative was worse: a CLI
+// whose --end meant something different from the library's End is the kind of
+// difference nobody notices until a backtest is a day short.
 //
 // # Zero values mean something here
 //
@@ -84,7 +113,8 @@ type Request struct {
 	// UTC.
 	Start time.Time
 
-	// End is the first instant *excluded* from the range, and must be UTC.
+	// End is the last instant *included* in the range, and must be UTC. A
+	// candle is returned when its open time is at or before it.
 	//
 	// The zero value means "now, as of the moment the request is executed".
 	// Prefer leaving it zero over writing time.Now(): a stored End is a
@@ -159,15 +189,19 @@ func (r Request) Validate() error {
 			return err
 		}
 
-		// Equal starts and ends are rejected rather than treated as an empty
-		// result. A half-open range [t, t) is empty by definition, and a
-		// caller who wrote one almost certainly meant something else — most
-		// often they meant an inclusive end. Returning zero candles and no
-		// error would leave them debugging the wrong layer.
-		if !r.Start.Before(r.End) {
+		// Note which comparison this is. Under the old half-open rule a range
+		// [t, t) was empty by definition and had to be rejected, so the test
+		// was !Start.Before(End) and it caught equality too. A closed range
+		// [t, t] is not empty — it holds one instant, and asks for the one
+		// candle that opens there — so equality is now a legal request and
+		// rejecting it would refuse something meaningful.
+		//
+		// What remains impossible is an End that precedes its Start, which no
+		// reading makes sense of.
+		if r.End.Before(r.Start) {
 			return fmt.Errorf(
-				"start %s is not before end %s (the range is half-open, so end is excluded): %w",
-				r.Start.Format(time.RFC3339), r.End.Format(time.RFC3339), ErrInvalidRequest,
+				"end %s is before start %s: %w",
+				r.End.Format(time.RFC3339), r.Start.Format(time.RFC3339), ErrInvalidRequest,
 			)
 		}
 	}
@@ -231,13 +265,51 @@ func (r Request) resolve(now time.Time) (Request, error) {
 		// future is the realistic way to get here — a typo'd year, or a
 		// backtest configured to begin tomorrow — and saying so beats
 		// returning zero candles.
-		if !r.Start.Before(r.End) {
+		if r.End.Before(r.Start) {
 			return Request{}, fmt.Errorf(
-				"start %s is not before now (%s), so the range is empty: %w",
+				"start %s is after now (%s), so the range is empty: %w",
 				r.Start.Format(time.RFC3339), r.End.Format(time.RFC3339), ErrInvalidRequest,
 			)
 		}
 	}
 
 	return r, nil
+}
+
+// endExclusive converts this request's inclusive End into the exclusive
+// boundary every layer below the public API works in.
+//
+// This is the *only* place the two conventions meet. A caller writes a closed
+// range [Start, End]; the planner, the chunk seams, the decoder's range checks
+// and the REST endTime parameter all speak half-open [Start, End). One function
+// with one caller-facing rule — "a candle counts when OpenTime <= End" —
+// becomes one rule for everything underneath: "a candle counts when
+// OpenTime < endExclusive". Two conventions are survivable; two conventions
+// with the conversion scattered across five call sites are not.
+//
+// # Why a nanosecond
+//
+// Because it is a unit Binance has never published in. A time.Time carries
+// nanoseconds, archive timestamps are milliseconds (microseconds since 2025),
+// and no candle can therefore have an open time strictly between End and
+// End+1ns. The conversion is exact rather than approximately right, and it is
+// the same line on both sides of the 2025 unit switch — which the "+1 of
+// something" alternative is not.
+//
+// The one input this cannot handle is the maximum representable time.Time,
+// which would overflow silently. Nothing guards against it: that instant is in
+// the year 219250468, a request reaching it has asked for two hundred million
+// years of candles, and Validate does not reject it either. Worth knowing the
+// guard is absent rather than assuming it is there.
+//
+// # It must be called on a resolved request
+//
+// A zero End means "now" and is filled in by [Request.resolve]. Calling this on
+// an unresolved request would hand back one nanosecond past the zero time,
+// which is a boundary in the year 1, so callers resolve first. There is no
+// guard here because adding one to a value the caller was supposed to have
+// filled in cannot be distinguished from a legitimately tiny range without
+// reintroducing the clock this method deliberately does not have.
+func (r Request) endExclusive() time.Time {
+	return r.End.Add(1)
 }

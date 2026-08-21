@@ -233,7 +233,7 @@ func TestFetchOneDailyArchive(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTC/USDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -266,6 +266,148 @@ func TestFetchOneDailyArchive(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The closed range
+// ---------------------------------------------------------------------------
+
+// TestEndIsInclusive is the defining test for [Request]'s closed range, and the
+// one that fails outright against the half-open rule this replaced.
+//
+// It works by moving the boundary one nanosecond and watching exactly one
+// candle appear. That is a stronger claim than "the right number came back":
+// a nanosecond is finer than any resolution Binance has ever published in —
+// milliseconds in the archives, microseconds since 2025 — so there is nothing
+// in the gap that could account for a difference of anything but the single
+// candle whose open time the boundary crossed.
+func TestEndIsInclusive(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeBinance{days: archiveNames("BTCUSDT", Interval1h, aggDaily, utc(2024, 1, 15), 1)}
+	l := f.loader(t, utc(2026, 8, 20))
+
+	// The open time of the final candle in the 2024-01-15 archive.
+	last := utc(2024, 1, 15, 23)
+
+	fetch := func(end time.Time) []Kline {
+		t.Helper()
+
+		klines, err := l.Fetch(t.Context(), Request{
+			Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
+			Start: utc(2024, 1, 15), End: end,
+		})
+		if err != nil {
+			t.Fatalf("Fetch with end %s: %v", end.Format(time.RFC3339Nano), err)
+		}
+
+		return klines
+	}
+
+	// An End sitting exactly on a candle's open time includes that candle.
+	// Under the old rule this returned 23.
+	got := fetch(last)
+
+	if len(got) != 24 {
+		t.Fatalf("end on the last open time returned %d candles, want 24", len(got))
+	}
+
+	if openTime := got[len(got)-1].OpenTime; !openTime.Equal(last) {
+		t.Errorf("last candle opens at %s, want %s", openTime, last)
+	}
+
+	// One nanosecond earlier excludes it, and nothing else.
+	got = fetch(last.Add(-time.Nanosecond))
+
+	if len(got) != 23 {
+		t.Fatalf("end one nanosecond earlier returned %d candles, want 23", len(got))
+	}
+
+	if openTime, want := got[len(got)-1].OpenTime, utc(2024, 1, 15, 22); !openTime.Equal(want) {
+		t.Errorf("last candle opens at %s, want %s", openTime, want)
+	}
+}
+
+// TestASingleInstantIsOneCandle pins down the spelling Validate used to reject.
+//
+// Start == End is an empty range under the half-open rule and a one-instant
+// range under the closed one, so it is the case where the two conventions
+// disagree most sharply: the old code returned an error, and the new code has
+// to return exactly one candle rather than the whole day the archive it came
+// from actually holds.
+func TestASingleInstantIsOneCandle(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeBinance{days: archiveNames("BTCUSDT", Interval1h, aggDaily, utc(2024, 1, 15), 1)}
+	l := f.loader(t, utc(2026, 8, 20))
+
+	noon := utc(2024, 1, 15, 12)
+
+	klines, err := l.Fetch(t.Context(), Request{
+		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
+		Start: noon, End: noon,
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	if len(klines) != 1 {
+		t.Fatalf("got %d candles, want 1", len(klines))
+	}
+
+	if openTime := klines[0].OpenTime; !openTime.Equal(noon) {
+		t.Errorf("candle opens at %s, want %s", openTime, noon)
+	}
+}
+
+// TestProgressReportsTheEndTheCallerWrote guards the boundary between the two
+// conventions against the refactor most likely to blur it.
+//
+// Converting inside resolve would be tempting and would pass every test above,
+// because everything downstream wants the exclusive bound anyway. What it would
+// also do is put the converted value into Progress.Request, so a caller's
+// progress display would quietly report an End one nanosecond past the one they
+// asked for. The conversion therefore lives in a method rather than in resolve,
+// and this is what says so.
+func TestProgressReportsTheEndTheCallerWrote(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeBinance{days: archiveNames("BTCUSDT", Interval1h, aggDaily, utc(2024, 1, 15), 1)}
+
+	var (
+		mu   sync.Mutex
+		ends []time.Time
+	)
+
+	l := f.loader(t, utc(2026, 8, 20), WithProgress(func(p Progress) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		ends = append(ends, p.Request.End)
+	}))
+
+	end := utc(2024, 1, 15, 23)
+
+	if _, err := l.Fetch(t.Context(), Request{
+		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
+		Start: utc(2024, 1, 15), End: end,
+	}); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(ends) == 0 {
+		t.Fatal("no progress was reported")
+	}
+
+	for i, got := range ends {
+		if !got.Equal(end) {
+			t.Errorf("progress %d reported end %s, want %s",
+				i, got.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+		}
+	}
+}
+
 // TestFetchIsSortedDeduplicatedAndTrimmed checks the reduce phase against a
 // range that needs all three of its jobs at once.
 //
@@ -286,7 +428,7 @@ func TestFetchIsSortedDeduplicatedAndTrimmed(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: start, End: end,
+		Start: start, End: upTo(end),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -334,7 +476,7 @@ func TestFetchJoinsArchivesToTheRESTTail(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 17),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 17)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -366,7 +508,7 @@ func TestStreamYieldsTheSameCandlesAsFetch(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 31), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 31), End: upTo(utc(2025, 1, 2)),
 	}
 	days := []string{"BTCUSDT-1h-2024-12-31.zip", "BTCUSDT-1h-2025-01-01.zip"}
 
@@ -423,7 +565,7 @@ func TestStreamStopsOnBreak(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 31), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 31), End: upTo(utc(2025, 1, 2)),
 	}
 
 	warm(t, l, req)
@@ -477,7 +619,7 @@ func TestMissingMonthlyArchiveFallsBackToDailies(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -512,7 +654,7 @@ func TestOneMissingDayDegradesThatDayOnly(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 31), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 31), End: upTo(utc(2025, 1, 2)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -547,12 +689,12 @@ func TestAnEmptySpanIsAnError(t *testing.T) {
 	// one of them can be served. Warmed first — see [warm].
 	warm(t, l, Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	})
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 14), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 14), End: upTo(utc(2024, 1, 16)),
 	})
 
 	if !errors.Is(err, ErrNotAvailable) {
@@ -671,7 +813,7 @@ func TestConcurrentRequestsFetchAnArchiveOnce(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	}
 
 	results := make([][]Kline, callers)
@@ -718,7 +860,7 @@ func TestEachCallerOwnsItsCandles(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	}
 
 	first, err := l.Fetch(t.Context(), req)
@@ -761,11 +903,11 @@ func TestFetchAll(t *testing.T) {
 	// they share must be fetched once.
 	first := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 31), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 31), End: upTo(utc(2025, 1, 2)),
 	}
 	second := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2025, 1, 1), End: utc(2025, 1, 2),
+		Start: utc(2025, 1, 1), End: upTo(utc(2025, 1, 2)),
 	}
 
 	got, err := l.FetchAll(t.Context(), []Request{first, second})
@@ -801,11 +943,11 @@ func TestFetchAllFailsOnTheFirstError(t *testing.T) {
 
 	good := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	}
 	bad := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 10), End: utc(2024, 1, 11), // never published
+		Start: utc(2024, 1, 10), End: upTo(utc(2024, 1, 11)), // never published
 	}
 
 	// Fail-fast cancels the sibling request mid-flight; warming first is what
@@ -874,7 +1016,7 @@ func TestRouteSkipsAnArchiveTheListingDoesNotHave(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 30), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 30), End: upTo(utc(2025, 1, 2)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -925,7 +1067,7 @@ func TestRouteRerouteAndCoalesce(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1mo, Market: MarketSpot,
-		Start: utc(2024, 1, 1), End: utc(2024, 5, 1),
+		Start: utc(2024, 1, 1), End: upTo(utc(2024, 5, 1)),
 	}
 
 	got := l.route(t.Context(),
@@ -968,7 +1110,7 @@ func TestRouteFansAMissingMonthOutIntoTheDaysThatExist(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 2, 1), End: utc(2024, 3, 1),
+		Start: utc(2024, 2, 1), End: upTo(utc(2024, 3, 1)),
 	}
 
 	got := l.route(t.Context(),
@@ -1101,7 +1243,7 @@ func TestProgressReportsEveryChunkOnce(t *testing.T) {
 
 	if _, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 31), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 31), End: upTo(utc(2025, 1, 2)),
 	}); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -1170,7 +1312,7 @@ func TestProgressIsSerialised(t *testing.T) {
 
 	if _, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 12, 31), End: utc(2025, 1, 2),
+		Start: utc(2024, 12, 31), End: upTo(utc(2025, 1, 2)),
 	}); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -1195,21 +1337,21 @@ func TestFetchRejectsABadRequestWithoutTouchingTheNetwork(t *testing.T) {
 			name: "no symbol",
 			req: Request{
 				Interval: Interval1h, Market: MarketSpot,
-				Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+				Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 			},
 		},
 		{
 			name: "no interval",
 			req: Request{
 				Symbol: "BTCUSDT", Market: MarketSpot,
-				Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+				Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 			},
 		},
 		{
 			name: "no market",
 			req: Request{
 				Symbol: "BTCUSDT", Interval: Interval1h,
-				Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+				Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 			},
 		},
 		{
@@ -1217,14 +1359,14 @@ func TestFetchRejectsABadRequestWithoutTouchingTheNetwork(t *testing.T) {
 			req: Request{
 				Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
 				Start: time.Date(2024, 1, 15, 0, 0, 0, 0, time.FixedZone("CET", 3600)),
-				End:   utc(2024, 1, 16),
+				End:   upTo(utc(2024, 1, 16)),
 			},
 		},
 		{
 			name: "end before start",
 			req: Request{
 				Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-				Start: utc(2024, 1, 16), End: utc(2024, 1, 15),
+				Start: utc(2024, 1, 16), End: upTo(utc(2024, 1, 15)),
 			},
 		},
 	}
@@ -1279,7 +1421,7 @@ func TestFetchFailsWhenTheListingFails(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	})
 	if err == nil {
 		t.Fatalf("got %d candles and no error from a failed listing", len(klines))
@@ -1303,7 +1445,7 @@ func TestFetchHonoursCancellation(t *testing.T) {
 
 	if _, err := l.Fetch(ctx, Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got error %v, want one wrapping context.Canceled", err)
 	}
@@ -1332,7 +1474,7 @@ func TestAnIPBanIsNotWaitedOut(t *testing.T) {
 
 	_, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	})
 
 	if !errors.Is(err, ErrIPBanned) {
@@ -1681,7 +1823,7 @@ func TestCancellationMidStreamIsReported(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 	}
 	chunks := []plan.Chunk{{Kind: plan.KindDailyArchive, Start: req.Start, End: req.End}}
 
@@ -1742,7 +1884,7 @@ func TestAChunkWithNothingInTheRequestedPartIsAnError(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 3, 16), End: utc(2024, 4, 1),
+		Start: utc(2024, 3, 16), End: upTo(utc(2024, 4, 1)),
 	}
 	chunk := plan.Chunk{Kind: plan.KindMonthlyArchive, Start: utc(2024, 3, 1), End: utc(2024, 4, 1)}
 
@@ -1776,7 +1918,7 @@ func TestAWindowWithNoCandleOpeningInItIsNotAGap(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1mo, Market: MarketSpot,
-		Start: utc(2024, 1, 15), End: utc(2024, 2, 1),
+		Start: utc(2024, 1, 15), End: upTo(utc(2024, 2, 1)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -1801,7 +1943,7 @@ func TestAChunkOutsideTheRequestIsNotAGap(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 20), End: utc(2024, 2, 1),
+		Start: utc(2024, 1, 20), End: upTo(utc(2024, 2, 1)),
 	}
 
 	// A daily chunk a fortnight before the request begins: no overlap at all.
@@ -1869,7 +2011,7 @@ func TestNoConsolidationOntoAnUnpublishedMonth(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 2, 10), End: utc(2024, 3, 1),
+		Start: utc(2024, 2, 10), End: upTo(utc(2024, 3, 1)),
 	}
 
 	chunks, err := plan.Expand(plan.Spec{
@@ -1923,7 +2065,7 @@ func TestConsolidationHappensWhenTheMonthIsThere(t *testing.T) {
 
 	req := Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 2, 10), End: utc(2024, 3, 1),
+		Start: utc(2024, 2, 10), End: upTo(utc(2024, 3, 1)),
 	}
 
 	chunks, err := plan.Expand(plan.Spec{
@@ -2009,7 +2151,7 @@ func TestFetchAllBoundsTheListingPhase(t *testing.T) {
 	for range requests {
 		reqs = append(reqs, Request{
 			Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-			Start: utc(2024, 1, 15), End: utc(2024, 1, 16),
+			Start: utc(2024, 1, 15), End: upTo(utc(2024, 1, 16)),
 		})
 	}
 
@@ -2152,7 +2294,7 @@ func TestRateLimitPausesThenSucceeds(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 16), End: utc(2024, 1, 17),
+		Start: utc(2024, 1, 16), End: upTo(utc(2024, 1, 17)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -2189,7 +2331,7 @@ func TestRateLimitGivesUpRatherThanHanging(t *testing.T) {
 
 	_, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 16), End: utc(2024, 1, 17),
+		Start: utc(2024, 1, 16), End: upTo(utc(2024, 1, 17)),
 	})
 
 	if !errors.Is(err, ErrRateLimited) {
@@ -2226,7 +2368,7 @@ func TestLadderRecoversAnArchiveThatVanished(t *testing.T) {
 
 	klines, err := l.Fetch(t.Context(), Request{
 		Symbol: "BTCUSDT", Interval: Interval1h, Market: MarketSpot,
-		Start: utc(2024, 1, 16), End: utc(2024, 1, 17),
+		Start: utc(2024, 1, 16), End: upTo(utc(2024, 1, 17)),
 	})
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)

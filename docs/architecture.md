@@ -825,7 +825,7 @@ type Request struct {
     Interval Interval
     Market   Market    // required; MarketSpot is the only implemented value
     Start    time.Time // inclusive; must be UTC
-    End      time.Time // exclusive; must be UTC; zero means "now, at call time"
+    End      time.Time // inclusive; must be UTC; zero means "now, at call time"
 }
 
 func (r Request) Validate() error
@@ -867,13 +867,46 @@ anyway. `ensureArchive` never re-hashes an archive already on disk, so there is
 no expensive re-check to turn off either. Verification stays non-optional, which
 is what requirement 9 and `docs/caching.md` already assumed.
 
-**Ranges are half-open**: `Start` is included, `End` is excluded, so a full year
-of 2024 is `Start` 2024-01-01 and `End` 2025-01-01. This is what lets the pieces
-a range is cut into rejoin without arithmetic — `[Jan, Feb) + [Feb, Mar)` is
-`[Jan, Mar)`, with each boundary written exactly once. Inclusive ends need a
+### The range is closed, and the seams are not
+
+**A `Request` is closed**: both `Start` and `End` are included, so a candle is
+returned when `Start <= OpenTime <= End`. `End` reads most naturally as *the
+open time of the last candle you want*. A full year of 2024 is `Start`
+2024-01-01 and `End` 2024-12-31T23:59:59.999999999Z.
+
+This was not the original design, and the reason it changed is worth recording
+because the original reasoning was not wrong. Half-open ranges are what let the
+pieces a range is cut into rejoin without arithmetic — `[Jan, Feb) + [Feb, Mar)`
+is `[Jan, Mar)`, with each boundary written exactly once. Inclusive ends need a
 "+1 of something" at every seam, and the something changes at the 2025
 millisecond→microsecond switch; every one of those is a chance to drop or
 duplicate a candle, silently.
+
+All of that is still true, and **all of it still applies below the public API**.
+Every internal boundary — `plan.Chunk`, `decodeSpec`, `vision.KlineQuery`,
+`Progress.Start`/`End` — is half-open and unchanged. What moved is only where
+the conversion happens: once, in `Request.endExclusive`, and the something it
+adds is **one nanosecond**.
+
+A nanosecond is the right step for the same reason the "+1 of something"
+objection was right about milliseconds. It is a unit Binance has never published
+in — archives carry milliseconds, and microseconds since 2025 — so nothing can
+fall strictly between `End` and `End+1ns`. The conversion is exact rather than
+approximately right, and it is the same single line on both sides of the 2025
+switch.
+
+**What it costs.** Writing `End` 2025-01-01 for "all of 2024" is no longer an
+error and is not reported as one: it asks for the candle opening at midnight on
+New Year's Day, so January's archive is fetched to get it and one extra candle
+arrives at the end of the slice. That tax is charged to whoever writes the
+boundary. It is accepted because the alternative was a CLI whose `--end` meant
+something different from the library's `End`, which is the kind of difference
+nobody notices until a backtest is a day short. `bmd` expands a bare `--end`
+date to that day's last instant, which lands the exclusive bound exactly on the
+seam.
+
+`Start == End` is legal and asks for a single candle. Under the half-open rule
+that spelling was empty by definition and `Validate` rejected it.
 
 A zero `End` means "now, resolved when the request is executed". Prefer it to
 writing `time.Now()`: a stored end date is a snapshot that ages, and the whole

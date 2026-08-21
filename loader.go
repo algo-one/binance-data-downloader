@@ -185,9 +185,11 @@ func NewLoader(opts ...Option) (*Loader, error) {
 // Fetch returns every candle in the requested range, in ascending order of open
 // time, with no duplicates.
 //
-// The range is half-open — Start included, End excluded — so a full year of
-// 2024 is Start 2024-01-01 and End 2025-01-01. A zero End means "now, as of
-// this call".
+// The range is closed — both Start and End are included, so a candle is
+// returned when Start <= OpenTime <= End. A full year of 2024 is Start
+// 2024-01-01 and End 2024-12-31T23:59:59.999999999Z; see [Request] for why the
+// nines are there and what writing 2025-01-01 instead would get you. A zero End
+// means "now, as of this call".
 //
 // # What an error means
 //
@@ -427,9 +429,12 @@ func (l *Loader) resolve(ctx context.Context, req Request, now time.Time) (Reque
 		return Request{}, nil, err
 	}
 
+	// endExclusive, not End: everything from here down is half-open. This is
+	// the boundary between the two conventions, and it is the whole of it —
+	// see [Request.endExclusive].
 	chunks, err := plan.Expand(plan.Spec{
 		Start:           resolved.Start,
-		End:             resolved.End,
+		End:             resolved.endExclusive(),
 		ArchivesThrough: index.through,
 		HasDaily:        resolved.Interval.HasDailyArchives(),
 		HasMonthly:      resolved.Interval.HasMonthlyArchives(),
@@ -691,7 +696,12 @@ consume:
 		}
 
 		for _, k := range klines {
-			if k.OpenTime.Before(req.Start) || !k.OpenTime.Before(req.End) {
+			// The closed range spelt out directly: before Start or after End is
+			// outside it. Written this way rather than against endExclusive
+			// because this is the one place in the pipeline whose subject is the
+			// caller's own range rather than a chunk of it, so the caller's own
+			// convention is the one that belongs here.
+			if k.OpenTime.Before(req.Start) || k.OpenTime.After(req.End) {
 				continue // an archive overshooting the range it was fetched for
 			}
 
@@ -886,16 +896,26 @@ func (l *Loader) sizeHint(req Request) int {
 		return 0
 	}
 
-	end := req.End
-	if end.IsZero() {
-		end = l.now().UTC()
+	// The request has not been resolved yet — this runs before Fetch commits to
+	// any work — so the zero End is filled in here rather than by resolve.
+	//
+	// Then the *resolved copy* is what endExclusive is asked for, rather than
+	// this function adding a nanosecond of its own. There is one place in this
+	// library that knows how wide the step between the two range conventions is,
+	// and a second one here would be a second thing to remember to change.
+	// Value receivers make the copy free of consequence: assigning to req cannot
+	// be seen by the caller.
+	if req.End.IsZero() {
+		req.End = l.now().UTC()
 	}
 
-	if !req.Start.Before(end) {
+	if req.End.Before(req.Start) {
 		return 0
 	}
 
-	return decodeSpec{Interval: req.Interval, Start: req.Start, End: end}.estimateRows()
+	spec := decodeSpec{Interval: req.Interval, Start: req.Start, End: req.endExclusive()}
+
+	return spec.estimateRows()
 }
 
 // minTime and maxTime are the time.Time spellings of the min and max builtins,
@@ -941,7 +961,10 @@ func maxTime(a, b time.Time) time.Time {
 // So the intersection is computed first. An empty one means the chunk cannot
 // contribute to this request at all, and nothing about it is worth reporting.
 func checkGap(klines []Kline, req Request, c plan.Chunk, now time.Time) error {
-	from, to := maxTime(c.Start, req.Start), minTime(c.End, req.End)
+	// Both operands of the min must be exclusive ends or the intersection is
+	// one nanosecond short at the tail, which would let a missing final candle
+	// pass as "outside the request".
+	from, to := maxTime(c.Start, req.Start), minTime(c.End, req.endExclusive())
 	if !from.Before(to) {
 		return nil // the chunk lies outside the request entirely
 	}
@@ -959,10 +982,18 @@ func checkGap(klines []Kline, req Request, c plan.Chunk, now time.Time) error {
 		return nil
 	}
 
+	// RFC3339Nano rather than RFC3339, and the reason is a message this once
+	// got wrong. The intersection is half-open and its end can now sit one
+	// nanosecond past a whole instant — a caller whose End is 2025-01-02T00:00
+	// is asking for the single candle that opens there, so the span checked is
+	// [2025-01-02T00:00:00Z, 2025-01-02T00:00:00.000000001Z). Formatted with
+	// RFC3339 both bounds print identically and the message reads as an empty
+	// range that somehow failed. RFC3339Nano omits trailing zeros, so every
+	// span that lands on a whole second still prints exactly as before.
 	return fmt.Errorf(
 		"%s %s [%s,%s): no candles from any source: %w",
 		req.Symbol, req.Interval,
-		from.Format(time.RFC3339), to.Format(time.RFC3339),
+		from.Format(time.RFC3339Nano), to.Format(time.RFC3339Nano),
 		ErrNotAvailable)
 }
 

@@ -411,9 +411,18 @@ type Progress struct {
 	// Done and Total meaningful.
 	Source Source
 
-	// Start and End are the half-open range the chunk covered. For an archive
-	// this is the archive's own extent, which is routinely wider than the part
-	// of it the request wanted.
+	// Start and End are the half-open range the chunk covered — Start
+	// included, End excluded. For an archive this is the archive's own
+	// extent, which is routinely wider than the part of it the request wanted.
+	//
+	// Note the mismatch with the Request above, and that it is deliberate.
+	// A [Request] is closed: the caller's End is included. A chunk is
+	// half-open, because chunks are the pieces a range is cut into and
+	// half-open pieces join without arithmetic — see [Request] on where each
+	// convention lives. These fields describe the pieces, so they use the
+	// pieces' convention, and a display that prints them alongside the
+	// request's own range should say so rather than let a reader assume the
+	// last candle of the chunk opened at End.
 	Start, End time.Time
 
 	// Klines is how many candles the chunk produced, before merging and

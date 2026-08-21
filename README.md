@@ -16,8 +16,11 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
 })
 ```
 
-Ranges are half-open — `Start` included, `End` excluded — so a full year of 2024
-is `Start` 2024-01-01 and `End` 2025-01-01.
+Ranges are closed — a candle is returned when `Start <= OpenTime <= End` — so a
+full year of 2024 is `Start` 2024-01-01 and `End` 2024-12-31T23:59:59.999999999Z.
+`End` reads most naturally as *the open time of the last candle you want*.
+Writing `End` 2025-01-01 is legal and asks for the candle that opens at midnight
+on New Year's Day, which costs January's archive to fetch.
 
 For a range too large to hold in memory, `loader.Stream(ctx, req)` yields the
 same candles one at a time; `loader.FetchAll(ctx, reqs)` runs several requests

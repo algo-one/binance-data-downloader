@@ -25,9 +25,10 @@
 //	    End:      end, // leave zero for "now, at call time"
 //	})
 //
-// Ranges are half-open: Start is included and End is excluded, so a full year
-// of 2024 is Start 2024-01-01 and End 2025-01-01. See [Request] for why that
-// matters more than it looks.
+// Ranges are closed: a candle is returned when Start <= OpenTime <= End, so a
+// full year of 2024 is Start 2024-01-01 and End 2024-12-31T23:59:59.999999999Z.
+// See [Request] for why the last instant is spelt out that way, and for what
+// End 2025-01-01 would fetch instead.
 //
 // [Loader.Stream] yields the same candles one at a time for a range too large
 // to hold at once, and [Loader.FetchAll] runs several requests under one

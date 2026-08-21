@@ -24,6 +24,22 @@ func utc(year int, month time.Month, day int, hms ...int) time.Time {
 	return time.Date(year, month, day, h, m, s, 0, time.UTC)
 }
 
+// upTo turns a half-open boundary into the closed [Request.End] that covers
+// exactly the same candles: the last instant before it.
+//
+// It exists so the tables below can go on naming the round boundary they mean —
+// "everything up to the 16th" — while asking for it in the convention Request
+// actually uses. Written out at each site as t.Add(-time.Nanosecond), the
+// intent would be buried in arithmetic 40 times over, and one of those forty
+// would eventually say -time.Millisecond.
+//
+// Note what does NOT use it: [plan.Chunk] bounds, [decodeSpec] bounds and
+// vision.KlineQuery bounds are all still half-open, because those are internal
+// seams. Only a Request is closed.
+func upTo(t time.Time) time.Time {
+	return t.Add(-time.Nanosecond)
+}
+
 // validRequest is the baseline the tables below mutate one field at a time, so
 // that each case states only what makes it interesting.
 func validRequest() Request {
@@ -32,7 +48,7 @@ func validRequest() Request {
 		Interval: Interval1h,
 		Market:   MarketSpot,
 		Start:    utc(2024, 1, 1),
-		End:      utc(2024, 2, 1),
+		End:      upTo(utc(2024, 2, 1)),
 	}
 }
 
@@ -106,11 +122,20 @@ func TestRequestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			// A half-open range [t, t) holds nothing. Returning zero candles
-			// and no error would leave the caller debugging the wrong layer,
-			// so the empty range is named as the mistake it almost always is.
-			name:    "an end equal to the start is rejected",
-			mutate:  func(r *Request) { r.End = r.Start },
+			// A closed range [t, t] holds one instant, and asks for the one
+			// candle that opens there. Under the half-open rule this spelling
+			// was empty by definition and had to be rejected; now it is a
+			// legitimate single-candle request, and refusing it would refuse
+			// something a caller can reasonably want.
+			name:   "an end equal to the start is a single-instant request",
+			mutate: func(r *Request) { r.End = r.Start },
+		},
+		{
+			// One nanosecond the other way is still an error, which is what
+			// pins the comparison down to the exact boundary rather than
+			// "roughly the right direction".
+			name:    "an end one nanosecond before the start is rejected",
+			mutate:  func(r *Request) { r.End = r.Start.Add(-time.Nanosecond) },
 			wantErr: true,
 		},
 	}
@@ -307,5 +332,47 @@ func TestRequestIsUsableAsAMapKey(t *testing.T) {
 
 	if seen[a] != 2 {
 		t.Errorf("count = %d, want 2", seen[a])
+	}
+}
+
+// TestEndExclusiveIsExactlyOneNanosecondPast covers the single point where the
+// library's two range conventions meet.
+//
+// Everything a caller writes is closed, [Start, End]; everything below the
+// public API is half-open, [Start, End). One function converts between them,
+// and the size of the step it takes is the whole argument for doing it this
+// way — so the step is asserted rather than assumed.
+func TestEndExclusiveIsExactlyOneNanosecondPast(t *testing.T) {
+	t.Parallel()
+
+	end := utc(2024, 2, 1)
+
+	req := validRequest()
+	req.End = end
+
+	got := req.endExclusive()
+
+	if want := end.Add(time.Nanosecond); !got.Equal(want) {
+		t.Errorf("endExclusive() = %s, want %s",
+			got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+
+	// A candle opening exactly at End is inside the exclusive bound. This is
+	// the property the conversion exists for, stated as the comparison the
+	// code below it actually performs.
+	if !end.Before(got) {
+		t.Errorf("a candle opening at End (%s) falls outside the exclusive bound %s",
+			end.Format(time.RFC3339Nano), got.Format(time.RFC3339Nano))
+	}
+
+	// And the step is smaller than any resolution Binance publishes in. The
+	// archives carry milliseconds, and microseconds since 2025, so a whole
+	// microsecond past End must already be outside the bound. If the step ever
+	// grew to a microsecond or more, a real candle could sit inside it and the
+	// range would silently gain one.
+	if end.Add(time.Microsecond).Before(got) {
+		t.Errorf("the exclusive bound %s is at least a microsecond past End (%s), "+
+			"which is wide enough to admit a real candle",
+			got.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
 	}
 }
