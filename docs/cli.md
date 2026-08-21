@@ -1,12 +1,11 @@
 # The `bmd` command-line tool
 
-> **Status:** the scaffold exists and the commands are stubs. They are
-> implemented in Stage 8. Run `bmd -h` to see the current surface.
-
 `bmd` is a thin shell over the library. Every flag maps onto a field of
-`binancedata.Request` or an option passed to `binancedata.NewLoader`; the CLI
-holds no logic of its own. Anything you can do here you can do from Go code, and
-vice versa.
+`binancedata.Request` or an option passed to `binancedata.NewLoader`, and the
+CLI holds no logic of its own beyond turning text into those values and candles
+into a file. Anything you can do here you can do from Go code, and vice versa —
+`bmd verify` is `Loader.VerifyCache`, `bmd list` is `Loader.Available`, and
+`--format parquet` is `binancedata.WriteParquet`.
 
 ## Build
 
@@ -23,67 +22,190 @@ Or install the released binary:
 go install github.com/algo-one/binance-data-downloader/cmd/bmd@latest
 ```
 
-## Available now
-
-```bash
-bmd -version    # print the module version
-bmd -h          # usage
-bmd help        # same, on stdout so it can be piped
-```
-
-## Planned commands (Stage 8)
-
-### `bmd download`
+## `bmd download`
 
 ```bash
 bmd download \
-  --symbol BTC/USDT --interval 1h \
-  --start 2024-01-01 --end 2024-03-31 \
-  --market spot \
-  --out ./data --format csv \
-  --cache-dir ~/.cache/bmd \
-  --concurrency 8
+  -symbol BTC/USDT -interval 1h \
+  -start 2024-01-01 -end 2024-03-31 \
+  -market spot \
+  -out ./data -format csv \
+  -cache-dir ~/.cache/bmd \
+  -concurrency 8
 ```
 
 | Flag | Meaning |
 | --- | --- |
-| `--symbol` | `BTC/USDT`, `BTC-USDT` or `BTCUSDT` — all normalised |
-| `--interval` | `1s` … `1mo`; validated against what Binance publishes |
-| `--start`, `--end` | `YYYY-MM-DD` or RFC 3339; interpreted as UTC |
-| `--market` | `spot` (the only implemented value today) |
-| `--out` | Output directory |
-| `--format` | `csv`, `json` or `parquet` |
-| `--cache-dir` | Where the two-tier cache lives |
-| `--concurrency` | Parallel downloads |
+| `-symbol` | `BTC/USDT`, `BTC-USDT` or `BTCUSDT` — all normalised |
+| `-interval` | `1s` … `1mo` (`1M` is accepted too); validated against what Binance publishes |
+| `-start`, `-end` | `YYYY-MM-DD` or RFC 3339, UTC. **Both ends are included** |
+| `-market` | `spot` (the only implemented value today) |
+| `-out` | A file, a directory, or `-` for stdout. Default: a generated name here |
+| `-format` | `csv`, `json` or `parquet` |
+| `-cache-dir` | Where the two-tier cache lives |
+| `-concurrency` | Parallel chunk fetches (default 8) |
+| `-quiet` | Print nothing to stderr but errors — no progress, no summary |
+| `-verbose` | Log what the pipeline is doing to stderr |
 
-### `bmd verify`
+### Both ends are included
+
+`-end 2024-03-31` covers **all** of the 31st. A bare date is expanded to that
+day's last instant, so it means the same thing at every interval — 24 candles of
+the 31st at `1h`, one at `1d`.
+
+This matters more than it looks, and it is why `Request.End` in the library is
+inclusive too. `End` is inclusive of an *instant*: a candle is returned when its
+open time is at or before it. Passing a bare `2024-03-31` straight through would
+return the single candle that opened at midnight, because that is the last open
+time at or before midnight — twenty-three candles short, with nothing to show
+for it.
+
+Writing `-end` as a full timestamp opts out of the expansion, since somebody who
+wrote the time has said which instant they mean:
 
 ```bash
-bmd verify --cache-dir ~/.cache/bmd
+bmd download -symbol BTC/USDT -interval 1h \
+  -start 2024-01-15T06:00:00Z -end 2024-01-15T18:00:00Z
 ```
 
-Re-hashes every cached tier-1 archive against its `.CHECKSUM` sidecar. The
-normal read path deliberately does not do this — see
-[caching.md](caching.md) — so this is how you check the cache on demand.
+### Where the file goes
 
-### `bmd list`
+Four spellings, in the order they are checked:
+
+| `-out` | Result |
+| --- | --- |
+| `-` | Standard output |
+| *(not given)* | `BTCUSDT-1h-2024-01-01_2024-03-31.csv` in the current directory |
+| an existing directory | that generated name, inside it |
+| anything else | exactly that file |
+
+Files are written through a temporary file in the same directory and renamed
+into place once the encoder finishes. An interrupted download therefore leaves
+nothing behind rather than a CSV that is silently short — or a parquet file with
+no footer, which is not a parquet file at all. Standard output gets no such
+protection, because there is nothing to rename.
+
+A second run with the same flags replaces the file. That is deliberate: running
+a download twice is the documented way to check the cache, and it must produce
+byte-identical output rather than an error.
+
+### Output formats
+
+All three carry the same eleven columns, in the same order, under the same
+names — `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`,
+`quote_volume`, `taker_buy_base_volume`, `taker_buy_quote_volume`, `trades`.
+
+**csv** has a header row. Times are RFC 3339 in UTC and keep their fractional
+seconds; prices and volumes are written exactly, never through a `float64`.
+
+**json** is one array of objects, streamed, so `bmd download … -out - | jq` works
+on a range too large to hold in memory. Every price and volume is a JSON
+*string*: a quote volume can reach twenty significant digits, and a bare JSON
+number that wide loses its tail in any consumer that parses into a `float64`,
+JavaScript included.
+
+**parquet** is the same schema the cache's second tier uses — `DECIMAL(38,8)`
+values and `TIMESTAMP(MICROS)` times — so DuckDB, Polars and pandas read it
+directly. It carries no source-archive stamp, because an export can come from
+many archives and the REST API at once and there is no single provenance to
+claim. Writing it to a terminal is refused; redirect it or use `-out`.
+
+Note that the values are numerically exact but not textually identical to
+Binance's own CSV: `42380.00000000` is written as `42380`. The number is the
+same one, with the trailing zeros the decimal type does not carry.
+
+## `bmd list`
 
 ```bash
-bmd list --symbol BTC/USDT --interval 1h
+bmd list -symbol BTC/USDT -interval 1mo
 ```
 
-Reports what Binance actually publishes for a symbol and interval, by querying
-the public S3 bucket listing. Useful for answering "how far back does this
-symbol go?" without downloading anything.
+```
+BTCUSDT 1mo spot
+
+monthly archives  105  2017-08-01 .. 2026-06-01  2 missing
+archives through       2026-07-01
+```
+
+Reports what Binance actually publishes, by asking the S3 bucket. Nothing is
+downloaded.
+
+The `missing` count is the point. Binance's archives have holes — as of
+2026-08-21, BTCUSDT's monthly `1mo` archives are missing **2024-03 and
+2026-03** while their neighbours exist — and no date arithmetic predicts that. A
+summary reporting only the first and last date would describe that range as
+complete. `-archives` prints every period with the holes marked in place:
+
+```bash
+bmd list -symbol BTC/USDT -interval 1mo -archives
+```
+
+`archives through` is the frontier: everything at or after it has to come from
+the REST API, because no archive covers it yet.
+
+`bmd list` takes no `-cache-dir` or `-concurrency`, because it opens no cache
+and makes no parallel fetches. A flag a command advertises and then ignores
+costs a debugging session to discover, so each command registers only what it
+honours.
+
+`-since 2024-01-01` bounds the answer *and* its cost. The bucket listing is
+seeked to it, so asking about one year is a single round trip where asking about
+a pair's whole history can be seven.
+
+## `bmd verify`
+
+```bash
+bmd verify                        # the default cache directory
+bmd verify -cache-dir ~/.cache/bmd
+bmd verify -rm                    # delete what fails
+bmd verify -quiet                 # failures only, no summary
+```
+
+Re-hashes every cached archive against the `.CHECKSUM` sidecar Binance published
+with it. The normal read path deliberately does not do this — see
+[caching.md](caching.md) — because re-hashing a 93 MB archive on every read
+would cost more than the parse the second tier exists to avoid. That leaves one
+gap, a file that was correct when written and rotted afterwards, and this is how
+it is closed.
+
+Failures are printed to stdout, one per line, and the exit status is 1 if there
+were any — so it works in a cron job. A clean cache prints nothing but the
+one-line summary on stderr.
+
+`-rm` deletes each failed archive **and its sidecar**, so the next download
+replaces them. The derived parquet is left alone: it carries the archive's
+published hash in its footer, so it is still valid data, and the cache is
+documented to keep serving from tier 2 when tier 1 has been pruned.
+
+Tier 2 is not walked, because it does not need to be. Every read checks the
+parquet footer against the archive's hash and the codec version and rebuilds
+when either fails, so tier 2 is verified continuously by the code that uses it.
+Tier 1 is the only tier nothing re-reads.
 
 ## Conventions
 
 **Ctrl-C stops promptly.** `SIGINT` and `SIGTERM` cancel the context that every
-download and every worker goroutine is running under, so an interrupted run
-stops immediately rather than finishing the current file.
+download and every worker goroutine runs under, so an interrupted run stops
+immediately rather than finishing the current file — and, because output is
+written through a temporary file, leaves no partial file behind.
 
-**stdout carries data, stderr carries everything else.** Usage text, progress
-and errors all go to stderr, so `bmd download ... --format csv > out.csv`
-produces a clean file. There is a test asserting this.
+**stdout carries data, stderr carries everything else.** Usage text, progress,
+the summary line and errors all go to stderr, so `bmd download … -out - -format
+csv > out.csv` produces a clean file. There is a test asserting it.
 
-**Exit status** is 0 on success (including `-h`), 1 on any failure.
+The one exception is `bmd verify`, whose failures *are* its output and go to
+stdout, so piping them into a file works.
+
+**Progress** is one redrawn line on a terminal and one line per chunk anywhere
+else, so a redirected stderr stays readable. It counts chunks rather than bytes,
+because that is what the library reports — see `Progress` in
+[architecture.md](architecture.md) for why there is no byte counter.
+
+**Exit status**
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success, including `-h` |
+| 1 | The work was attempted and failed |
+| 2 | The command line could not be acted on |
+| 130 | Interrupted (128 + `SIGINT`) |

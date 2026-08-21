@@ -1,0 +1,5 @@
+[
+  {"open_time":"2024-01-15T00:00:00Z","close_time":"2024-01-15T00:59:59.999Z","open":"42150.01","high":"42380.55","low":"42090.1","close":"42311.99","volume":"1234.56789012","quote_volume":"118661604939.99255335","taker_buy_base_volume":"600.12345678","taker_buy_quote_volume":"25389411.87654321","trades":98765},
+  {"open_time":"2024-01-15T01:00:00Z","close_time":"2024-01-15T01:59:59.999Z","open":"42150.01","high":"42380.55","low":"42090.1","close":"42311.99","volume":"1234.56789012","quote_volume":"118661604939.99255335","taker_buy_base_volume":"600.12345678","taker_buy_quote_volume":"25389411.87654321","trades":98766},
+  {"open_time":"2024-01-15T02:00:00Z","close_time":"2024-01-15T02:59:59.999Z","open":"42150.01","high":"42380.55","low":"42090.1","close":"42311.99","volume":"1234.56789012","quote_volume":"118661604939.99255335","taker_buy_base_volume":"600.12345678","taker_buy_quote_volume":"25389411.87654321","trades":98767}
+]

@@ -2,15 +2,16 @@
 //
 // It is a thin shell around the binancedata library: every flag maps onto a
 // field of binancedata.Request or an option passed to binancedata.NewLoader,
-// and the CLI itself holds no logic of its own. Anything you can do here you
-// can do from Go code, and vice versa.
+// and the CLI itself holds no logic of its own beyond turning text into those
+// values and candles into a file. Anything you can do here you can do from Go
+// code, and vice versa.
 //
 // Usage:
 //
 //	bmd [flags] <command> [command flags]
 //
-// The commands are stubs today; they arrive in a later stage. Run `bmd -h`
-// for the current surface.
+// The three commands are download, list and verify. Run `bmd help` for the
+// summary and `bmd <command> -h` for a command's own flags.
 package main
 
 // A directory under cmd/ that declares `package main` becomes an executable.
@@ -35,18 +36,40 @@ import (
 	binancedata "github.com/algo-one/binance-data-downloader"
 )
 
-// Process exit statuses. Distinct codes per failure class can be added later
-// if scripts need to tell them apart.
+// Process exit statuses.
+//
+// Four rather than two, because a script wrapping this tool wants to tell them
+// apart. "I typed the command wrong" and "Binance is down" call for completely
+// different responses, and a shell can only see the number.
 const (
-	exitOK      = 0
+	exitOK = 0
+
+	// exitFailure is the catch-all: the work was attempted and did not
+	// succeed. A missing archive, a checksum mismatch, an unwritable output
+	// file, a cache with bad files in it.
 	exitFailure = 1
+
+	// exitUsage is for a command line that could not be acted on at all — an
+	// unknown flag, a missing required one, a date that will not parse. It is
+	// 2 because that is what getopt, and therefore most of Unix, uses.
+	exitUsage = 2
+
+	// exitInterrupted is Ctrl-C. The shell convention is 128 plus the signal
+	// number, and SIGINT is 2. Reporting it distinctly is what lets a script
+	// tell "the user stopped it" from "it failed", which matters most in the
+	// case where those look identical: a partial download.
+	exitInterrupted = 130
 )
 
-// errNotImplemented is returned by the command stubs. Declaring it once as a
-// package-level variable — rather than building the same string inline in
-// three places — is the Go convention for an error a caller might want to
-// recognise with errors.Is.
-var errNotImplemented = errors.New("not implemented yet")
+// errUsage marks an error as being about the command line rather than about the
+// work. It is never returned on its own — it is wrapped around a message that
+// says what was wrong — and its only job is to select an exit status.
+var errUsage = errors.New("usage")
+
+// usagef builds a usage error, since every call site does the same two things.
+func usagef(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", errUsage, fmt.Sprintf(format, args...))
+}
 
 // main is deliberately one line.
 //
@@ -77,10 +100,18 @@ func cli() int {
 	// run takes its output streams as parameters rather than reaching for the
 	// os globals, so a test can pass a bytes.Buffer and assert on what was
 	// printed.
-	//
-	// This is a switch with an initialiser and no tag value: `err` is scoped
-	// to the switch, and each case is a boolean expression.
-	switch err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); {
+	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+
+	return report(err, os.Stderr)
+}
+
+// report prints an error if there is one and returns the exit status for it.
+//
+// It is split out of cli so that the mapping from error to status is one
+// switch a test can drive directly, rather than something only reachable by
+// starting a process.
+func report(err error, stderr io.Writer) int {
+	switch {
 	case err == nil:
 		return exitOK
 
@@ -90,13 +121,26 @@ func cli() int {
 		// asking for help is not a failure.
 		return exitOK
 
+	case errors.Is(err, context.Canceled):
+		// Ctrl-C. Say something, because a command that stops mid-download and
+		// prints nothing is indistinguishable from one that finished.
+		//
+		// The blank assignment is deliberate and is how you tell both a reader
+		// and the errcheck linter that an error is being ignored on purpose.
+		// If writing to stderr fails there is no second channel on which to
+		// report that — the reporting channel is the thing that broke.
+		_, _ = fmt.Fprintln(stderr, "bmd: interrupted")
+
+		return exitInterrupted
+
+	case errors.Is(err, errUsage):
+		_, _ = fmt.Fprintf(stderr, "bmd: %v\n", err)
+
+		return exitUsage
+
 	default:
-		// The blank assignment is deliberate and is how you tell both a
-		// reader and the errcheck linter that an error is being ignored on
-		// purpose. If writing the error message to stderr fails, there is no
-		// second channel on which to report that — the reporting channel is
-		// the thing that broke.
-		_, _ = fmt.Fprintf(os.Stderr, "bmd: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "bmd: %v\n", err)
+
 		return exitFailure
 	}
 }
@@ -126,7 +170,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.Usage = func() { writeUsage(stderr) }
 
 	if err := fs.Parse(args); err != nil {
-		// Includes flag.ErrHelp for -h, which main treats as success.
+		// Includes flag.ErrHelp for -h, which report treats as success.
 		return err
 	}
 
@@ -135,6 +179,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		// into something. A failed write is a genuine failure, so it is
 		// returned rather than ignored.
 		_, err := fmt.Fprintln(stdout, binancedata.Version())
+
 		return err
 	}
 
@@ -143,7 +188,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	rest := fs.Args()
 	if len(rest) == 0 {
 		writeUsage(stderr)
-		return errors.New("no command given")
+
+		return usagef("no command given")
 	}
 
 	// If a signal arrived while we were parsing, stop before doing any work.
@@ -151,35 +197,31 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	// rest[0] is the command; rest[1:] will become the arguments each
-	// subcommand parses with its own flag.FlagSet once they are implemented.
-	command := rest[0]
+	command, args := rest[0], rest[1:]
 
 	// Go's switch needs no `break`; cases do not fall through unless you write
 	// an explicit `fallthrough`.
 	switch command {
 	case "download":
-		// Stage 8: fetch a range and write it as csv, json or parquet.
-		return fmt.Errorf("download: %w", errNotImplemented)
-
-	case "verify":
-		// Stage 8: re-hash every cached archive against its .CHECKSUM sidecar.
-		return fmt.Errorf("verify: %w", errNotImplemented)
+		return download(ctx, args, stdout, stderr)
 
 	case "list":
-		// Stage 8: report what Binance actually publishes for a symbol and
-		// interval, by querying the public S3 listing.
-		return fmt.Errorf("list: %w", errNotImplemented)
+		return list(ctx, args, stdout, stderr)
+
+	case "verify":
+		return verify(ctx, args, stdout, stderr)
 
 	case "help":
 		writeUsage(stdout)
+
 		return nil
 
 	default:
 		writeUsage(stderr)
+
 		// %q quotes the command so a stray quote or space in the argument is
 		// visible in the message rather than silently confusing.
-		return fmt.Errorf("unknown command %q", command)
+		return usagef("unknown command %q", command)
 	}
 }
 
@@ -197,14 +239,23 @@ Usage:
 
 Commands:
   download    Download candles for a symbol and time range
-  verify      Re-verify cached archives against their checksums
   list        Show what Binance publishes for a symbol and interval
+  verify      Re-hash cached archives against their checksums
   help        Show this help
 
 Flags:
   -version    Print the version and exit
   -h, -help   Show this help
 
-The commands are not implemented yet; this is the Stage 0 scaffold.
+Run 'bmd <command> -h' for a command's own flags.
+
+Examples:
+  bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
+  bmd download -symbol BTC/USDT -interval 1d -start 2024-01-01 -format json -out -
+  bmd list -symbol BTC/USDT -interval 1h
+  bmd verify
+
+Dates are UTC. A bare -end date includes that whole day.
+Data goes to stdout only when -out is "-"; everything else goes to stderr.
 `)
 }

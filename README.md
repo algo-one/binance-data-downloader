@@ -26,10 +26,23 @@ For a range too large to hold in memory, `loader.Stream(ctx, req)` yields the
 same candles one at a time; `loader.FetchAll(ctx, reqs)` runs several requests
 under one concurrency budget and deduplicates the archives they share.
 
-> **Status: under construction.** Stages 0–7 are complete: the library API above
-> works today. The `bmd` command-line tool is Stage 8 and its subcommands are
-> still stubs — see [docs/architecture.md](docs/architecture.md) for the staged
-> plan.
+## Command line
+
+```bash
+mise run build
+
+bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
+bmd list     -symbol BTC/USDT -interval 1mo      # what Binance actually publishes
+bmd verify                                        # re-hash the cache
+```
+
+`-start` and `-end` are both inclusive, and a bare `-end` date covers that whole
+day. Output is csv, json or parquet. See [docs/cli.md](docs/cli.md).
+
+> **Status: under construction.** Stages 0–8 are complete: the library API above
+> and the `bmd` tool both work today. Stage 9 is documentation, runnable
+> examples and a v0.1.0 release — see
+> [docs/architecture.md](docs/architecture.md) for the staged plan.
 
 ## Why
 

@@ -1,10 +1,9 @@
 # Architecture
 
-> **Status:** design document. Stages 0 (scaffolding), 1 (domain types),
-> 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache),
-> 6 (REST fetcher) and 7 (loader orchestration) are complete; the packages
-> described below arrive stage by stage. Sections marked *planned* describe code
-> that does not exist yet.
+> **Status:** Stages 0 (scaffolding), 1 (domain types), 2 (time and
+> availability), 3 (parsing), 4 (downloader), 5 (cache), 6 (REST fetcher),
+> 7 (loader orchestration) and 8 (CLI) are complete. Everything described below
+> exists. Stage 9 is documentation and release.
 
 ## What the library does
 
@@ -50,7 +49,12 @@ Findings from probing it directly on 2026-08-18, all of which shape the code:
 
 - **The archives have holes.** `BTCUSDT-1mo-2024-03.zip` does not exist, while
   `2024-02` and `2024-04` both do. No date arithmetic predicts a missing month
-  in the middle of a published range; only the listing reveals it.
+  in the middle of a published range; only the listing reveals it. **A second
+  hole turned up on 2026-08-21**, when `bmd list -symbol BTC/USDT -interval 1mo
+  -archives` was run against the live bucket for the first time: `2026-03` is
+  missing as well, out of 105 published months. Two holes rather than one is
+  what turns this from an anecdote into a rate — roughly one month in fifty is
+  absent, on the most heavily traded pair Binance has.
 - **The interval availability tables in the Python source are wrong.** They
   declare `1s` daily-only. Binance publishes `1s` monthly archives too —
   `BTCUSDT-1s-2024-03.zip` is 93 MB of real data. See `interval.go`.
@@ -756,6 +760,13 @@ again, which is what it was always documented to be.
 │       └── limiter.go   x/time/rate, sized to that endpoint's quota
 │
 ├── cmd/bmd/          the CLI binary
+│   ├── main.go       command dispatch, exit statuses, signal handling
+│   ├── flags.go      dates → time.Time, shared flags → loader options
+│   ├── download.go   flags → Request, Stream → an encoder
+│   ├── list.go       Loader.Available, rendered
+│   ├── verify.go     Loader.VerifyCache, rendered
+│   ├── output.go     csv/json/parquet encoders; destinations; atomic writes
+│   └── progress.go   the one-line terminal display
 ├── testdata/         real archives, byte-untouched (see its README)
 └── docs/
 ```
@@ -842,6 +853,35 @@ func (l *Loader) Fetch(ctx context.Context, req Request) ([]Kline, error)
 func (l *Loader) FetchAll(ctx context.Context, reqs []Request) (map[Request][]Kline, error)
 func (l *Loader) Stream(ctx context.Context, req Request) iter.Seq2[Kline, error]
 
+// Added in Stage 8, because the CLI could not otherwise be a thin shell.
+func (l *Loader) Available(ctx context.Context, q AvailabilityQuery) (Availability, error)
+func (l *Loader) VerifyCache(ctx context.Context) iter.Seq2[CacheEntry, error]
+func WriteParquet(ctx context.Context, w io.Writer, seq iter.Seq2[Kline, error]) (int, error)
+
+type AvailabilityQuery struct {
+    Symbol   string
+    Interval Interval
+    Market   Market
+    Since    time.Time // optional; bounds the answer and its cost
+}
+
+type Availability struct {
+    Symbol          string
+    Interval        Interval
+    Market          Market
+    Monthly, Daily  []time.Time // start instants, ascending
+    ArchivesThrough time.Time   // first instant no archive covers
+}
+
+func (a Availability) MonthlyGaps() []time.Time
+func (a Availability) DailyGaps() []time.Time
+
+type CacheEntry struct {
+    Path string // the archive on disk
+    Size int64
+    Err  error  // nil if it hashes to what its sidecar says
+}
+
 type Progress struct {
     Request     Request   // the request this work belongs to, resolved
     Source      Source    // monthly archive, daily archive or REST
@@ -922,6 +962,81 @@ the stateful step.
 so five years of one-minute candles is roughly 820 MB held at once. A backtest
 can consume candles without materialising the range.
 
+## The command line
+
+`bmd` is three commands over the library, and the interesting part of building
+it was discovering that two of them had nothing to call.
+
+### The CLI needed public API before it could be a thin shell
+
+`docs/cli.md` has always promised that the tool holds no logic of its own and
+that anything it can do can be done from Go code. That was not achievable as the
+API stood. `cmd/bmd` is a separate package, so it sees only exported
+identifiers, and:
+
+- `bmd verify` needs the sidecar parser and the cache tree layout — `readSidecar`
+  and `cachePaths`, both unexported.
+- `bmd list` needs the bucket index — `fetchArchiveIndex` and `archiveIndex`,
+  both unexported.
+- `--format parquet` needs the schema — `writeKlines`, `parquetRow`,
+  `encodeDecimal`, all unexported, and `writeKlines` refuses to write without a
+  `parquetStamp` naming a source archive that an export does not have.
+
+The alternative was to reimplement each of those inside the CLI, which would
+have put the parquet schema in the repository twice and given the tool three
+capabilities its own library could not offer. So Stage 8 added three small
+public APIs instead, listed above. One thing worth noting for future work: the
+Stage 2 rule that a package stays under `internal/` only if it needs no domain
+types governs what the **root** imports. A package imported only by `cmd/` may
+import the root package freely — there is no cycle — so an `internal/output`
+speaking `[]Kline` would have been legal. It was not needed once the three
+functions existed.
+
+### The CLI cannot test the pipeline, and should not
+
+The options that aim a `Loader` at an `httptest.Server` — `withTestHosts`,
+`withClock`, `withPolicy`, `withLimiter` — are unexported, deliberately: they
+are a test seam, not API. A test in `package main` therefore cannot build a
+Loader that talks to a fake Binance.
+
+That is the right constraint rather than a problem to route around. The pipeline
+is already covered end to end in `loader_test.go`, against three fake hosts and
+real archives. What is left for the CLI is everything between a command line and
+that pipeline, and that is what its tests cover: `newLoader` is a package
+variable holding a factory, the commands talk to a three-method `loader`
+interface declared beside them, and the tests supply their own implementation.
+The encoders are pinned with golden files, because the thing under test is an
+exact document — a test asserting "the output contains open_time" would pass on
+output with the columns in the wrong order or a price rounded through a float64.
+
+### Decisions worth recording
+
+**`-end` is inclusive, and a bare date covers the whole day.** This is the
+reason `Request.End` became inclusive; the reasoning is in the closed-range
+section above. The expansion is what makes the two agree at every interval, and
+it also puts the library's exclusive bound exactly on a chunk seam, so the plan
+is identical to the one the old half-open spelling produced.
+
+**Output is written through a temporary file and renamed.** A download
+interrupted halfway otherwise leaves a CSV that is silently short. The stakes
+differ by format and neither is acceptable: a truncated CSV looks complete, and
+a parquet file whose footer was never written is not a parquet file. A second
+run replaces the file rather than refusing, because running a download twice is
+the documented way to check the cache and must produce byte-identical output.
+
+**The clock is read in `buildRequest`.** It is the only place in the project
+that reads one inside logic, and the layer where that is correct: everything
+below takes its time as a parameter precisely so the reading happens once, at
+the edge. `Request` documents a preference for leaving `End` zero, which is
+right for a long-running process that stores a request and wrong for a CLI —
+resolving it here is what makes the generated file name, the summary line and
+the candles describe the same instant.
+
+**`bmd verify` walks tier 1 only.** Tier 2 is checked on every read against the
+archive's hash and the codec version, and rebuilt when either fails, so it is
+verified continuously by the code that uses it. Tier 1 is the only tier nothing
+re-reads, which is what makes it the one worth a command.
+
 ## Scope
 
 **Spot klines only**, with three deliberate extension points so futures is an
@@ -992,7 +1107,7 @@ because they are easy to get subtly wrong and silent when they are.
 | 6 | Header presence is **sniffed per file**, never hardcoded per market | 3 ✅ |
 | 7 | The timestamp unit is detected **per row**, so a file spanning the 2025 ms→µs switch parses correctly | 3 ✅ |
 | 8 | One `http.Client` is shared for the process, so connections are reused rather than reopened per request | 4 ✅ |
-| 9 | Checksums are **verified**, not merely stored — at download time, and on demand via `bmd verify` | 4 ✅ (download) → 8 (`bmd verify`) |
+| 9 | Checksums are **verified**, not merely stored — at download time, and on demand via `bmd verify` | 4 ✅ (download) → 8 ✅ (`bmd verify`) |
 | 10 | Cache writes are atomic: temp file in the destination directory, then `rename`. A crash never leaves a torn file | 5 ✅ |
 
 Two rules that apply everywhere rather than to one stage: validation lives in a
@@ -1012,7 +1127,7 @@ setting is a defect, not a stub.
 | 5 | Two-tier cache — ZIP + `.CHECKSUM` with atomic writes; footer-stamped Parquet; `singleflight` | **done** |
 | 6 | REST fetcher — pagination for the recent tail, rate limiting | **done** |
 | 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | **done** |
-| 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress | |
+| 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress, `bmd verify`, `bmd list` | **done** |
 | 9 | Docs and release — runnable examples, pkg.go.dev polish, v0.1.0 | |
 
 ## Dependencies

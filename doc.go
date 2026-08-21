@@ -34,10 +34,18 @@
 // to hold at once, and [Loader.FetchAll] runs several requests under one
 // concurrency budget, downloading whatever they have in common exactly once.
 //
+// Three more calls answer questions that are not "give me candles".
+// [Loader.Available] reports what Binance actually publishes for a symbol and
+// interval, holes included — the archives have them, and no calendar predicts
+// which. [Loader.VerifyCache] re-hashes cached archives against the checksums
+// they were published with. [WriteParquet] writes candles in the same format
+// the cache stores its second tier in, for a query engine to read.
+//
 // # Status
 //
-// The library is complete as of Stage 7. The bmd command-line tool is Stage 8
-// and its subcommands are still stubs. See docs/architecture.md for the plan.
+// The library and the bmd command-line tool are both complete as of Stage 8.
+// Stage 9 is documentation, runnable examples and a v0.1.0 release. See
+// docs/architecture.md for the plan.
 //
 // # Where the data comes from
 //
