@@ -41,11 +41,21 @@
 // they were published with. [WriteParquet] writes candles in the same format
 // the cache stores its second tier in, for a query engine to read.
 //
-// # Status
+// # Examples
 //
-// The library and the bmd command-line tool are both complete as of Stage 8.
-// Stage 9 is documentation, runnable examples and a v0.1.0 release. See
-// docs/architecture.md for the plan.
+// example_test.go carries a worked example for most of the surface above, and
+// they are the fastest way in. Seven of them execute on every test run with
+// their printed output checked — the pure ones, which need no network — and the
+// rest are compiled but not run, because running them would mean fetching from
+// Binance and no test in this repository does that. Both kinds are checked by
+// the compiler, so an example naming a field that no longer exists fails the
+// build rather than misleading somebody.
+//
+// # Stability
+//
+// The version is v0.x. Everything documented here works and is tested, but the
+// API carries no compatibility promise yet: a v0.2.0 may rename something a
+// v0.1.0 caller used. Pin an exact version if that matters.
 //
 // # Where the data comes from
 //

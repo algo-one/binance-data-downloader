@@ -1,9 +1,10 @@
 # Architecture
 
-> **Status:** Stages 0 (scaffolding), 1 (domain types), 2 (time and
-> availability), 3 (parsing), 4 (downloader), 5 (cache), 6 (REST fetcher),
-> 7 (loader orchestration) and 8 (CLI) are complete. Everything described below
-> exists. Stage 9 is documentation and release.
+> **Status:** all nine stages are complete — 0 (scaffolding), 1 (domain types),
+> 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache), 6 (REST
+> fetcher), 7 (loader orchestration), 8 (CLI) and 9 (documentation and release).
+> Everything described below exists. The remaining step is the v0.1.0 tag
+> itself.
 
 ## What the library does
 
@@ -1037,6 +1038,94 @@ archive's hash and the codec version, and rebuilt when either fails, so it is
 verified continuously by the code that uses it. Tier 1 is the only tier nothing
 re-reads, which is what makes it the one worth a command.
 
+## Documentation and release
+
+Stage 9 found most of its own deliverables already built — `doc.go`, the README
+and the five documents in `docs/` were written in Stage 0 and kept current by
+every stage since, and `revive`'s `exported` rule has meant since Stage 0 that
+no exported identifier can ship without a doc comment. What was left was the
+examples, one deferred API change, and the release machinery.
+
+### Examples are compiled; only some of them run
+
+`example_test.go` holds fifteen, in `package binancedata_test` so that they can
+reach only exported identifiers — worth having the compiler check in a
+repository where half the code is under `internal/`.
+
+They split in two, and the split is forced rather than chosen. `go test` runs an
+example only when it ends in an `// Output:` comment, and an example that calls
+`Fetch` could only produce output by fetching from Binance, which no test here
+does. So the seven examples over pure logic — `ParseInterval`,
+`NormalizeSymbol`, `Interval.HasDailyArchives`, `Interval.Duration`,
+`Request.Validate`, `Availability.MonthlyGaps`, `Closes` — carry an `// Output:`
+block and are assertions. The eight that hold a `Loader` do not.
+
+Pointing the second group at an `httptest.Server` would make them executable —
+`WithHTTPClient` is public, so a fake transport is reachable from the external
+test package — and it is deliberately not done. Example source is what a reader
+sees on the documentation page, and a screenful of test-server plumbing teaches
+nothing about calling `Fetch`. The coverage is already bought by
+`loader_test.go`, which stands up three fake hosts and counts what each is
+asked for.
+
+Compile-checking is stronger than it sounds: `go vet` binds every example name
+to a real identifier. Renaming `ExampleLoader_Stream` to `ExampleLoader_Streem`
+fails with *"refers to unknown field or method: Loader.Streem"*, so a renamed
+method breaks the build rather than the documentation.
+
+### `Option` became an interface
+
+Deferred from Stage 7 on the grounds that documentation polish was Stage 9's
+remit, and done here because a tag makes the representation permanent.
+
+`type Option func(*loaderConfig) error` published a signature naming a type no
+other package can see, so the generated documentation rendered the declaration
+as an instruction the reader cannot follow — the private config leaking out
+through the one place it was meant to stay behind. It is now an interface with a
+single unexported `apply` method and an unexported `optionFunc` adapter, which
+renders as a named type with its contents filtered out. Callers are unaffected:
+every `With*` signature is unchanged, and there was never a way to build an
+`Option` by hand.
+
+This is the same question Stage 2 answered when it rejected the `internal/core`
+alias: an identifier the documentation names but the reader cannot reach is
+worse than one it never mentions.
+
+### The version comes from the tag, and nothing else
+
+`version.go` has always read `debug.ReadBuildInfo` rather than a constant, and
+Stage 9 measured what that actually yields, because it decides whether the
+release pipeline has to inject anything:
+
+| Build | `Version()` |
+| --- | --- |
+| `go run ./cmd/bmd` | `(devel)` |
+| `go build -buildvcs=false` | `(devel)` |
+| `go build`, untagged commit | `v0.0.0-20260821114356-2970247f722f` |
+| `go build`, clean tree at a tag | the tag |
+| `go build`, dirty tree at a tag | the tag, plus `+dirty` |
+
+Since Go 1.24 the toolchain reads version control and stamps what it finds, so
+a checkout at `v0.1.0` produces a binary reporting `v0.1.0` with no `-ldflags`
+involved. `.goreleaser.yaml` therefore overrides goreleaser's default ldflags,
+which would otherwise inject `-X main.version` and create a second source of
+truth for the same number. The `+dirty` suffix is a bonus: a binary built from
+uncommitted changes says so instead of impersonating the release.
+
+### goreleaser is configured but not wired to CI
+
+`.goreleaser.yaml` cross-compiles `bmd` for darwin and linux on amd64 and arm64
+— matching the CI matrix rather than reaching wider, since an artefact for a
+platform nothing tests is a promise made without evidence — archives each with
+the licence and `docs/cli.md`, and writes one `checksums.txt`.
+
+There is no release workflow. The repository is private and its audience
+installs with `go install`, so prebuilt binaries are not needed yet. What is
+needed is a release config that has been *run* before the day it matters, which
+is what `mise run release:snapshot` is for: it builds all four platforms and
+publishes nothing. A release config first executed on release day is the one
+piece of a project guaranteed to be untested when it counts.
+
 ## Scope
 
 **Spot klines only**, with three deliberate extension points so futures is an
@@ -1128,7 +1217,7 @@ setting is a defect, not a stub.
 | 6 | REST fetcher — pagination for the recent tail, rate limiting | **done** |
 | 7 | Loader orchestration — plan/execute/reduce, bounded pool, progress, `Fetch`/`FetchAll`/`Stream` | **done** |
 | 8 | CLI — `cmd/bmd`, csv/json/parquet output, progress, `bmd verify`, `bmd list` | **done** |
-| 9 | Docs and release — runnable examples, pkg.go.dev polish, v0.1.0 | |
+| 9 | Docs and release — runnable examples, `Option` as an interface, goreleaser | **done** |
 
 ## Dependencies
 
@@ -1167,6 +1256,11 @@ and cross-compilation.
   through, are synthesised in the test itself.
 - **`t.TempDir()`** for all cache tests.
 - **Golden files** for CLI output and for reproducible Parquet.
+- **Runnable examples** double as tests. Seven of the fifteen in
+  `example_test.go` execute with their output checked; all fifteen are compiled,
+  and `go vet` binds each example's name to a real identifier, so a rename
+  breaks the build. See "Documentation and release" above for why the other
+  eight cannot run.
 - **`-race`** on every run.
 - **A frozen clock** — time is injected, never read from `time.Now()` inside
   logic, so calendar rules are testable. The retry policy carries its timer and

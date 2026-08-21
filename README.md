@@ -3,6 +3,12 @@
 Download and cache historical Binance market data — as a Go library and as a
 command-line tool.
 
+> **Status: complete and private.** The library and the `bmd` tool both work,
+> and the repository is not public — so `go get` needs a little setup, and there
+> is no pkg.go.dev page. See [Install](#install) for the former and
+> `go doc` for the latter. The version is v0.x: the API is settled but not
+> promised.
+
 ```go
 // No options needed: the cache lands in the OS cache directory.
 loader, err := binancedata.NewLoader()
@@ -39,11 +45,6 @@ bmd verify                                        # re-hash the cache
 `-start` and `-end` are both inclusive, and a bare `-end` date covers that whole
 day. Output is csv, json or parquet. See [docs/cli.md](docs/cli.md).
 
-> **Status: under construction.** Stages 0–8 are complete: the library API above
-> and the `bmd` tool both work today. Stage 9 is documentation, runnable
-> examples and a v0.1.0 release — see
-> [docs/architecture.md](docs/architecture.md) for the staged plan.
-
 ## Why
 
 Binance publishes bulk historical klines as ZIP archives at
@@ -78,19 +79,37 @@ framework, so the CLI is a thin shell over it rather than the other way round.
 
 ## Install
 
-As a library:
+Requires Go 1.25.0 or newer.
+
+The repository is private, so two things have to be arranged first. Go defaults
+to fetching modules through `proxy.golang.org` and checking them against
+`sum.golang.org`, neither of which can see a private repository; and it fetches
+over HTTPS, where a private repository asks for credentials Go cannot supply.
+Both are one-time settings:
+
+```bash
+# Fetch anything under this org straight from the source, skipping the public
+# proxy and checksum database. See `go help private`.
+go env -w GOPRIVATE=github.com/algo-one/*
+
+# Use the SSH key you already push with, instead of HTTPS.
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+```
+
+Then, as a library:
 
 ```bash
 go get github.com/algo-one/binance-data-downloader
 ```
 
-As a CLI:
+Or as a CLI:
 
 ```bash
 go install github.com/algo-one/binance-data-downloader/cmd/bmd@latest
 ```
 
-Requires Go 1.25.0 or newer.
+Neither line changes if the repository is made public later — the two settings
+above simply stop being necessary.
 
 ## Development
 
@@ -113,15 +132,37 @@ mise tasks      # list everything below
 | `mise run fmt:check` | Fail if anything is unformatted (CI uses this) |
 | `mise run cover` | Test with coverage and open the HTML report |
 | `mise run tidy` | Sync `go.mod` with the imports in the code |
+| `mise run audit` | Check dependencies against the Go vulnerability database |
+| `mise run release:snapshot` | Build the release artefacts locally, publishing nothing |
 | `mise run ci` | Everything CI runs, in order |
 
 ## Documentation
+
+**API reference.** A private module gets no pkg.go.dev page, so read it from the
+source instead — the doc comments are the same ones pkg.go.dev would render:
+
+```bash
+go doc github.com/algo-one/binance-data-downloader          # the package overview
+go doc github.com/algo-one/binance-data-downloader.Loader   # one type
+
+# pkg.go.dev itself, served from this directory. It is not part of the
+# toolchain, so `go run` fetches it on demand rather than it being a
+# dependency of this module.
+go run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
+```
+
+`example_test.go` holds fifteen worked examples, and they are the fastest way in
+— seven of them execute on every test run with their output checked, so they
+cannot quietly become wrong.
+
+**Longer form:**
 
 | Document | Contents |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | How the pieces fit together, and the staged build plan |
 | [docs/caching.md](docs/caching.md) | The two-tier cache, its invariants, and why it exists |
 | [docs/cli.md](docs/cli.md) | The `bmd` command-line tool |
+| [docs/numbers.md](docs/numbers.md) | Why prices are decimals, and what the alternatives measured |
 | [docs/go-notes.md](docs/go-notes.md) | The Go idioms this codebase leans on, in one place |
 
 The code itself is commented far more heavily than typical Go. That is
