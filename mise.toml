@@ -34,6 +34,11 @@ gotestsum = "1.13.0"
 # actually *call* the vulnerable function, so it reports far fewer false alarms.
 # The "go:" backend means mise builds it from source with the Go toolchain above.
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.6.0"
+# goreleaser builds the release artefacts — cross-compiled bmd binaries, their
+# archives and a checksum file. Pinned here rather than installed ad hoc so that
+# `mise run release:snapshot` produces the same output on any machine, which is
+# the only way a release config can be reviewed before it is used for real.
+goreleaser = "2.17.1"
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -93,6 +98,17 @@ run = "go mod tidy"
 [tasks.audit]
 description = "Check dependencies against the Go vulnerability database"
 run = "govulncheck ./..."
+
+[tasks."release:snapshot"]
+description = "Build the release artefacts locally without publishing anything"
+# The safe way to exercise .goreleaser.yaml. --snapshot invents a version rather
+# than requiring a git tag, and skips every publishing step; --clean wipes dist/
+# first so what lands there is only from this run.
+#
+# Run this after touching .goreleaser.yaml. A release config is the one piece of
+# a project that is normally first executed on the day it matters most, and this
+# is what takes that property away.
+run = "goreleaser release --snapshot --clean"
 
 [tasks.ci]
 description = "Everything CI runs, in the same order"

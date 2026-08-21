@@ -1,6 +1,11 @@
 # Compiled output. `mise run build` writes here; nothing in it belongs in git.
 /bin/
 
+# goreleaser's output. `mise run release:snapshot` fills this with binaries and
+# archives for four platforms — a few hundred megabytes, all reproducible from
+# a tag.
+/dist/
+
 # Test and coverage artefacts.
 cover.out
 coverage.html

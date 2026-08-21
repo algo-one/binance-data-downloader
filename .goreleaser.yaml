@@ -1,0 +1,138 @@
+# Release configuration for the bmd command-line tool.
+#
+# goreleaser cross-compiles the binary, packs each build into an archive with
+# the licence and the docs, writes a checksum file over all of them, and — when
+# run without --snapshot at a git tag — uploads the lot to a GitHub release.
+#
+# # What is deliberately not here
+#
+# There is no GitHub Actions workflow driving this. The repository is private
+# and its audience is one person plus one Go program, both of which install with
+# `go install`, so prebuilt binaries are not needed yet. What is needed is a
+# release config that has been *run* before the day it matters: `mise run
+# release:snapshot` builds everything below and publishes nothing, so this file
+# is reviewable rather than aspirational. Adding the workflow later is one file
+# and no change here.
+#
+# Reference: https://goreleaser.com/customization/
+version: 2
+
+project_name: bmd
+
+before:
+  hooks:
+    # Not `go mod tidy`, which is goreleaser's own suggestion. A release must
+    # not be able to edit go.mod on its way out — if tidy has something to say,
+    # that is a commit to make and review, not a side effect of tagging.
+    # `download` fetches the same modules and changes nothing.
+    - go mod download
+
+builds:
+  - id: bmd
+    main: ./cmd/bmd
+    binary: bmd
+
+    # Nothing in the dependency graph needs cgo — parquet-go is pure Go and
+    # DuckDB was ruled out for exactly this reason — so the binaries link
+    # statically and cross-compile from any host without a C toolchain.
+    env:
+      - CGO_ENABLED=0
+
+    # macOS and Linux, on both architectures. This matches the CI matrix rather
+    # than reaching wider: an artefact for a platform nothing tests is a promise
+    # made without evidence. Windows is absent for the same reason — the cache
+    # layer touches paths and file permissions, and no CI job exercises it
+    # there.
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+    flags:
+      # Replaces the build machine's absolute paths in the binary with the
+      # module path, so two people building the same tag get the same bytes.
+      - -trimpath
+
+    # -s -w drop the symbol table and DWARF, which is a few megabytes off each
+    # binary. They do not affect `bmd -version`: the module version lives in the
+    # separate .go.buildinfo section, which the linker leaves alone.
+    #
+    # Note what is *not* here. goreleaser's default ldflags inject
+    # `-X main.version={{.Version}}`, and this project has no such variable to
+    # inject into, on purpose. version.go reads the version the Go toolchain
+    # stamps from the git tag, so goreleaser building a checkout at v0.1.0
+    # produces a binary reporting v0.1.0 with nothing passed in — measured, and
+    # written up in version.go. An -X flag here would be a second source of
+    # truth for the same number.
+    ldflags:
+      - -s -w
+
+    # Give every file in the build the commit's timestamp instead of the build
+    # machine's clock, so rebuilding a tag next year produces identical
+    # archives.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: bmd
+    ids:
+      - bmd
+
+    # tar.gz everywhere. There is no Windows build to need a zip.
+    formats:
+      - tar.gz
+
+    # bmd_0.1.0_darwin_arm64.tar.gz. Lowercase OS and arch because that is what
+    # the Go toolchain calls them, so the filename matches GOOS/GOARCH rather
+    # than introducing a third spelling.
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+    # Unpacking leaves one directory rather than scattering files into the
+    # current one.
+    wrap_in_directory: true
+
+    files:
+      - LICENSE
+      - README.md
+      - docs/cli.md
+
+checksum:
+  # One file over every archive, which is what a package manager or a careful
+  # human verifies against. Fitting, for a tool whose whole point is checking
+  # the SHA-256 of what it downloads.
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  # The version stamped on a --snapshot build, which has no tag to read. The
+  # -SNAPSHOT suffix is there so an artefact that escapes a laptop cannot be
+  # mistaken for a release.
+  version_template: "{{ incpatch .Version }}-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  # Built from the commit subjects between this tag and the last one.
+  use: git
+  sort: asc
+
+  filters:
+    # Documentation and test-only commits are noise in a user-facing changelog.
+    # They are still in the history; they are just not news.
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "typo"
+
+release:
+  # Created as a draft, never published outright. A release is the one action in
+  # this repository that cannot be undone quietly — deleting a published tag
+  # after anyone has fetched it leaves them pinned to something that no longer
+  # exists — so the last step stays a human clicking publish.
+  draft: true
+
+  # Refuse to release from a tag carrying a prerelease suffix unless it is
+  # marked as one. "auto" reads the tag: v0.1.0-rc1 becomes a prerelease,
+  # v0.1.0 does not.
+  prerelease: auto
