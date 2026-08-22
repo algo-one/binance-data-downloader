@@ -763,9 +763,11 @@ again, which is what it was always documented to be.
 ├── cmd/bmd/          the CLI binary
 │   ├── main.go       command dispatch, exit statuses, signal handling
 │   ├── flags.go      dates → time.Time, shared flags → loader options
-│   ├── download.go   flags → Request, Stream → an encoder
+│   ├── download.go   flags → []Request, one symbol at a time, Stream → an encoder
 │   ├── list.go       Loader.Available, rendered
 │   ├── verify.go     Loader.VerifyCache, rendered
+│   ├── cache.go      Loader.CacheUsage, rendered
+│   ├── prune.go      Loader.PruneArchives, rendered
 │   ├── output.go     csv/json/parquet encoders; destinations; atomic writes
 │   └── progress.go   the one-line terminal display
 ├── testdata/         real archives, byte-untouched (see its README)
@@ -1149,7 +1151,9 @@ every hit.
 **Only the `.zip` goes.** The sidecar stays because its hash is what validates the
 Parquet, and the Parquet stays because it is what answers reads. Deleting either
 would strand the entry as completely as deleting both, which is why
-`CacheUsage` counts sidecars as their own category despite their being 88 bytes.
+`CacheUsage` counts sidecars as their own category despite their being 88–91
+bytes — the hash, two spaces and the archive's own name, so the size moves with
+the length of that name and never past ninety-odd.
 
 **Tier 2 is the larger tier, which is the opposite of the obvious guess.**
 Measured on BTCUSDT `1m` for 2024-01: 2,169,570 bytes of archive against

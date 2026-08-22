@@ -467,11 +467,13 @@
       <a class="pill" href="#download">Downloading</a>
       <a class="pill" href="#parse">Parsing</a>
       <a class="pill" href="#cache">Caching</a>
+      <a class="pill" href="#prune">Pruning</a>
       <a class="pill" href="#rest">REST tail</a>
       <a class="pill" href="#orchestration">Concurrency</a>
       <a class="pill" href="#layout">Package layout</a>
       <a class="pill" href="#correctness">Correctness</a>
       <a class="pill" href="#api">API</a>
+      <a class="pill" href="#cli">The CLI</a>
     </div>
   </div>
 </nav>
@@ -483,7 +485,7 @@
     <h1>One clean stack of candles, out of three sources that each lie a little.</h1>
     <p class="dek">A Go library that turns a symbol, an interval and a time range into a
     verified, gap-free slice of Binance kline data — fast on the first run, ten times
-    faster on the second. This page walks through how the nine finished stages fit
+    faster on the second. This page walks through how the eleven finished stages fit
     together, with the numbers that shaped each decision.</p>
 
     <div class="statbar">
@@ -747,8 +749,70 @@
     </figure>
   </section>
 
-  <section id="rest">
+  <section id="prune">
     <div class="kicker"><span class="num">§6</span></div>
+    <h2>Reclaiming disk, without breaking a single read</h2>
+    <div class="prose">
+      <p>If a hit never opens the archive, the archive doesn't have to still be there.
+      That fell out of the cache design and sat unused for four stages — a test has
+      asserted since tier 2 existed that a cache whose ZIP has been deleted still
+      serves every read that doesn't need a rebuild. What was missing was a way to
+      ask for it: <code>bmd cache</code> reports, <code>bmd prune</code> acts.</p>
+      <p><strong>The pruner doesn't get its own opinion of "usable".</strong> An
+      archive may go only when the Parquet beside it would be accepted by a read, and
+      that is the same two footer gates the read path opens with — the stamp must
+      name this archive's hash and this binary's <code>CodecVersion</code>, and the
+      schema must be the one this package writes. One copy of each, called from both
+      places. A pruner with a second, looser notion of usable is one that eventually
+      deletes an archive that was about to be needed.</p>
+      <p><strong>Only the <code>.zip</code> goes.</strong> The sidecar stays, because
+      its hash is what validates the Parquet; the Parquet stays, because it is what
+      answers reads. Deleting either would strand the entry as completely as deleting
+      both.</p>
+    </div>
+
+    <figure>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 860 300" role="img" aria-label="A bar chart of one cached symbol-month, BTCUSDT 1m for January 2024. Before pruning, the ZIP archive is 2,169,570 bytes — about 40 percent — and the derived Parquet file is 3,226,820 bytes, about 60 percent. After pruning, the archive's share is reclaimed and the Parquet, which is what reads actually hit, is untouched.">
+        <text x="20" y="26" class="svg-eyebrow dim" font-size="11">ONE SYMBOL-MONTH ON DISK — BTCUSDT 1m, 2024-01</text>
+
+        <rect class="accent-fill accent-stroke" x="20" y="42" width="330" height="56" rx="8" stroke-width="1.2"/>
+        <text x="185" y="66" class="svg-title ink" font-size="13" text-anchor="middle">ZIP archive</text>
+        <text x="185" y="85" class="accentc" font-size="11" text-anchor="middle">2,169,570 B — 40%</text>
+
+        <rect class="teal-fill teal-stroke" x="358" y="42" width="482" height="56" rx="8" stroke-width="1.2"/>
+        <text x="599" y="66" class="svg-title ink" font-size="13" text-anchor="middle">Parquet</text>
+        <text x="599" y="85" class="tealc" font-size="11" text-anchor="middle">3,226,820 B — 60%, and the tier reads actually hit</text>
+
+        <text x="20" y="140" class="svg-eyebrow dim" font-size="11">AFTER bmd prune</text>
+
+        <rect class="box-fill rose-stroke" x="20" y="156" width="330" height="56" rx="8" stroke-width="1.2" stroke-dasharray="5 4"/>
+        <text x="185" y="180" class="svg-title rosec" font-size="13" text-anchor="middle">reclaimed</text>
+        <text x="185" y="199" class="rosec" font-size="11" text-anchor="middle">re-downloadable, never re-derivable</text>
+
+        <rect class="teal-fill teal-stroke" x="358" y="156" width="482" height="56" rx="8" stroke-width="1.2"/>
+        <text x="599" y="180" class="svg-title ink" font-size="13" text-anchor="middle">Parquet — untouched</text>
+        <text x="599" y="199" class="tealc" font-size="11" text-anchor="middle">every read still served, no archive, no network</text>
+
+        <text x="20" y="248" class="soft" font-size="11.5">The .CHECKSUM sidecar is 88–91 bytes — about 1/60,000th of this bar, too small to draw, and it stays: it is what the Parquet is validated against.</text>
+        <text x="20" y="274" class="soft" font-size="11.5">Tier 2 being the larger tier is the opposite of the obvious guess. It is snappy against the ZIP's deflate, and fixed-width decimals against text.</text>
+      </svg>
+      </div>
+      <figcaption>Pruning gives back about 40% of a cache. What it costs is a download rather than a decode, on the day a <code style="font-family: var(--font-mono); font-size: 0.92em;">CodecVersion</code> bump invalidates that entry.</figcaption>
+    </figure>
+
+    <div class="callout">
+      <h4>The invariant is a test, not a comment</h4>
+      <ul>
+        <li><strong>Prune, then read, then count requests.</strong> A prune that deleted something a read needed would still return the right candles — by downloading them again. A test comparing only the candles passes on a cache that has silently started paying for the network on every hit.</li>
+        <li><strong><code>-n</code> is how you look first.</strong> <code>bmd prune</code> deletes; the dry run reaches every verdict and touches nothing. A command named <code>prune</code> that refuses to prune unless asked twice is worse.</li>
+        <li><strong>What stays open:</strong> the gates read the footer, not the pages. Bit rot inside a data page surfaces on a later read, through Parquet's own per-page CRC. Closing that means decoding every cached file to answer a question about disk space.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="rest">
+    <div class="kicker"><span class="num">§7</span></div>
     <h2>The REST tail, and its fallback ladder</h2>
     <div class="prose">
       <p>Archives lag real time by about a day, so the plan never assumes an archive
@@ -813,7 +877,7 @@
   </section>
 
   <section id="orchestration">
-    <div class="kicker"><span class="num">§7</span></div>
+    <div class="kicker"><span class="num">§8</span></div>
     <h2>Concurrency, without the deadlock</h2>
     <div class="prose">
       <p>The worker pool is deliberately <strong>flat</strong> — every chunk, whether
@@ -831,7 +895,7 @@
   </section>
 
   <section id="layout">
-    <div class="kicker"><span class="num">§8</span></div>
+    <div class="kicker"><span class="num">§9</span></div>
     <h2>Why the package layout looks the way it does</h2>
     <div class="prose">
       <p>The obvious layout — every internal piece under <code>internal/</code> —
@@ -897,7 +961,7 @@
   </section>
 
   <section id="correctness">
-    <div class="kicker"><span class="num">§9</span></div>
+    <div class="kicker"><span class="num">§10</span></div>
     <h2>Errors and correctness</h2>
     <div class="prose">
       <p>Six sentinel errors cover everything the pipeline can tell a caller, always
@@ -934,7 +998,7 @@
   </section>
 
   <section id="api">
-    <div class="kicker"><span class="num">§10</span></div>
+    <div class="kicker"><span class="num">§11</span></div>
     <h2>What it looks like to call</h2>
     <div class="prose">
       <p>The public surface is small on purpose: a <code>Loader</code>, a
@@ -957,11 +1021,91 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
     End:      time.Date(<span class="tp">2024</span>, <span class="tp">12</span>, <span class="tp">31</span>, <span class="tp">23</span>, <span class="tp">59</span>, <span class="tp">59</span>, <span class="tp">999999999</span>, time.UTC),
 })</div>
     <p class="prose" style="margin-top:14px; font-size: 13.5px; color: var(--ink-faint); max-width: 62ch;">A request is closed on both ends — <code>End</code> is the open time of the last candle you want, so <code>Start == End</code> legally asks for exactly one.</p>
+
+    <h3>The whole method surface</h3>
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>Call</th><th>Answers</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">Fetch</td><td>One range, materialised</td></tr>
+          <tr><td class="mono">FetchAll</td><td>Several ranges at once, deduplicated across the batch</td></tr>
+          <tr><td class="mono">Stream</td><td>One range, as an <code>iter.Seq2</code> — memory bounded by the concurrency limit, not the range</td></tr>
+          <tr><td class="mono">Available</td><td>What Binance has published for a symbol and interval, holes included</td></tr>
+          <tr><td class="mono">VerifyCache</td><td>Re-hash every cached archive against its sidecar</td></tr>
+          <tr><td class="mono">CacheUsage</td><td>Bytes and file counts by category, and what a prune would free</td></tr>
+          <tr><td class="mono">PruneArchives</td><td>Delete the archives tier 2 no longer needs — or, dry, just decide</td></tr>
+          <tr><td class="mono">WriteParquet</td><td>A <code>Stream</code> straight to a Parquet file, for DuckDB or Polars</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="prose" style="margin-top:14px; font-size: 13.5px; color: var(--ink-faint); max-width: 62ch;">The last five exist because the CLI could not otherwise be a thin shell over the library — anything <code>bmd</code> can do has to be reachable from Go code, and <code>cmd/bmd</code> sees only exported identifiers.</p>
+  </section>
+
+  <section id="cli">
+    <div class="kicker"><span class="num">§12</span></div>
+    <h2>Five commands, and one of them is a rate-limit decision</h2>
+    <div class="prose">
+      <p><code>bmd</code> holds no logic of its own. Every command is a thin rendering
+      of a library call, which is the constraint that drove five small additions to
+      the public API rather than a second implementation inside the tool.</p>
+    </div>
+
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th>Command</th><th>Does</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">bmd download</td><td>Candles for one or more symbols → csv, json or parquet</td></tr>
+          <tr><td class="mono">bmd list</td><td>What Binance publishes for a symbol and interval</td></tr>
+          <tr><td class="mono">bmd cache</td><td>What the cache holds, and what pruning would reclaim</td></tr>
+          <tr><td class="mono">bmd prune</td><td>Delete the archives tier 2 no longer needs (<code>-n</code> to look first)</td></tr>
+          <tr><td class="mono">bmd verify</td><td>Re-hash tier 1 against the published checksums</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Why one process downloads many symbols</h3>
+    <div class="prose">
+      <p>Binance enforces <code>REQUEST_WEIGHT</code> <strong>per IP address</strong>,
+      and the library's limiter is process-wide for exactly that reason: two limiters
+      each honouring 40 weight per second permit 80 against a ceiling of 100 — each
+      correct alone and wrong together. Until the tool took a list of symbols, the
+      only way to download several was several <code>bmd</code> processes. Three of
+      them sit at 120 against that ceiling, and Binance answers persistent excess
+      with an HTTP 418: an address ban lasting two minutes to three days. The tool's
+      only multi-symbol shape was the shape that breaks its own limiter.</p>
+    </div>
+
+    <div class="code">bmd download -symbol BTC/USDT -symbol ETH/USDT -symbol SOL/USDT \
+     -interval 1h -start <span class="tp">2024-01-01</span> -end <span class="tp">2024-03-31</span> -out ./data
+
+<span class="cm"># one process, one limiter, one symbol at a time</span></div>
+
+    <div class="callout">
+      <h4>Three decisions inside that loop</h4>
+      <ul>
+        <li><strong>Streaming, not <code>FetchAll</code>.</strong> <code>FetchAll</code> returns every candle of every symbol resident at once; five years of minute candles for one symbol is already about 820 MB. And a list of distinct symbols has nothing to deduplicate, which is all <code>FetchAll</code> would add. The limiter comes from being one process, not from which method it calls.</li>
+        <li><strong>Sequential, not concurrent.</strong> The loader's semaphore already spans calls, so one symbol's chunks saturate the pool for any range worth downloading. Running symbols in parallel would need a second bound outside the library's — the nested limit §8 exists to warn about.</li>
+        <li><strong>One symbol failing does not abandon the rest</strong>, and nothing is silent: the failure is printed, counted, and reaches the exit status. A cancellation is the exception and ends the run, or Ctrl-C would be reported as every remaining symbol having failed.</li>
+      </ul>
+    </div>
+
+    <h3>Four exit codes, because a shell can only see the number</h3>
+    <div class="tblwrap">
+      <table>
+        <thead><tr><th class="mono">code</th><th>Means</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">0</td><td>The candles are where you asked for them</td></tr>
+          <tr><td class="mono">1</td><td>The work was attempted and failed — a missing archive, a checksum mismatch, an unwritable file</td></tr>
+          <tr><td class="mono">2</td><td>The command line could not be acted on at all. What getopt uses, so what Unix uses</td></tr>
+          <tr><td class="mono">130</td><td>Ctrl-C. 128 + SIGINT, and distinct so a script can tell "stopped" from "failed" — which matter most when they look identical: a partial download</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <footer>
     <p>Built from scratch in Go · module <code style="font-family: var(--font-mono);">github.com/algo-one/binance-data-downloader</code></p>
-    <p class="status">9 of 9 stages complete — remaining step is the v0.1.0 tag</p>
+    <p class="status">11 of 11 stages complete — remaining step is the v0.1.0 tag</p>
   </footer>
 
 </div>
