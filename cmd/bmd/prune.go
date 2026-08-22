@@ -142,7 +142,7 @@ func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, q
 	}
 
 	if !quiet {
-		writePruneSummary(stderr, dryRun, pruned, freed, kept)
+		writePruneSummary(stderr, dryRun, pruned, freed, kept, failed)
 	}
 
 	if failed > 0 {
@@ -159,8 +159,18 @@ func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, q
 // The two tenses are not decoration. A dry run and a real one otherwise print
 // the same sentence, and a reader who has just freed 3 GB should never have to
 // check which flags they typed to find out whether they actually did.
-func writePruneSummary(w io.Writer, dryRun bool, pruned int, freed int64, kept int) {
-	if pruned == 0 && kept == 0 {
+//
+// failed is taken for the sake of one branch — the early return below — and is
+// otherwise unused, because the failures have already been printed one per line
+// and the error runPrune returns counts them. Without it, a prune of three
+// archives on a read-only mount reaches this with pruned and kept both zero and
+// announces "no cached archives" directly underneath three "permission denied"
+// lines about the archives it just found.
+func writePruneSummary(w io.Writer, dryRun bool, pruned int, freed int64, kept, failed int) {
+	// Every archive this walk saw ended up in exactly one of the three counts,
+	// so all three being zero is the only shape that means the walk found
+	// nothing at all.
+	if pruned == 0 && kept == 0 && failed == 0 {
 		_, _ = fmt.Fprintln(w, "no cached archives")
 
 		return

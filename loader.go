@@ -1263,6 +1263,27 @@ func (l *Loader) CacheUsage(ctx context.Context) (CacheUsage, error) {
 // the ordinary reason is a parquet that has not been built yet, and the archive
 // is then the only copy of that data on the machine.
 //
+// # It must not run while the same cache is being filled
+//
+// This is the one coordination rule on the type, and it is stated here because
+// nothing enforces it. A prune walks and deletes with no lock: not the
+// singleflight group [Loader.Fetch] collapses concurrent reads through — that
+// group deduplicates identical work and would hand a prune somebody else's
+// candles rather than serialise against them — and not a lock file, so a second
+// process running `bmd prune` is outside any guard this one could take.
+//
+// What that costs is a race window rather than corruption. The read path
+// establishes that tier 1 is present and then opens it; an archive deleted
+// between those two steps turns a rebuild that would have decoded from disk
+// into "cache: opening BTCUSDT-1h-2024-01.zip: no such file or directory",
+// where a tier 1 that had been absent all along would simply have been
+// downloaded. Nothing is lost and nothing is written wrongly — the call fails
+// and the next one succeeds — but it is a failure a caller did not have to
+// have.
+//
+// So: prune when the Loader is idle, and do not run `bmd prune` against a cache
+// directory a download is writing into.
+//
 // A cache directory that does not exist yet yields nothing and no error.
 func (l *Loader) PruneArchives(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error] {
 	return l.cache.prune(ctx, opts)

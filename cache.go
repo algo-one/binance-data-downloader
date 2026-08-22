@@ -412,10 +412,10 @@ func (c *cache) load(ctx context.Context, ref archiveRef, spec decodeSpec, p cac
 	var stale error
 
 	// Read once, here, and passed to ensureArchive below. Both steps want the
-	// same 91 bytes, and reading them twice would open, read and parse the same
-	// file twice on every cold path. An unreadable sidecar is reported as the
-	// empty string rather than an error, because at this point it is not one:
-	// no sidecar is the ordinary state of an archive that has never been
+	// same ninety-odd bytes, and reading them twice would open, read and parse
+	// the same file twice on every cold path. An unreadable sidecar is reported
+	// as the empty string rather than an error, because at this point it is not
+	// one: no sidecar is the ordinary state of an archive that has never been
 	// fetched, and the only thing either caller does about it is download.
 	sum, err := readSidecar(p.sidecar, p.name)
 	if err != nil {
@@ -1061,8 +1061,11 @@ type CacheUsage struct {
 	Archives     int64
 	ArchiveCount int
 
-	// Sidecars and SidecarCount are the .CHECKSUM files. Ninety-one bytes each,
-	// so they will never matter to a disk-space decision, and they are counted
+	// Sidecars and SidecarCount are the .CHECKSUM files. Around ninety bytes
+	// each — 64 hex digits, two spaces and the archive's own file name, so the
+	// size moves with the length of that name and nothing here depends on a
+	// fixed figure. Either way they will never matter to a disk-space decision,
+	// and they are counted
 	// separately anyway because of what they mean: the hash in a sidecar is what
 	// the parquet beside it is validated against, so a sidecar is the one part
 	// of tier 1 that pruning must leave behind. Deleting them would strand
@@ -1161,17 +1164,34 @@ func (c *cache) usage(ctx context.Context) (CacheUsage, error) {
 	err := walkCacheFiles(ctx, c.root, func(path string, d fs.DirEntry) error {
 		info, err := d.Info()
 		if err != nil {
+			// WalkDir hands back a DirEntry that has not been stat'd, so this
+			// is where a file that went away between ReadDir and now shows up.
+			// It is the ordinary outcome of measuring a cache while something
+			// is writing to it: every cache write goes through a temporary
+			// file in its destination directory, and writeAtomic renames those
+			// away. A file that is gone occupies nothing, so counting nothing
+			// for it is the accurate answer rather than a concession.
+			//
+			// Only that one error. EACCES on a directory that lost search
+			// permission, or EIO from a volume having a bad day, means this
+			// walk cannot see what it is being asked to measure, and a size
+			// report is worthless if it is allowed to guess.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+
 			return err
 		}
 
 		size := info.Size()
 
-		// The sidecar case is tested first because it is the one that would be
-		// caught by the wrong arm otherwise. A sidecar is named by appending to
-		// the whole archive name — BTCUSDT-1h-2024-01.zip.CHECKSUM — so its
-		// filepath.Ext is ".CHECKSUM" and not ".zip", but that is Binance's
-		// naming rule rather than ours and it is not this switch's business to
-		// depend on it holding.
+		// The sidecar arm is first as a matter of order rather than of
+		// necessity. Under Binance's naming a sidecar is the whole archive name
+		// with a suffix appended — BTCUSDT-1h-2024-01.zip.CHECKSUM — so its
+		// filepath.Ext is ".CHECKSUM", the archive arm below would not claim it
+		// either way, and the arms are in fact disjoint. Putting it first is
+		// what keeps that true without this switch having to depend on a naming
+		// rule that belongs to Binance and not to us.
 		switch {
 		case strings.HasSuffix(path, vision.ChecksumSuffix):
 			usage.Sidecars += size
@@ -1240,7 +1260,12 @@ func (c *cache) usage(ctx context.Context) (CacheUsage, error) {
 func (c *cache) prune(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error] {
 	return func(yield func(PruneResult, error) bool) {
 		err := walkCacheFiles(ctx, c.root, func(path string, d fs.DirEntry) error {
-			if filepath.Ext(path) != archiveExt || strings.HasSuffix(path, vision.ChecksumSuffix) {
+			// Extension alone, and no second test for the sidecar suffix. A
+			// sidecar is named <archive>.CHECKSUM, so its filepath.Ext is
+			// ".CHECKSUM" and this arm has already excluded it — a HasSuffix
+			// check beside this one can never fire, and a guard that cannot
+			// fire reads as though it were protecting against something.
+			if filepath.Ext(path) != archiveExt {
 				return nil
 			}
 
@@ -1291,6 +1316,24 @@ func (c *cache) prune(ctx context.Context, opts PruneOptions) iter.Seq2[PruneRes
 // Deriving downward is the direction that cannot be wrong: cachePaths built
 // these three names from one stem, and this rebuilds the same two from the same
 // stem.
+//
+// # Why there is no context here
+//
+// The same deliberate exception [readSidecar] and [writeAtomic] carry, and it
+// is worth stating rather than leaving to be noticed, because this one does
+// more I/O than either: a sidecar read, then an open, a stat and a footer read
+// through [checkParquetFile].
+//
+// A context would still buy nothing. Every one of those calls is an os.File
+// operation, and the os package consults no context — passing one here would
+// advertise a cancellation that could not be honoured in the middle of a read,
+// which is worse than not offering one. The cancellation that a caller can
+// actually observe is already there and is at the right granularity:
+// [walkCacheFiles] checks ctx.Err before every file, so a cancelled `bmd cache`
+// stops at the next archive rather than after all hundred thousand.
+//
+// What would change this is tier 2 growing a reader that takes a context. If
+// that happens, this takes one first.
 func archivePrunable(archive string) error {
 	name := filepath.Base(archive)
 
@@ -1343,7 +1386,32 @@ func checkParquetFile(path string, want parquetStamp) error {
 // A callback returning fs.SkipAll ends the walk without an error, which is how
 // an iterator built on this reports a consumer that stopped asking.
 func walkCacheFiles(ctx context.Context, root string, fn func(path string, d fs.DirEntry) error) error {
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	// "The cache root has never been created" is settled here, once, before the
+	// walk starts — and deliberately not by matching fs.ErrNotExist out of
+	// whatever the walk came back with.
+	//
+	// Those look like the same question and are not. One ErrNotExist means the
+	// root is absent, which is an empty cache; another means a file went away
+	// while the walk was looking at it, which is a walk that saw part of the
+	// tree. A cache is written through temporary files in the destination
+	// directory, so the second happens whenever `bmd cache` runs during a
+	// download: ReadDir lists .BTCUSDT-1h-2024-01.zip.tmp-9134, writeAtomic
+	// renames it away, and the callback's d.Info() returns ENOENT. Deciding
+	// from the final error alone cannot tell the two apart, so a walk that
+	// stopped after twelve of four hundred entries would return nil and the
+	// caller would print twelve as the whole cache.
+	//
+	// Stat answers only the first question, and every error the walk yields
+	// after this point is a real one belonging to the caller.
+	if _, err := os.Stat(root); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+
+		return err
+	}
+
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// A directory that vanished under us, or one we cannot read.
 			// Returning it stops the walk, which is the honest outcome: a
@@ -1362,13 +1430,4 @@ func walkCacheFiles(ctx context.Context, root string, fn func(path string, d fs.
 
 		return fn(path, d)
 	})
-
-	// A cache directory that does not exist holds no files, which is exactly
-	// what a cache nothing has been written to yet is. Every other failure is
-	// real and belongs to the caller.
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-
-	return nil
 }

@@ -193,3 +193,34 @@ func TestCacheRejectsAnEmptyCacheDir(t *testing.T) {
 		t.Errorf("exit status = %d, want %d", got, exitUsage)
 	}
 }
+
+// TestCacheReportOnAZeroByteStrayFile is the case the byte total cannot answer.
+//
+// os.CreateTemp creates a file before anything is written into it, so a process
+// killed at that instant leaves a cache holding one file and no bytes. That is
+// precisely the stray the "other" row was added to surface — and a report that
+// decides emptiness from CacheUsage.Total would call it an empty cache and print
+// no row at all. The counts are what say whether there are files; the bytes only
+// say how big they are.
+func TestCacheReportOnAZeroByteStrayFile(t *testing.T) {
+	f := &fakeLoader{usage: binancedata.CacheUsage{
+		Root:       "/home/ivan/.cache/bmd",
+		Other:      0,
+		OtherCount: 1,
+	}}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	if err := run(t.Context(), []string{"cache"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if strings.Contains(stdout.String(), "empty") {
+		t.Errorf("stdout = %q, want the stray file reported rather than an empty cache", stdout.String())
+	}
+
+	if !strings.Contains(stdout.String(), "other") {
+		t.Errorf("stdout = %q, want an 'other' row naming the zero-byte file", stdout.String())
+	}
+}

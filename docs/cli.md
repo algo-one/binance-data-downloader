@@ -90,12 +90,15 @@ and the second would silently replace the first.
 ones is reported, counted, and the other three are still written:
 
 ```
-BTCUSDT 1h: wrote 1440 candles to ./data/BTCUSDT-1h-2024-01-01_2024-03-31.csv
+BTCUSDT 1h: wrote 2184 candles to ./data/BTCUSDT-1h-2024-01-01_2024-03-31.csv
 NOSUCHPAIR: klines NOSUCHPAIR 1h: 400 Bad Request: Invalid symbol. (code -1121)
-SOLUSDT 1h: wrote 1440 candles to ./data/SOLUSDT-1h-2024-01-01_2024-03-31.csv
-2 of 3 symbols, 2880 candles in total
+SOLUSDT 1h: wrote 2184 candles to ./data/SOLUSDT-1h-2024-01-01_2024-03-31.csv
+2 of 3 symbols, 4368 candles in total
 bmd: 1 of 3 symbols failed
 ```
+
+2184 is what the range above actually holds: 2024-01-01 to 2024-03-31 inclusive
+is 91 days, and 91 × 24 hourly candles is 2184 per symbol.
 
 The exit status is 1. A failed symbol leaves no file behind, because output is
 written through a temporary file and renamed only once the encoder finishes.
@@ -307,6 +310,27 @@ A kept archive is a verdict and exits 0. A failed delete is a failure and exits
 1, because a script that prunes to make room needs to know the room is not
 there.
 
+### Pruning retires `bmd verify`
+
+Worth knowing before you put both in a cron job. `bmd verify` walks `.zip` files
+and nothing else, so on a fully pruned cache it finds nothing to hash. It says
+so rather than printing a clean-looking summary —
+
+```
+no cached archives to verify (a pruned cache keeps only sidecars and parquet)
+```
+
+— and it still exits 0, because nothing failed. What changes is what a 0 means:
+before a prune it says every archive still hashes to what Binance published;
+after one it says only that there were no archives to ask about.
+
+Tier 2 is not left unchecked, but it is checked by a different mechanism and on
+a different schedule. Every read compares the Parquet footer against the
+sidecar's hash and the codec version, and Parquet checksums each data page as it
+is decoded — so damage surfaces as a read error on the range that touches it,
+continuously, rather than on demand across the whole cache. There is no command
+that sweeps tier 2 the way `bmd verify` sweeps tier 1.
+
 ## `bmd verify`
 
 ```bash
@@ -325,7 +349,10 @@ it is closed.
 
 Failures are printed to stdout, one per line, and the exit status is 1 if there
 were any — so it works in a cron job. A clean cache prints nothing but the
-one-line summary on stderr.
+one-line summary on stderr. A cache with no archives at all — a fresh one, or a
+pruned one — says so in its own words instead; see
+[Pruning retires `bmd verify`](#pruning-retires-bmd-verify) for why that is not
+the same sentence.
 
 `-rm` deletes each failed archive **and its sidecar**, so the next download
 replaces them. The derived parquet is left alone: it carries the archive's

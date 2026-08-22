@@ -266,3 +266,63 @@ func TestPruneRejectsAnEmptyCacheDir(t *testing.T) {
 		t.Errorf("exit status = %d, want %d", got, exitUsage)
 	}
 }
+
+// TestPruneWhereEveryDeleteFailsDoesNotSayThereWereNoArchives.
+//
+// A read-only mount, three prunable archives, three EACCES. Nothing is pruned
+// and nothing is kept, so a summary that decides from those two counts alone
+// takes the "no cached archives" branch — printed directly underneath three
+// permission-denied lines about the archives it just found, and directly above
+// an error counting them. The summary has to see the third outcome.
+func TestPruneWhereEveryDeleteFailsDoesNotSayThereWereNoArchives(t *testing.T) {
+	var results []binancedata.PruneResult
+
+	for _, name := range []string{
+		"BTCUSDT-1h-2024-01.zip",
+		"BTCUSDT-1h-2024-02.zip",
+		"BTCUSDT-1h-2024-03.zip",
+	} {
+		results = append(results, binancedata.PruneResult{
+			Path: "/cache/" + name,
+			Size: 1 << 20,
+			Err:  errors.New("remove /cache/" + name + ": permission denied"),
+		})
+	}
+
+	f := &fakeLoader{results: results}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	err := run(t.Context(), []string{"prune"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("run returned nil, want an error so the process exits non-zero")
+	}
+
+	if strings.Contains(stderr.String(), "no cached archives") {
+		t.Errorf("stderr = %q, want it not to claim the cache held no archives", stderr.String())
+	}
+
+	// It still reports the work honestly: nothing was freed, and the three
+	// failures are the error's business rather than the summary's.
+	if want := "pruned 0 archives, freed 0 B"; !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+	}
+}
+
+// TestPruneOnAnEmptyCacheStillSaysSo is the other half of the branch above: with
+// no results at all there really were no archives, and that sentence is right.
+func TestPruneOnAnEmptyCacheStillSaysSo(t *testing.T) {
+	f := &fakeLoader{}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	if err := run(t.Context(), []string{"prune"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if !strings.Contains(stderr.String(), "no cached archives") {
+		t.Errorf("stderr = %q, want it to say the cache held no archives", stderr.String())
+	}
+}

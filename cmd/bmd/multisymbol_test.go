@@ -509,3 +509,96 @@ func equalStrings(got, want []string) bool {
 
 	return true
 }
+
+// TestProgressDoesNotPadTheNextSymbolsFirstLine is a unit test on the display
+// itself rather than on a command, because what it asserts is a field's value
+// after a call and there is no way to see that through run().
+//
+// The padding exists to overwrite a line that is still on screen: a redraw ends
+// with "\r" and no newline, so a shorter line after a longer one would leave the
+// tail of the longer one visible. done() ends that line with a newline, and
+// after it there is nothing on screen to overwrite — so a width carried across
+// pads the next symbol's first line out to the previous symbol's last, on a line
+// that is already empty.
+func TestProgressDoesNotPadTheNextSymbolsFirstLine(t *testing.T) {
+	var buf bytes.Buffer
+
+	p := &progress{w: &buf, tty: true, showSymbol: true}
+
+	// A long line, from a symbol with many chunks: the count is padded to the
+	// width of the total, so [  1/100] is wider than [1/1].
+	p.report(binancedata.Progress{
+		Request: binancedata.Request{Symbol: "1000SATSUSDT"},
+		Done:    1, Total: 100, Source: binancedata.SourceMonthlyArchive,
+		Start:  mustDate(t, "2024-01-01"),
+		Klines: 44640,
+	})
+
+	wide := p.width
+
+	p.done()
+
+	if p.width != 0 {
+		t.Errorf("width after done() = %d, want 0: the line it measured is gone", p.width)
+	}
+
+	buf.Reset()
+
+	// The next symbol, with a shorter line.
+	p.report(binancedata.Progress{
+		Request: binancedata.Request{Symbol: "BNBBTC"},
+		Done:    1, Total: 1, Source: binancedata.SourceDailyArchive,
+		Start:  mustDate(t, "2024-01-01"),
+		Klines: 24,
+	})
+
+	line := buf.String()
+
+	if len(line) >= wide {
+		t.Errorf("the next symbol's first line is %q (%d bytes), want it not padded out to the "+
+			"previous symbol's %d", line, len(line), wide)
+	}
+
+	if strings.HasSuffix(line, " ") {
+		t.Errorf("the next symbol's first line is %q, want no trailing padding on an empty line", line)
+	}
+}
+
+// TestOneSymbolsErrorCarriesNoSymbolPrefix pins the promise docs/cli.md makes
+// about the single-symbol case: "with one symbol nothing above changes ... the
+// error is reported as it always was".
+//
+// Wrapping every per-symbol failure in "SYMBOL: " on the way into the failed
+// slice breaks that, and breaks it invisibly — the multi-symbol path prints its
+// own prefixed line and reads only the slice's length, so the wrap shows up
+// nowhere except here, in the one error that is returned to main rather than
+// printed.
+func TestOneSymbolsErrorCarriesNoSymbolPrefix(t *testing.T) {
+	f := &fakeLoader{streamErr: binancedata.ErrNotAvailable}
+	f.install(t)
+
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+
+	err := run(t.Context(), []string{
+		"download",
+		"-symbol", "BTCUSDT",
+		"-interval", "1h",
+		"-start", "2024-01-15",
+		"-end", "2024-01-15",
+		"-out", ".",
+	}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("run returned nil, want the stream failure")
+	}
+
+	if strings.HasPrefix(err.Error(), "BTCUSDT") {
+		t.Errorf("error = %q, want no symbol prefix on the only symbol the user named", err)
+	}
+
+	// Still the library's error, not a count: main prints this one directly.
+	if !errors.Is(err, binancedata.ErrNotAvailable) {
+		t.Errorf("error = %v, want it to still wrap ErrNotAvailable", err)
+	}
+}

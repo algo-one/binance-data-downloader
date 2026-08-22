@@ -1859,3 +1859,63 @@ func TestCacheUsageAgreesWithPrune(t *testing.T) {
 		t.Errorf("the report offers %d bytes, a dry run would free %d", usage.Prunable, bytes)
 	}
 }
+
+// TestWalkCacheFilesReportsAMidWalkNotExist is the regression for the swallow.
+//
+// One fs.ErrNotExist means "the cache root has never been created", which is an
+// empty cache; another means "a file went away while the walk was looking at
+// it", which is a walk that saw part of the tree. Deciding between them from the
+// error the walk finally returned cannot work, and getting it wrong is the
+// quietest failure in this file: usage would return whatever it had counted so
+// far with a nil error beside it, and the caller would print twelve entries of a
+// four-hundred-entry cache as the whole cache.
+//
+// The callback stands in for the real source, which is not reproducible on
+// demand: WalkDir hands back a DirEntry it has not stat'd, so a temporary file
+// that writeAtomic renames away between ReadDir and d.Info() surfaces exactly
+// here, as an ENOENT from inside the callback.
+func TestWalkCacheFilesReportsAMidWalkNotExist(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(root, "BTCUSDT-1h-2024-01.zip"), []byte("x"), cacheFilePerm); err != nil {
+		t.Fatalf("writing a file to walk: %v", err)
+	}
+
+	want := fmt.Errorf("stat of a file that went away: %w", fs.ErrNotExist)
+
+	err := walkCacheFiles(t.Context(), root, func(string, fs.DirEntry) error {
+		return want
+	})
+	if err == nil {
+		t.Fatal("walkCacheFiles returned nil for a file that vanished mid-walk, want the error")
+	}
+
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("walkCacheFiles returned %v, want it to carry %v", err, fs.ErrNotExist)
+	}
+}
+
+// TestWalkCacheFilesOnAMissingRoot is the case the swallow existed to serve, and
+// it still holds: a cache directory nothing has written to yet holds no files.
+func TestWalkCacheFilesOnAMissingRoot(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "never-created")
+
+	calls := 0
+
+	err := walkCacheFiles(t.Context(), root, func(string, fs.DirEntry) error {
+		calls++
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walkCacheFiles on an unwritten cache root: %v", err)
+	}
+
+	if calls != 0 {
+		t.Errorf("the callback ran %d times on a root that does not exist, want 0", calls)
+	}
+}

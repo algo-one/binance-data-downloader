@@ -82,10 +82,23 @@ func writeCacheUsage(w io.Writer, u binancedata.CacheUsage) error {
 		return err
 	}
 
+	// The four categories are disjoint and cover every file under the root, so
+	// this is the file count of the whole cache. It is computed once because
+	// two lines below need it and they must agree: the one that decides the
+	// cache is empty, and the total row.
+	files := u.ArchiveCount + u.SidecarCount + u.ParquetCount + u.OtherCount
+
 	// An empty cache is a real answer and deserves a sentence rather than a
 	// table of zeroes. It is also the ordinary state of a machine that has not
 	// run a download yet, so it should not read like something went wrong.
-	if u.Total() == 0 {
+	//
+	// Files rather than bytes, and the difference is not pedantic. os.CreateTemp
+	// creates a zero-byte file before anything is written into it, so a process
+	// killed at that instant leaves a cache holding one file and no bytes —
+	// and the "other" row below exists precisely to make that file visible.
+	// Deciding from u.Total() would answer "empty" for the one cache state the
+	// report was extended to describe.
+	if files == 0 {
 		_, err := fmt.Fprintln(w, "empty")
 
 		return err
@@ -107,7 +120,7 @@ func writeCacheUsage(w io.Writer, u binancedata.CacheUsage) error {
 		writeCacheRow(tw, "other", u.OtherCount, u.Other)
 	}
 
-	writeCacheRow(tw, "total", u.ArchiveCount+u.SidecarCount+u.ParquetCount+u.OtherCount, u.Total())
+	writeCacheRow(tw, "total", files, u.Total())
 
 	if err := tw.Flush(); err != nil {
 		return err

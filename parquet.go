@@ -409,11 +409,24 @@ func parquetWriterOptions() []parquet.WriterOption {
 // checkParquet reports whether a tier-2 file would be accepted by [readKlines],
 // without reading a single candle out of it.
 //
-// It is the same two gates that function opens with — [checkStamp] against the
-// footer, then [checkSchema] against the column layout — and deliberately
-// nothing after them. Both read only parquet's footer, which sits at the end of
-// the file, so the whole question costs one open and one seek however large the
-// file is.
+// It is every gate that function opens with and deliberately nothing after
+// them: [checkStamp] against the footer, [checkSchema] against the column
+// layout, and the stamped row count [readKlines] bounds its allocations by.
+// All three read only parquet's footer, which sits at the end of the file, so
+// the whole question costs one open and one seek however large the file is.
+//
+// The row count is the easiest of the three to leave out, and leaving it out
+// would be a real hole rather than a tidiness one. readKlines refuses a footer
+// whose bmd.rows key is missing or unparseable, and refuses one whose count
+// disagrees with what the row groups add up to — so a file failing only those
+// is one this would call readable and the reader would reject. The archive
+// beside it would be pruned on that verdict and the next read would go to the
+// network, which is the one outcome pruning promises not to cause.
+//
+// Both of those are decidable from the footer, which is why they belong here.
+// The row-group totals are footer metadata: parquet records each group's row
+// count in the same structure as the key/value pairs, so comparing them against
+// the stamp costs arithmetic and no further reading.
 //
 // # What it is for, and the gap it leaves
 //
@@ -445,7 +458,32 @@ func checkParquet(r io.ReaderAt, size int64, want parquetStamp) error {
 		return err
 	}
 
-	return checkSchema(f, want)
+	if err := checkSchema(f, want); err != nil {
+		return err
+	}
+
+	stamped, err := lookupInt(f, metaRows)
+	if err != nil {
+		return err
+	}
+
+	// The same arithmetic readKlines does, without the reading in between: it
+	// bounds each row group against the stamp on the way through and compares
+	// the total once at the end. A file whose footer disagrees with itself is a
+	// truncated or half-rewritten one, and its archive is the only place the
+	// missing rows still exist.
+	var rows int64
+
+	for _, rowGroup := range f.RowGroups() {
+		rows += rowGroup.NumRows()
+	}
+
+	if rows != int64(stamped) {
+		return fmt.Errorf("parquet: %q: row groups hold %d rows, footer says %d: %w",
+			want.SourceFile, rows, stamped, ErrCorruptArchive)
+	}
+
+	return nil
 }
 
 // readKlines reads a tier-2 file, after checking that it may be used.

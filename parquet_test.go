@@ -1210,3 +1210,100 @@ func openParquet(t *testing.T, data []byte) *parquet.File {
 
 	return f
 }
+
+// TestCheckParquetRejectsEverythingReadKlinesRejectsInTheFooter is the invariant
+// pruning rests on, tested as an invariant rather than as a list of cases.
+//
+// checkParquet is what decides an archive may be deleted, and it decides it by
+// claiming to be the gates readKlines opens with. If it is more permissive by
+// even one gate, `bmd prune` deletes the archive for a parquet the reader will
+// refuse — and the next read goes to the network, which is the one thing
+// pruning promises not to cause. So every footer below is fed to both, and the
+// assertion is that they agree.
+//
+// Only footer-decidable damage is here, which is the documented limit of what
+// this can answer: bit rot inside a data page surfaces when the page is
+// decoded, and checkParquet reads no pages. That residual is the one cost of
+// pruning and is stated in checkParquet's own doc comment.
+func TestCheckParquetRejectsEverythingReadKlinesRejectsInTheFooter(t *testing.T) {
+	t.Parallel()
+
+	klines := hourlyFixture(t)
+	stamp := testStamp()
+
+	good := map[string]string{
+		metaSourceFile:   stamp.SourceFile,
+		metaSourceSHA256: stamp.SourceSHA256,
+		metaCodecVersion: strconv.Itoa(CodecVersion),
+		metaRows:         strconv.Itoa(len(klines)),
+	}
+
+	tests := []struct {
+		name   string
+		break_ func(m map[string]string)
+	}{
+		{"no stamp at all", func(m map[string]string) { clear(m) }},
+		{"built from a different archive", func(m map[string]string) {
+			m[metaSourceSHA256] = "00" + stamp.SourceSHA256[2:]
+		}},
+		{"built by a newer codec", func(m map[string]string) {
+			m[metaCodecVersion] = strconv.Itoa(CodecVersion + 1)
+		}},
+		{"codec version is not a number", func(m map[string]string) { m[metaCodecVersion] = "one" }},
+
+		// The two this function used to let through. Both are readable from
+		// the footer alone, and both make readKlines refuse the file.
+		{"no row count", func(m map[string]string) { delete(m, metaRows) }},
+		{"row count is not a number", func(m map[string]string) { m[metaRows] = "many" }},
+		{"row count claims more rows than there are", func(m map[string]string) {
+			m[metaRows] = strconv.Itoa(len(klines) + 1)
+		}},
+		{"row count claims fewer rows than there are", func(m map[string]string) {
+			m[metaRows] = strconv.Itoa(len(klines) - 1)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			meta := maps.Clone(good)
+			tt.break_(meta)
+
+			b := rawParquet(t, klines, meta)
+
+			if _, err := readKlines(t.Context(), bytes.NewReader(b), int64(len(b)), stamp); err == nil {
+				t.Fatal("readKlines accepted this footer; the case no longer tests anything")
+			}
+
+			if err := checkParquet(bytes.NewReader(b), int64(len(b)), stamp); err == nil {
+				t.Error("checkParquet accepted a file readKlines refuses, so prune would delete its archive")
+			}
+		})
+	}
+}
+
+// TestCheckParquetAcceptsWhatReadKlinesReads is the other direction, and the one
+// that stops the gates above from being tightened into uselessness: a healthy
+// file has to pass, or prune would keep every archive and reclaim nothing.
+func TestCheckParquetAcceptsWhatReadKlinesReads(t *testing.T) {
+	t.Parallel()
+
+	klines := hourlyFixture(t)
+	stamp := testStamp()
+
+	b := rawParquet(t, klines, map[string]string{
+		metaSourceFile:   stamp.SourceFile,
+		metaSourceSHA256: stamp.SourceSHA256,
+		metaCodecVersion: strconv.Itoa(CodecVersion),
+		metaRows:         strconv.Itoa(len(klines)),
+	})
+
+	if _, err := readKlines(t.Context(), bytes.NewReader(b), int64(len(b)), stamp); err != nil {
+		t.Fatalf("readKlines on a healthy file: %v", err)
+	}
+
+	if err := checkParquet(bytes.NewReader(b), int64(len(b)), stamp); err != nil {
+		t.Errorf("checkParquet on a healthy file: %v", err)
+	}
+}

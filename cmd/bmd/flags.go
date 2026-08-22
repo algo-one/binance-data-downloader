@@ -383,6 +383,16 @@ func checkSymbolFlag(fs *flag.FlagSet, symbols symbolList) error {
 // this would have two downloads writing the same path, each through its own
 // temporary file, with the second rename silently replacing the first's work.
 func parseSymbols(symbols []string) ([]string, error) {
+	// A backstop, and unreachable from the one caller there is today:
+	// download() runs checkSymbolFlag before buildRequests, and that returns an
+	// error for every empty case with a better message than this one — it can
+	// tell "never given" from "given and names nothing", which a slice cannot.
+	//
+	// It stays because of what the alternative fails as. Without it an empty
+	// slice produces zero requests, runDownload loops zero times, and the
+	// command prints "0 of 0 symbols" and exits 0 — a silent success for a run
+	// that downloaded nothing. That is the wrong way for a future second caller
+	// to discover it forgot the check.
 	if len(symbols) == 0 {
 		return nil, usagef("-symbol is required, for example BTC/USDT")
 	}

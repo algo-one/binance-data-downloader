@@ -126,6 +126,13 @@ func (p *progress) done() {
 	_, _ = fmt.Fprintln(p.w)
 
 	p.active = false
+
+	// The width goes with the line it measured. It exists to overwrite what is
+	// still on screen, and after the newline above there is nothing there —
+	// so leaving it set would pad the first line of the next symbol out to the
+	// width of the last line of the previous one, on a line that is already
+	// empty.
+	p.width = 0
 }
 
 // outcome renders the part of an event that says how the chunk went.

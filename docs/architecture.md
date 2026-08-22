@@ -1151,9 +1151,11 @@ every hit.
 **Only the `.zip` goes.** The sidecar stays because its hash is what validates the
 Parquet, and the Parquet stays because it is what answers reads. Deleting either
 would strand the entry as completely as deleting both, which is why
-`CacheUsage` counts sidecars as their own category despite their being 88–91
-bytes — the hash, two spaces and the archive's own name, so the size moves with
-the length of that name and never past ninety-odd.
+`CacheUsage` counts sidecars as their own category despite their being about
+ninety bytes — the hash, two spaces and the archive's own name, so the size
+moves with the length of that name rather than being fixed. 88 for
+`BTCUSDT-1m-2024-01.zip`, 91 for a daily one, 95 for the longest symbol at a
+daily period; nothing in the code depends on the figure.
 
 **Tier 2 is the larger tier, which is the opposite of the obvious guess.**
 Measured on BTCUSDT `1m` for 2024-01: 2,169,570 bytes of archive against

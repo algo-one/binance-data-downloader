@@ -214,7 +214,14 @@ func runDownload(
 				return err
 			}
 
-			failed = append(failed, fmt.Errorf("%s: %w", req.Symbol, err))
+			// Stored as it came back, with no symbol prefix wrapped around
+			// it. Two things read this slice and neither wants one: the
+			// multi-symbol branch reads only its length, and prints its own
+			// "SYMBOL: ..." line just below, so a wrapped copy would be
+			// allocated and thrown away — and the single-symbol branch returns
+			// failed[0] to main, where a prefix naming the only symbol the user
+			// typed is noise that was not there in Stage 8.
+			failed = append(failed, err)
 
 			// One symbol failing does not abandon the rest. The user named
 			// these symbols in one command and the ones that work are still

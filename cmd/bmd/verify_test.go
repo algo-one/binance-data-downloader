@@ -390,3 +390,47 @@ func TestPlural(t *testing.T) {
 		}
 	}
 }
+
+// TestVerifyOnACacheWithNoArchivesSaysSo separates two very different zeroes.
+//
+// "checked 0 archives, 0 failed" is the sentence a healthy cache prints with
+// the count filled in, and on a pruned cache it is what this command says about
+// a cache it did not look at: prune deletes every .zip, this walks only .zip
+// files, and the exit status stays 0 because nothing failed. A cron job reading
+// that sees a verified cache. What it actually has is 1.2 GB of tier 2 that
+// this command has never been able to check.
+func TestVerifyOnACacheWithNoArchivesSaysSo(t *testing.T) {
+	f := &fakeLoader{}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	if err := run(t.Context(), []string{"verify"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if strings.Contains(stderr.String(), "0 failed") {
+		t.Errorf("stderr = %q, want it not to read like a cache that was checked and passed", stderr.String())
+	}
+
+	if !strings.Contains(stderr.String(), "no cached archives to verify") {
+		t.Errorf("stderr = %q, want it to say there was nothing to verify", stderr.String())
+	}
+}
+
+// TestVerifyStaysQuietWithNoArchivesUnderQuiet: -quiet suppresses the
+// reassurance line, and the sentence above is one.
+func TestVerifyStaysQuietWithNoArchivesUnderQuiet(t *testing.T) {
+	f := &fakeLoader{}
+	f.install(t)
+
+	var stdout, stderr bytes.Buffer
+
+	if err := run(t.Context(), []string{"verify", "-quiet"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing under -quiet", stderr.String())
+	}
+}

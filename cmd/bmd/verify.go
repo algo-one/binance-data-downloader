@@ -120,8 +120,21 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 	// The failures themselves are stdout and are printed either way; this is
 	// the reassurance line, which is exactly what -quiet is for.
 	if !quiet {
-		_, _ = fmt.Fprintf(stderr, "checked %d %s (%s), %d failed\n",
-			checked, plural(checked, "archive"), humanBytes(bytes), bad)
+		if checked == 0 {
+			// Said differently on purpose, because "checked 0 archives, 0
+			// failed" is the same sentence a healthy cache prints and would be
+			// read as one — by a person, and by the cron job this command's
+			// help text advertises. It is not: a pruned cache has no tier 1
+			// left, so this command has nothing to hash and its exit status
+			// stops carrying any information about the data reads are actually
+			// served from. Naming that is the whole of the fix; see the note
+			// in docs/cli.md for what does still cover tier 2.
+			_, _ = fmt.Fprintln(stderr,
+				"no cached archives to verify (a pruned cache keeps only sidecars and parquet)")
+		} else {
+			_, _ = fmt.Fprintf(stderr, "checked %d %s (%s), %d failed\n",
+				checked, plural(checked, "archive"), humanBytes(bytes), bad)
+		}
 	}
 
 	if bad > 0 {
