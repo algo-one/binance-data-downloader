@@ -525,8 +525,84 @@ A 418 is reported as `*vision.RateLimitError` with `Banned` set, and its
 internal; the root package re-attaches the same pair from `errors.go`, so a
 library consumer asking only "should I slow down?" gets a yes and one that can
 tell a ban from a throttle can. `X-MBX-USED-WEIGHT-1M` is decoded onto
-`vision.KlinesPage` and available to the layer above, which does not read it
-yet — Stage 7 owns progress and diagnostics and is where it becomes visible.
+`vision.KlinesPage` and reported by `restapi.go` — see "The quota reading is
+reported, not acted on" below.
+
+### The quota reading is reported, not acted on
+
+`X-MBX-USED-WEIGHT-1M` says how much of the 6000 this IP has spent in the
+current minute. It is the only visibility this library has into a budget that is
+metered per address rather than per process, which makes it the one measurement
+that can see what no amount of local accounting can: a second backtest, another
+copy of this library, or a live trading bot drawing on the same quota. The
+limiter's job is to keep that number low, and this is how you find out when that
+is not working.
+
+`restFetcher.klines` logs it at debug for every page, and once per fetch at warn
+past four fifths of the quota. Three things about that are decided rather than
+defaulted.
+
+**The threshold is sized against what this library can produce, not as a round
+fraction.** At `DefaultWeightPerSecond` a minute of the loader running flat out
+accounts for 2400 of the 6000, and even a loader configured to the full quota
+settles at 6000 only while saturated. A reading of 4800 therefore means either a
+burst worth knowing about or — far likelier — company on the address.
+
+**The warning is per fetch, not per page.** The condition is a property of the
+minute rather than of the page that observed it, so a range crossing the
+threshold on its first page crosses it on all of them, and a warning repeated
+ninety-nine times is a warning nobody reads.
+
+**Zero is not a measurement.** The field is zero when the header was absent or
+unreadable, and one request always costs `KlinesWeight`, so a zero is reported
+as nothing at all rather than as "nothing has been spent".
+
+Reporting rather than reacting is the same division of labour the rest of this
+package keeps. A page knows what one request cost; only the layer owning the
+pipeline can decide the pipeline should slow down, and that layer already has
+the server's own word for it in the 429 handling. This is the diagnostic that
+explains why that fired, or that it is about to.
+
+It was decoded and dropped until this was written, with a comment saying Stage 7
+would be where it became visible. That is the accepted-and-ignored defect this
+document's own rule names, in the one place where the ignored value is the only
+evidence there is.
+
+### The rate is settable, and only downwards
+
+`WithRateLimit(weightPerSecond float64)` replaces the sustained rate for one
+loader. The unit is Binance's own — REQUEST_WEIGHT, of which a klines call costs
+`KlinesWeight` — rather than requests per second, so the number in the option is
+the number in the quota and neither has to be re-derived when the other changes.
+
+The argument for having it is the same one that sets the default low. The quota
+is per IP, so everything on the machine draws from the same 6000, and the
+default cannot know how much company it has: 40 is a guess that leaves room, not
+a measurement. A caller who *does* know — because the history download shares an
+address with something latency-sensitive — is the only one who can say so.
+
+Rates above the quota's own 100 per second are **rejected, not clamped**. There
+is no rate above it Binance permits, so accepting one would accept a setting
+that cannot be honoured, and clamping silently would have the option report
+success for a policy it did not apply. The ceiling is the quota rather than the
+default, so raising the rate toward it stays available to a caller who knows
+they have the address to themselves.
+
+The burst follows the rate by rule instead of by constant. `vision.BurstFor` is
+half a second's worth, floored at one klines call, and at the default rate it
+yields exactly `DefaultBurst` — so the shipped policy is one number and a rule
+rather than two constants that can drift apart. The floor is the part with teeth:
+`rate.Limiter.WaitN` returns an error rather than waiting when the weight exceeds
+the burst, so a bucket smaller than one call would refuse every request forever
+instead of pacing it, which is precisely the failure a caller asking for a very
+low rate is least expecting.
+
+The option opts out of the process-wide limiter, and that is the one thing to
+know before reaching for it. A loader built without it shares one bucket with
+every other such loader, because two buckets each honouring the documented rate
+permit twice it — correct alone and wrong in aggregate. With a single loader per
+process, which is the normal case, the option does exactly what it says. With
+several, it has to be set on all of them.
 
 **A status decides whose fault a failure is; the body only decides the detail.**
 Binance answers a 5xx with the same `{"code","msg"}` document it uses for a 400,
@@ -885,6 +961,7 @@ func WithConcurrency(n int) Option
 func WithHTTPClient(c *http.Client) Option
 func WithProgress(fn func(Progress)) Option
 func WithLogger(l *slog.Logger) Option
+func WithRateLimit(weightPerSecond float64) Option
 
 func (l *Loader) Fetch(ctx context.Context, req Request) ([]Kline, error)
 func (l *Loader) FetchAll(ctx context.Context, reqs []Request) (map[Request][]Kline, error)

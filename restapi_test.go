@@ -1,9 +1,12 @@
 package binancedata
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -29,7 +32,15 @@ func newTestRESTFetcher(t *testing.T, handler http.HandlerFunc) restFetcher {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	return restFetcher{api: vision.NewAPI(srv.URL, srv.Client(), fastPolicy(), vision.NewLimiter(1e6, 1e6))}
+	return restFetcher{
+		api: vision.NewAPI(srv.URL, srv.Client(), fastPolicy(), vision.NewLimiter(1e6, 1e6)),
+		// Discarding rather than nil. A nil *slog.Logger panics the moment a
+		// handler sends the used-weight header, which is a failure this helper
+		// would hand to whichever test happened to add one — so the default is
+		// the same safe one defaultLoaderConfig picks. A test that wants to
+		// read the records assigns its own over this.
+		logger: slog.New(slog.DiscardHandler),
+	}
 }
 
 // fakeKline is one generated candle: the instant it opens, and the JSON row the
@@ -827,5 +838,227 @@ func TestRESTStopsOnCancellation(t *testing.T) {
 
 	if calls.Load() > 2 {
 		t.Errorf("made %d requests after cancellation, want at most 2", calls.Load())
+	}
+}
+
+// logRecord is one captured slog record, decoded far enough to assert on.
+type logRecord struct {
+	Level      string `json:"level"`
+	Msg        string `json:"msg"`
+	UsedWeight int    `json:"used_weight"`
+}
+
+// captureLogs returns a logger recording everything at debug and above, and a
+// function that decodes what it collected.
+//
+// A JSON handler into a buffer rather than a hand-written slog.Handler: the
+// assertions here are about which records appeared and what one attribute said,
+// and a handler implementation would be more code to maintain than the two
+// lines of decoding it saves.
+func captureLogs(t *testing.T) (*slog.Logger, func() []logRecord) {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	return logger, func() []logRecord {
+		t.Helper()
+
+		var out []logRecord
+
+		for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
+			if line == "" {
+				continue
+			}
+
+			var rec logRecord
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("decoding log line %q: %v", line, err)
+			}
+
+			out = append(out, rec)
+		}
+
+		return out
+	}
+}
+
+// withUsedWeight wraps a handler so every response carries the quota header.
+//
+// A value of zero sends no header at all, which is the real endpoint's own
+// behaviour on the paths that do not meter — and the case that has to stay
+// distinguishable from "nothing has been spent", since one request always costs
+// vision.KlinesWeight.
+func withUsedWeight(next http.HandlerFunc, used int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if used > 0 {
+			w.Header().Set("X-MBX-USED-WEIGHT-1M", strconv.Itoa(used))
+		}
+
+		next(w, r)
+	}
+}
+
+// TestRESTReportsUsedWeight covers the quota reading being surfaced rather than
+// dropped.
+//
+// X-MBX-USED-WEIGHT-1M is the only visibility this library has into a budget
+// that is shared per IP address rather than per process, so a second backtest
+// or a live trading bot on the same machine is invisible to every other
+// measurement here. Decoding the header and then ignoring it — which is what
+// this did before — is the accepted-and-ignored defect docs/architecture.md
+// names, in the one place where the ignored value is the only evidence there is.
+func TestRESTReportsUsedWeight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		used      int
+		wantDebug int
+		wantWarn  int
+	}{
+		{
+			name: "no header is not a measurement",
+			used: 0,
+			// Zero is "absent or unreadable", not "nothing spent" — this very
+			// request cost vision.KlinesWeight — so nothing is claimed.
+			wantDebug: 0,
+			wantWarn:  0,
+		},
+		{
+			name:      "an ordinary reading is debug only",
+			used:      120,
+			wantDebug: 1,
+			wantWarn:  0,
+		},
+		{
+			name: "one under the threshold does not warn",
+			used: restWeightWarnThreshold - 1,
+			// The boundary is checked from below as well as on it, because a
+			// >= written as > is a bug no round number would expose.
+			wantDebug: 1,
+			wantWarn:  0,
+		},
+		{
+			name:      "the threshold itself warns",
+			used:      restWeightWarnThreshold,
+			wantDebug: 1,
+			wantWarn:  1,
+		},
+		{
+			name:      "past the threshold warns",
+			used:      vision.WeightLimitPerMinute - 10,
+			wantDebug: 1,
+			wantWarn:  1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			start := utc(2024, 1, 15)
+			rows := makeKlines(start, time.Hour, 4)
+			end := start.Add(4 * time.Hour)
+
+			f := newTestRESTFetcher(t, withUsedWeight(serveKlines(rows, nil), tc.used))
+
+			logger, records := captureLogs(t)
+			f.logger = logger
+
+			got, err := f.klines(t.Context(), restRef{
+				Market: MarketSpot, Symbol: "BTCUSDT", Interval: Interval1h, Start: start, End: end,
+			}, end)
+			if err != nil {
+				t.Fatalf("klines: %v", err)
+			}
+
+			// The candles come back either way. That is the whole reason this
+			// needs its own test: reporting the quota is invisible in the
+			// result, so a version that dropped the header again would pass
+			// every other test in this file.
+			if len(got) != 4 {
+				t.Fatalf("got %d candles, want 4", len(got))
+			}
+
+			var debug, warn int
+
+			for _, rec := range records() {
+				switch rec.Level {
+				case "DEBUG":
+					debug++
+
+					if rec.UsedWeight != tc.used {
+						t.Errorf("debug record says used_weight %d, want %d", rec.UsedWeight, tc.used)
+					}
+				case "WARN":
+					warn++
+				}
+			}
+
+			if debug != tc.wantDebug {
+				t.Errorf("got %d debug records, want %d", debug, tc.wantDebug)
+			}
+
+			if warn != tc.wantWarn {
+				t.Errorf("got %d warn records, want %d", warn, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// TestRESTWarnsOncePerFetch pins the warning to the fetch rather than the page.
+//
+// The condition is a property of the minute, not of the page that observed it:
+// a range crossing the threshold on its first page crosses it on every
+// subsequent one, so a per-page warning turns a real signal into a hundred
+// lines nobody reads. The debug records stay per page, because that is the
+// level whose job is detail.
+func TestRESTWarnsOncePerFetch(t *testing.T) {
+	t.Parallel()
+
+	start := utc(2024, 1, 15)
+
+	// 2,500 one-minute candles: three pages, as in TestRESTPaginatesWholeRange.
+	const count = 2500
+
+	rows := makeKlines(start, time.Minute, count)
+	end := start.Add(count * time.Minute)
+
+	var calls atomic.Int32
+
+	f := newTestRESTFetcher(t, withUsedWeight(serveKlines(rows, &calls), vision.WeightLimitPerMinute-1))
+
+	logger, records := captureLogs(t)
+	f.logger = logger
+
+	if _, err := f.klines(t.Context(), restRef{
+		Market: MarketSpot, Symbol: "BTCUSDT", Interval: Interval1m, Start: start, End: end,
+	}, end); err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+
+	if want := int32(3); calls.Load() != want {
+		t.Fatalf("made %d requests, want %d — the rest of this test assumes three pages", calls.Load(), want)
+	}
+
+	var debug, warn int
+
+	for _, rec := range records() {
+		switch rec.Level {
+		case "DEBUG":
+			debug++
+		case "WARN":
+			warn++
+		}
+	}
+
+	if debug != 3 {
+		t.Errorf("got %d debug records, want 3 — one per page", debug)
+	}
+
+	if warn != 1 {
+		t.Errorf("got %d warn records, want exactly 1 for the whole fetch", warn)
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/algo-one/binance-data-downloader/internal/vision"
 )
 
 // TestNewLoaderDefaults pins what a caller who passes nothing gets. Every line
@@ -101,6 +103,22 @@ func TestNewLoaderRejectsBadOptions(t *testing.T) {
 		{
 			name: "a nil http client",
 			opt:  WithHTTPClient(nil),
+		},
+		{
+			name: "a zero rate limit",
+			opt:  WithRateLimit(0),
+		},
+		{
+			name: "a negative rate limit",
+			opt:  WithRateLimit(-1),
+		},
+		{
+			// Rejected rather than clamped. No rate above the published quota
+			// is one Binance permits, so accepting it would be accepting a
+			// setting that cannot be honoured — and clamping silently would
+			// have the option report success for a policy it did not apply.
+			name: "a rate limit above the published quota",
+			opt:  WithRateLimit(vision.WeightLimitPerMinute/60 + 1),
 		},
 		{
 			name: "a nil progress function",
@@ -240,6 +258,61 @@ func TestEveryOptionIsHonoured(t *testing.T) {
 
 		if l.logger != logger {
 			t.Error("the logger was not installed")
+		}
+	})
+
+	t.Run("rate limit", func(t *testing.T) {
+		t.Parallel()
+
+		// This one is asserted on the config rather than on the Loader, and
+		// the reason is worth stating because it is the exception to how every
+		// case above works. vision.NewAPI does not keep the limiter as a
+		// field: it captures it in the policy's Reserve closure, so there is
+		// nothing on a built Loader to read it back from. cfg.limiter is the
+		// value NewLoader hands to vision.NewAPI, one line apart, so checking
+		// it here is checking the thing that reaches the transport.
+		//
+		// The pacing itself is not re-tested. internal/vision/limiter_test.go
+		// pins what a rate.Limiter with these numbers does, inside a synctest
+		// bubble that can assert on exact durations; a second measurement here
+		// would need a real server, which a bubble cannot contain.
+		cfg := defaultLoaderConfig()
+
+		const rate = 10
+
+		if err := WithRateLimit(rate).apply(&cfg); err != nil {
+			t.Fatalf("WithRateLimit: %v", err)
+		}
+
+		if cfg.limiter == nil {
+			t.Fatal("the limiter was not installed")
+		}
+
+		if got := float64(cfg.limiter.Limit()); got != rate {
+			t.Errorf("limit is %g weight per second, want %d", got, rate)
+		}
+
+		// Half a second's worth, which is the rule BurstFor states — so a
+		// caller who lowers the rate gets a proportionally smaller spike
+		// rather than the shipped burst on top of a slower refill.
+		if got, want := cfg.limiter.Burst(), vision.BurstFor(rate); got != want {
+			t.Errorf("burst is %d weight, want %d", got, want)
+		}
+	})
+
+	t.Run("the default leaves the limiter to internal/vision", func(t *testing.T) {
+		t.Parallel()
+
+		// The other half of the option, and the more important half. A nil
+		// limiter is what makes vision.NewAPI reach for the process-wide one,
+		// and that sharing is a correctness requirement rather than an
+		// optimisation: two buckets each honouring 40 weight per second permit
+		// 80, which is the shape of mistake that earns an IP ban. A default
+		// that quietly built a per-loader limiter would break it silently.
+		cfg := defaultLoaderConfig()
+
+		if cfg.limiter != nil {
+			t.Error("the default config carries its own limiter; it should be nil so the process-wide one is used")
 		}
 	})
 }

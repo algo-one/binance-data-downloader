@@ -312,11 +312,12 @@ type KlinesPage struct {
 	// — a second process on the same address spending the same quota, most
 	// likely, which no amount of local accounting can detect.
 	//
-	// Nothing reads it yet. restapi.go drops the field, because a fetcher
-	// returning candles has nowhere to put a diagnostic; Stage 7 owns progress
-	// reporting and is where it becomes visible. Recording that here rather
-	// than claiming the diagnosis already works is the difference between a
-	// decoded value with a known consumer and one that is quietly ignored.
+	// The root package's restapi.go reports it to the configured slog.Logger:
+	// at debug level for every page, and once per fetch at warn level past four
+	// fifths of [WeightLimitPerMinute]. Reporting rather than reacting is the
+	// division of labour this package keeps everywhere — a page knows what one
+	// request cost, and only the layer owning the pipeline can decide that the
+	// pipeline should slow down.
 	UsedWeight int
 }
 

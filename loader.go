@@ -179,7 +179,13 @@ func NewLoader(opts ...Option) (*Loader, error) {
 		// setting by another name. restapi.go keeps the field because
 		// near-live use is a legitimate thing to want; the day it is wanted, a
 		// public option and a line here are the whole change.
-		rest:     restFetcher{api: vision.NewAPI(cfg.apiBaseURL, cfg.client, cfg.policy, cfg.limiter)},
+		rest: restFetcher{
+			api: vision.NewAPI(cfg.apiBaseURL, cfg.client, cfg.policy, cfg.limiter),
+			// The same logger the loader keeps, so the REST quota reading
+			// appears in the same stream as the substitutions and pauses it
+			// helps explain.
+			logger: cfg.logger,
+		},
 		sem:      newSemaphore(cfg.concurrency),
 		minPause: cfg.minPause,
 		maxPause: cfg.maxPause,

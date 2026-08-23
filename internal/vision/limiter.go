@@ -143,3 +143,21 @@ func NewLimiter(ratePerSecond float64, burst int) *rate.Limiter {
 	// added.
 	return rate.NewLimiter(rate.Limit(ratePerSecond), burst)
 }
+
+// BurstFor returns the burst that pairs with a sustained rate, in weight units.
+//
+// The rule is half a second's worth of the rate, never less than one klines
+// call. At [DefaultWeightPerSecond] that is exactly [DefaultBurst], which is
+// the point: the shipped policy is not a pair of unrelated constants but one
+// number and a rule, so a caller who lowers the rate gets a proportionally
+// smaller spike rather than the shipped burst on top of their slower refill.
+//
+// The floor matters more than it looks. rate.Limiter.WaitN returns an error
+// rather than waiting when n exceeds the burst, so a bucket smaller than
+// [KlinesWeight] would fail every klines call forever instead of pacing it —
+// the failure mode a caller asking for a very low rate is least expecting.
+func BurstFor(ratePerSecond float64) int {
+	burst := int(ratePerSecond / 2)
+
+	return max(burst, KlinesWeight)
+}

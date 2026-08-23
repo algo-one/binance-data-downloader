@@ -248,6 +248,77 @@ func WithConcurrency(n int) Option {
 	})
 }
 
+// WithRateLimit lowers the sustained rate this loader is allowed to spend
+// against the REST endpoint's quota, in weight units per second. The default is
+// [vision.DefaultWeightPerSecond].
+//
+// # What the unit is
+//
+// Binance meters the REST mirror as REQUEST_WEIGHT, not as requests: 6000 per
+// minute per IP address, measured on 2026-08-20, and one klines call costs 2 of
+// them. So the quota is 100 weight per second, the default takes 40, and the
+// argument here is in the same unit Binance publishes rather than a translation
+// of it that would need re-deriving every time the cost of a call changes.
+//
+// Only the REST tail is paced. data.binance.vision is a static file server with
+// no quota, so listing and archive downloads are unaffected — [WithConcurrency]
+// is the knob for those.
+//
+// # Why you would turn it down
+//
+// The quota is per IP, not per API key or per process, so everything on the
+// machine draws from the same 6000: a live trading bot, a second backtest,
+// another copy of this library. The default already leaves most of the budget
+// unspent for exactly that reason, and it cannot know how much company it has.
+// If a history download shares an address with something latency-sensitive,
+// spending less than 40 is the way to say so.
+//
+// Exceeding the quota is worse than being slow. Binance escalates a 429 a
+// client keeps ignoring into an HTTP 418, an IP ban running from two minutes to
+// three days and lengthening with repeat offences — which punishes the address
+// rather than the process, so the ban shows up in the trading bot's logs.
+//
+// # Why it will not let you go up
+//
+// Values above the quota's own 100 per second are rejected rather than clamped.
+// There is no rate above it that Binance permits, so accepting one would be
+// accepting a setting that cannot be honoured, and clamping silently would have
+// this function report success for a policy it did not apply. The ceiling is
+// the quota itself rather than the default, so raising the rate towards it
+// stays possible for a caller who knows they have the address to themselves.
+//
+// # The one thing to know before using it
+//
+// A loader built without this option shares one process-wide limiter with every
+// other such loader, because two buckets each honouring the documented rate
+// permit twice it — correct alone and wrong in aggregate. This option opts out
+// of that sharing: the loader gets a bucket of its own. With a single loader in
+// the process, which is the normal case, that is exactly what it looks like.
+// With several, set it on all of them, or the ones left on the default are
+// spending from a second bucket that knows nothing about this one.
+func WithRateLimit(weightPerSecond float64) Option {
+	return optionFunc(func(c *loaderConfig) error {
+		if weightPerSecond <= 0 {
+			return fmt.Errorf("loader: rate limit %g: must be greater than zero: %w",
+				weightPerSecond, ErrInvalidRequest)
+		}
+
+		// The quota expressed per second. Written as the division rather than
+		// as 100 so that the published number stays the only place the figure
+		// lives, and a correction to it reaches this check for free.
+		const quotaPerSecond = float64(vision.WeightLimitPerMinute) / 60
+
+		if weightPerSecond > quotaPerSecond {
+			return fmt.Errorf("loader: rate limit %g: exceeds the published quota of %g weight per second: %w",
+				weightPerSecond, quotaPerSecond, ErrInvalidRequest)
+		}
+
+		c.limiter = vision.NewLimiter(weightPerSecond, vision.BurstFor(weightPerSecond))
+
+		return nil
+	})
+}
+
 // WithHTTPClient supplies the [http.Client] used for every request.
 //
 // The default is a package-wide client built in internal/vision, and it is

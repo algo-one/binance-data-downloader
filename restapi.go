@@ -3,6 +3,7 @@ package binancedata
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/algo-one/binance-data-downloader/internal/vision"
@@ -63,6 +64,24 @@ const restPageSize = vision.MaxKlinesLimit
 // frontier is a day or two of the same. A thousand pages is an order of
 // magnitude beyond either, and still a number rather than a hope.
 const maxRESTPages = 1000
+
+// restWeightWarnThreshold is the used-weight reading past which a fetch says so
+// out loud, in weight units spent by this IP in the current minute.
+//
+// Four fifths of [vision.WeightLimitPerMinute]. The number is chosen against
+// what this library alone can produce rather than as a round fraction: the
+// default pace is vision.DefaultWeightPerSecond, so a minute of this loader
+// running flat out accounts for 2400 of the 6000, and even a loader configured
+// to the full quota settles at 6000 only while saturated. A reading of 4800
+// therefore means either a burst worth knowing about or — far more likely, and
+// the case no amount of local accounting can detect — something else on this
+// address spending the same budget.
+//
+// Warning rather than acting on it is deliberate. The pipeline's response to
+// actual pressure is the 429 handling in loader.go, which has the server's own
+// word for it; this is the diagnostic that explains why that fired, or that it
+// is about to.
+const restWeightWarnThreshold = vision.WeightLimitPerMinute * 4 / 5
 
 // restRef names one range to fetch from the REST API.
 //
@@ -141,6 +160,12 @@ type restFetcher struct {
 	// because near-live use is a legitimate thing to want, and Stage 7 can
 	// surface it as an option on NewLoader without this file changing.
 	includePartial bool
+
+	// logger is where the used-weight diagnostic goes. It is never nil —
+	// loader.go passes the configured one, which defaults to a discarding
+	// handler — so there is no nil check at the call site, for the reason
+	// defaultLoaderConfig gives for defaulting it that way.
+	logger *slog.Logger
 }
 
 // klines fetches every candle in ref, paginating until the range is covered.
@@ -218,6 +243,10 @@ func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]
 	// since it is also what advances the cursor.
 	var prev time.Time
 
+	// warnedOnWeight keeps the quota warning to one per fetch. See where it is
+	// set for why a per-page warning would be worse than none.
+	var warnedOnWeight bool
+
 	cursor := ref.Start
 
 	for page := 1; cursor.Before(ref.End); page++ {
@@ -247,6 +276,39 @@ func (f restFetcher) klines(ctx context.Context, ref restRef, now time.Time) ([]
 		})
 		if err != nil {
 			return nil, translateRESTError(err)
+		}
+
+		// What Binance says this IP has spent in the current minute, counting
+		// this request. It is reported before the empty-page check on purpose:
+		// a page with no candles in it still cost quota and still carries the
+		// header, and a range that turns out to be empty is exactly when a
+		// caller wants to know the budget went somewhere.
+		//
+		// Zero means the header was absent or unreadable rather than that
+		// nothing has been spent — this request alone costs vision.KlinesWeight
+		// — so it is not reported as a measurement.
+		if got.UsedWeight > 0 {
+			f.logger.DebugContext(ctx, "rest quota used",
+				"ref", ref,
+				"page", page,
+				"used_weight", got.UsedWeight,
+				"limit", vision.WeightLimitPerMinute)
+
+			// Once per fetch, not once per page. A hundred-page range that
+			// crosses the threshold on its first page crosses it on all
+			// hundred, and a warning repeated ninety-nine times is a warning
+			// nobody reads — the condition is a property of the minute, not of
+			// the page that happened to observe it.
+			if !warnedOnWeight && got.UsedWeight >= restWeightWarnThreshold {
+				warnedOnWeight = true
+
+				f.logger.WarnContext(ctx,
+					"rest quota is running low; another process on this IP may be spending it",
+					"ref", ref,
+					"used_weight", got.UsedWeight,
+					"limit", vision.WeightLimitPerMinute,
+					"threshold", restWeightWarnThreshold)
+			}
 		}
 
 		if len(got.Klines) == 0 {
