@@ -1,4 +1,0 @@
-- Better terminal UI.
-- Debug log mode
-- lets go further: - mise setup the same
-- Architecture diagram in HTML
