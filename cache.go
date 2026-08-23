@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
@@ -236,7 +237,7 @@ func (c *cache) paths(ref archiveRef) (cachePaths, error) {
 	// filepath.Join, not path.Join: these are filesystem paths, and on Windows
 	// the separator is a backslash. The bucket keys in availability.go use
 	// path.Join for the mirror-image reason — URLs are always forward slashes.
-	dir := filepath.Join(c.root, market, DataTypeKlines.String(), ref.Symbol, ref.Interval.String(), ref.Agg.String())
+	dir := filepath.Join(c.root, market, dataTypeKlines.String(), ref.Symbol, ref.Interval.String(), ref.Agg.String())
 
 	return cachePaths{
 		name:    name,
@@ -1148,6 +1149,567 @@ type PruneResult struct {
 	// Err is set when the archive was prunable and deleting it failed. The
 	// archive is still there; nothing else about the cache changed.
 	Err error
+}
+
+// EvictOptions selects which cache entries [Loader.EvictCache] removes.
+//
+// # Why every field is a filter and none is a policy
+//
+// Because the two automatic policies a cache usually gets are both unreliable
+// here, and it is worth saying which and why rather than leaving the absence to
+// look like an oversight.
+//
+// *Expire by age* would have to read a file's modification time, and that
+// records when an entry was **downloaded**, not when it was last used. A
+// symbol-month a backtest reads on every run expires on schedule while one
+// fetched yesterday and never opened again survives — the wrong axis, applied
+// confidently.
+//
+// *Evict least-recently-used under a size cap* needs a recency signal the
+// filesystem does not reliably give. Access times are off or coarse on most
+// Linux configurations (`noatime`, or `relatime`'s once-a-day update), so the
+// library would have to record reads itself: a write on every cache hit,
+// against a read path whose whole claim is that a hit opens the sidecar and a
+// parquet footer and touches nothing else. Paying for that on every read to
+// answer a question asked once a month is the wrong trade.
+//
+// What is left is the signal the caller actually has, and it is a good one: "my
+// window moved on, drop 2019", "I am done with these symbols". So this is a
+// selection rather than a rule, and the deleting happens when it is asked for.
+//
+// # At least one selector is required
+//
+// A zero EvictOptions is an error rather than "everything", because the zero
+// value of a struct is what a caller gets by forgetting to fill one in, and the
+// cost of that mistake here is the whole cache. Deleting everything is a
+// legitimate request and has its own spelling: All, which may not be combined
+// with a filter.
+type EvictOptions struct {
+	// Symbols limits the eviction to these trading pairs, in any spelling
+	// [NormalizeSymbol] accepts. Empty means every symbol.
+	Symbols []string
+
+	// Intervals limits it to these candle periods. Empty means every interval.
+	Intervals []Interval
+
+	// Before limits it to entries that end at or before this instant —
+	// entries covering *only* instants earlier than it.
+	//
+	// The bound is on the data, not on the file: it is read from the archive's
+	// own name, so it means the same thing whenever the entry was downloaded.
+	// It is also exclusive at the whole-entry level rather than trimming, since
+	// an entry is the unit the cache stores: January's monthly archive survives
+	// a Before of 2024-01-15, because half of it is still wanted and there is
+	// no way to keep half a file. Set Before to 2024-02-01 to remove it.
+	//
+	// Must be UTC when set. The zero value means every period.
+	Before time.Time
+
+	// All evicts the entire cache. It is the only way to run with no filter,
+	// and setting it alongside one is an error rather than a redundancy — a
+	// call that says both "everything" and "only these" has two readings and
+	// neither is safe to guess.
+	All bool
+
+	// DryRun reaches every verdict and deletes nothing. Each [EvictResult]
+	// comes back with the files it would have removed and Removed false.
+	DryRun bool
+}
+
+// evictFilter is EvictOptions after validation: the same question, in the form
+// the walk asks it.
+//
+// The sets are nil rather than empty when a dimension is unfiltered, and the
+// difference carries meaning that a length check would have to re-derive at
+// every call site: a nil set matches everything, and an empty non-nil set would
+// match nothing. Only one of those can be built here, because validate rejects
+// an EvictOptions naming no symbol at all.
+type evictFilter struct {
+	symbols   map[string]bool
+	intervals map[Interval]bool
+	before    time.Time
+}
+
+// validate checks the options and returns the filter they describe.
+func (o EvictOptions) validate() (evictFilter, error) {
+	filtered := len(o.Symbols) > 0 || len(o.Intervals) > 0 || !o.Before.IsZero()
+
+	switch {
+	case o.All && filtered:
+		return evictFilter{}, fmt.Errorf(
+			"evict: All cannot be combined with a filter: %w", ErrInvalidRequest)
+
+	case !o.All && !filtered:
+		return evictFilter{}, fmt.Errorf(
+			"evict: name at least one of Symbols, Intervals or Before, or set All: %w", ErrInvalidRequest)
+	}
+
+	var filter evictFilter
+
+	if len(o.Symbols) > 0 {
+		filter.symbols = make(map[string]bool, len(o.Symbols))
+
+		for _, symbol := range o.Symbols {
+			// Normalised here for the same reason a Request's symbol is: the
+			// cache tree is keyed by the normalised form, so "BTC/USDT" would
+			// otherwise match no directory and evict nothing while reporting
+			// success.
+			normalized, err := NormalizeSymbol(symbol)
+			if err != nil {
+				return evictFilter{}, fmt.Errorf("evict: %w", err)
+			}
+
+			filter.symbols[normalized] = true
+		}
+	}
+
+	if len(o.Intervals) > 0 {
+		filter.intervals = make(map[Interval]bool, len(o.Intervals))
+
+		for _, iv := range o.Intervals {
+			if !iv.IsValid() {
+				return evictFilter{}, fmt.Errorf("evict: interval %s: %w", iv, ErrInvalidRequest)
+			}
+
+			filter.intervals[iv] = true
+		}
+	}
+
+	if !o.Before.IsZero() {
+		// The same rule Request.Validate applies to Start and End, and for the
+		// same reason: a local-zone instant here would select a different set
+		// of entries on two machines running the same command.
+		if o.Before.Location() != time.UTC {
+			return evictFilter{}, fmt.Errorf(
+				"evict: Before is %s, must be UTC: %w", o.Before.Location(), ErrInvalidRequest)
+		}
+
+		filter.before = o.Before
+	}
+
+	return filter, nil
+}
+
+// EvictResult is one cache entry an eviction considered, and what it decided.
+//
+// An entry is the unit the cache stores and therefore the unit this removes:
+// the archive, its .CHECKSUM sidecar and the parquet built from it, however
+// many of the three are still on disk. A previously pruned entry has two of
+// them and is evicted exactly like any other.
+type EvictResult struct {
+	// Name is the entry's archive name without its extension, e.g.
+	// "BTCUSDT-1h-2024-01". It is what to print: the date in it is formatted
+	// the way the entry's own granularity formats it, so a monthly entry reads
+	// as 2024-01 and a daily one as 2024-01-15 without the caller deciding.
+	Name string
+
+	// Symbol and Interval are the entry's, taken from the cache tree it sits
+	// in rather than parsed out of Name.
+	Symbol   string
+	Interval Interval
+
+	// Period is the first instant the entry covers, UTC. Whether it spans a
+	// month or a day is visible in Name.
+	Period time.Time
+
+	// Files are the entry's files that were on disk, absolute, in the order
+	// archive, sidecar, parquet — skipping any that was already gone.
+	Files []string
+
+	// Size is their total in bytes: what evicting this entry reclaims, or
+	// would have.
+	Size int64
+
+	// Removed reports whether this call deleted them. It is false in a dry
+	// run, and false when Err is set.
+	//
+	// A partial failure counts as not removed: if one of the three files could
+	// not be deleted, Err says so and Removed stays false even though the
+	// others are gone. The entry is unusable either way — a read needs all
+	// three or a rebuild — and reporting it as removed would overstate what
+	// was reclaimed.
+	Removed bool
+
+	// Err is set when a file should have gone and would not.
+	Err error
+}
+
+// evict removes whole cache entries the filter selects.
+//
+// [Loader.EvictCache] is the exported door and carries the reasoning; this is
+// the walk.
+//
+// # Why this walks directories and prune walks files
+//
+// Because the two operate on different units, and the difference is not
+// cosmetic. A prune considers archives, so a file walk with an extension test
+// is the whole of its traversal. An eviction considers *entries*, which are one
+// to three files sharing a stem — and, crucially, an entry that has already
+// been pruned has no .zip at all. Anchoring on the archive would skip precisely
+// the entries a previous prune left behind, which are the ones a cache
+// accumulates.
+//
+// Walking the tree by directory answers both problems at once. The leaf
+// directory is market/klines/symbol/interval/granularity, so the symbol and the
+// interval come from the path rather than from parsing a file name, and one
+// ReadDir hands over every file of every entry in it together.
+//
+// # Nothing is deleted that this code cannot name
+//
+// A file whose name is not one this library would have generated is left alone,
+// and so is a directory level that does not parse. That is the same strictness
+// [parseArchiveDate] applies to a bucket listing, and here it is what keeps a
+// stray file — a half-written temporary, something a person dropped in — from
+// being swept up by a command that was asked to remove 2019.
+func (c *cache) evict(ctx context.Context, opts EvictOptions) iter.Seq2[EvictResult, error] {
+	return func(yield func(EvictResult, error) bool) {
+		filter, err := opts.validate()
+		if err != nil {
+			yield(EvictResult{}, err)
+
+			return
+		}
+
+		// The same question walkCacheFiles settles before its walk, and for the
+		// same reason: a root that has never been created is an empty cache,
+		// not a fault, and deciding that from an error the walk produced later
+		// cannot tell it from a file that vanished mid-walk.
+		if _, err := os.Stat(c.root); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return
+			}
+
+			yield(EvictResult{}, fmt.Errorf("cache: evicting from %s: %w", c.root, err))
+
+			return
+		}
+
+		stopped := false
+
+		err = filepath.WalkDir(c.root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if !d.IsDir() {
+				return nil
+			}
+
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			leaf, ok := c.leafDir(path, filter)
+			if !ok {
+				// Not a directory this walk should descend into: either a level
+				// that does not match the filter, or one that is not part of
+				// the layout at all. Either way its subtree holds nothing to
+				// evict.
+				return fs.SkipDir
+			}
+
+			if leaf == nil {
+				return nil // an ancestor of the leaves; keep descending
+			}
+
+			if !c.evictDir(*leaf, filter, opts.DryRun, yield) {
+				stopped = true
+
+				return fs.SkipAll
+			}
+
+			// The leaf is done, and it has no subdirectories worth visiting.
+			return fs.SkipDir
+		})
+
+		if err != nil && !stopped {
+			yield(EvictResult{}, fmt.Errorf("cache: evicting from %s: %w", c.root, err))
+		}
+	}
+}
+
+// evictLeaf is one data directory of the cache tree, with the identity its path
+// encodes already recovered.
+type evictLeaf struct {
+	dir      string
+	symbol   string
+	interval Interval
+	agg      aggregation
+}
+
+// leafDir classifies a directory inside the cache tree.
+//
+// It returns (nil, true) for a directory the walk should descend into, a
+// non-nil leaf for one holding entries, and ok false for anything to skip —
+// including a level that the filter has ruled out, which is what makes
+// `-symbol BTC/USDT` cost one directory read rather than a walk of every symbol
+// on the machine.
+//
+// The layout it decodes is the one [cache.paths] builds:
+//
+//	<root>/<market>/klines/<symbol>/<interval>/<granularity>/
+func (c *cache) leafDir(path string, filter evictFilter) (*evictLeaf, bool) {
+	rel, err := filepath.Rel(c.root, path)
+	if err != nil {
+		return nil, false
+	}
+
+	if rel == "." {
+		return nil, true
+	}
+
+	parts := strings.Split(rel, string(filepath.Separator))
+
+	switch len(parts) {
+	case 1:
+		// The market segment. Every value marketPath can produce is accepted
+		// rather than enumerated here, because "spot" is the only one today and
+		// a futures tree would be evictable the moment it existed.
+		return nil, true
+
+	case 2:
+		// The data type. Only klines are written, and a directory named
+		// anything else was not put there by this library.
+		return nil, parts[1] == dataTypeKlines.String()
+
+	case 3:
+		return nil, filter.symbols == nil || filter.symbols[parts[2]]
+
+	case 4:
+		// ParseInterval rather than a scan of Intervals(), and it round-trips
+		// with the directory name because cache.paths names the directory with
+		// Interval.String. It accepts the REST spelling too, which cannot
+		// appear here — a directory named "1M" is not one this library wrote,
+		// and evicting from it would be evicting from a tree nothing reads.
+		iv, err := ParseInterval(parts[3])
+		if err != nil || iv.String() != parts[3] {
+			return nil, false
+		}
+
+		return nil, filter.intervals == nil || filter.intervals[iv]
+
+	case 5:
+		// The interval is re-parsed rather than carried down from case 4,
+		// because WalkDir calls this with a path and no memory of the parent.
+		// It cannot fail: this directory was only descended into because case 4
+		// accepted its parent.
+		iv, err := ParseInterval(parts[3])
+		if err != nil {
+			return nil, false
+		}
+
+		agg, ok := parseAggregation(parts[4])
+		if !ok {
+			return nil, false
+		}
+
+		return &evictLeaf{dir: path, symbol: parts[2], interval: iv, agg: agg}, true
+
+	default:
+		// Deeper than the layout goes.
+		return nil, false
+	}
+}
+
+// parseAggregation is the inverse of [aggregation.String], over the two
+// directory names cache.paths writes.
+func parseAggregation(name string) (aggregation, bool) {
+	for _, agg := range []aggregation{aggMonthly, aggDaily} {
+		if agg.String() == name {
+			return agg, true
+		}
+	}
+
+	return 0, false
+}
+
+// evictDir evicts the entries of one leaf directory, reporting each through
+// yield. It returns false when the consumer stopped iterating.
+func (c *cache) evictDir(
+	leaf evictLeaf, filter evictFilter, dryRun bool, yield func(EvictResult, error) bool,
+) bool {
+	entries, err := os.ReadDir(leaf.dir)
+	if err != nil {
+		return yield(EvictResult{}, fmt.Errorf("cache: evicting from %s: %w", leaf.dir, err))
+	}
+
+	// Grouped by stem, in the order ReadDir hands them over — which is sorted
+	// by name, and the dates in these names are ISO, so entries come out
+	// oldest first without a sort. The same property the S3 listing relies on.
+	var (
+		stems []string
+		files = make(map[string][]fs.DirEntry, len(entries))
+	)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		stem, ok := entryStem(entry.Name())
+		if !ok {
+			continue // not one of ours; see the note on evict
+		}
+
+		if _, seen := files[stem]; !seen {
+			stems = append(stems, stem)
+		}
+
+		files[stem] = append(files[stem], entry)
+	}
+
+	evicted := 0
+
+	for _, stem := range stems {
+		period, ok := parseArchiveDate(stem+archiveExt, leaf.symbol, leaf.interval, leaf.agg)
+		if !ok {
+			// The name matched an extension but not the stem this library
+			// builds — a different symbol or interval than the directory it is
+			// sitting in, which is not a file we put there.
+			continue
+		}
+
+		if !selectedByBefore(period, leaf.agg, filter.before) {
+			continue
+		}
+
+		result := c.evictEntry(leaf, stem, period, files[stem], dryRun)
+		if result.Removed {
+			evicted++
+		}
+
+		if !yield(result, nil) {
+			return false
+		}
+	}
+
+	// A directory emptied by this call is removed, and the parents that its
+	// removal emptied with it. os.Remove refuses a directory that still holds
+	// anything, so this needs no emptiness test of its own and cannot delete a
+	// tree something else is using: the failure is the guard. Errors are
+	// ignored for the same reason — a directory that would not go is a
+	// directory that was not empty, which is the ordinary case.
+	if evicted > 0 && !dryRun {
+		c.removeEmptyDirs(leaf.dir)
+	}
+
+	return true
+}
+
+// entryStem recovers the shared name of a cache entry's files, and reports
+// whether the file is one of the three an entry consists of.
+//
+// The sidecar is tested first, and the order is load-bearing: a sidecar is
+// named <archive>.CHECKSUM, so it ends in ".CHECKSUM" and *contains* ".zip".
+// Testing the archive suffix first would leave a stem ending in ".zip" and the
+// sidecar would group under a key of its own.
+func entryStem(name string) (string, bool) {
+	for _, suffix := range []string{archiveExt + vision.ChecksumSuffix, archiveExt, parquetExt} {
+		if stem, ok := strings.CutSuffix(name, suffix); ok {
+			return stem, true
+		}
+	}
+
+	return "", false
+}
+
+// selectedByBefore reports whether an entry covering this period ends early
+// enough to be evicted.
+//
+// The comparison is against the entry's **end** rather than its start, and that
+// is the difference between a bound on data and a bound on file names. A
+// monthly archive for 2024-01 covers the whole of January, so a caller asking
+// to keep everything from 2024-01-15 onward must keep it: half of it is still
+// wanted, and a file is not divisible. Comparing the start instead would delete
+// the fifteen days the caller said they still needed.
+func selectedByBefore(period time.Time, agg aggregation, before time.Time) bool {
+	if before.IsZero() {
+		return true
+	}
+
+	var end time.Time
+
+	switch agg {
+	case aggMonthly:
+		end = period.AddDate(0, 1, 0)
+	case aggDaily:
+		end = period.AddDate(0, 0, 1)
+	default:
+		// Unreachable: leafDir only builds a leaf for a granularity
+		// parseAggregation recognised. Keeping the entry is the safe reading of
+		// a case that cannot happen.
+		return false
+	}
+
+	return !end.After(before)
+}
+
+// evictEntry deletes one entry's files, or measures them for a dry run.
+func (c *cache) evictEntry(
+	leaf evictLeaf, stem string, period time.Time, entries []fs.DirEntry, dryRun bool,
+) EvictResult {
+	result := EvictResult{
+		Name:     stem,
+		Symbol:   leaf.symbol,
+		Interval: leaf.interval,
+		Period:   period,
+	}
+
+	// The three names an entry can have, in the order cache.paths lists them,
+	// so a report reads tier 1, its sidecar, then tier 2. Only the ones ReadDir
+	// actually saw are included — a pruned entry has no archive, and saying it
+	// had one would misreport what was reclaimed.
+	present := make(map[string]fs.DirEntry, len(entries))
+	for _, entry := range entries {
+		present[entry.Name()] = entry
+	}
+
+	for _, name := range []string{stem + archiveExt, stem + archiveExt + vision.ChecksumSuffix, stem + parquetExt} {
+		entry, ok := present[name]
+		if !ok {
+			continue
+		}
+
+		result.Files = append(result.Files, filepath.Join(leaf.dir, name))
+
+		if info, err := entry.Info(); err == nil {
+			result.Size += info.Size()
+		}
+		// A file that vanished between ReadDir and now contributes no bytes and
+		// is still listed: the removal below treats an absent file as removed,
+		// so the entry is gone either way and the size is the only casualty.
+	}
+
+	if dryRun || len(result.Files) == 0 {
+		return result
+	}
+
+	for _, file := range result.Files {
+		// ErrNotExist is success. Something else removing the file first is
+		// indistinguishable from this call removing it, and the caller's
+		// question — "is this entry out of the cache" — is answered yes.
+		if err := os.Remove(file); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			result.Err = err
+
+			return result
+		}
+	}
+
+	result.Removed = true
+
+	return result
+}
+
+// removeEmptyDirs deletes dir and the ancestors its removal empties, stopping
+// at the cache root, which is left in place because the caller may not own it.
+func (c *cache) removeEmptyDirs(dir string) {
+	for dir != c.root && strings.HasPrefix(dir, c.root+string(filepath.Separator)) {
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+
+		dir = filepath.Dir(dir)
+	}
 }
 
 // usage walks the cache root and adds up what is in it.

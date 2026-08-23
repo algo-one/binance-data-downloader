@@ -36,6 +36,13 @@ type fakeLoader struct {
 	// above can only fail all of them at once.
 	streamErrs map[string]error
 
+	// intervalErrs is the same idea along the other axis, and it exists because
+	// -interval takes a list too. One symbol at three intervals where the
+	// middle one fails is a case streamErrs cannot express — it would fail all
+	// three — and it is the case that tells a failure line naming the symbol
+	// alone from one naming the pair.
+	intervalErrs map[binancedata.Interval]error
+
 	// available and availableErr are what Available returns.
 	available    binancedata.Availability
 	availableErr error
@@ -56,6 +63,15 @@ type fakeLoader struct {
 	// only way a test can tell a -n that reached the library from one that was
 	// parsed and dropped.
 	gotPrune binancedata.PruneOptions
+
+	// evicted and evictErr are what EvictCache yields, and gotEvict records
+	// what it was asked for. The options matter more here than anywhere else in
+	// this fake: `bmd evict` exists to translate flags into a selection, so a
+	// -before that was parsed and quietly dropped is the whole failure mode,
+	// and nothing about the files that came back would reveal it.
+	evicted  []binancedata.EvictResult
+	evictErr error
+	gotEvict binancedata.EvictOptions
 
 	// gotRequest records what Stream was asked for, which is what most of the
 	// download tests are actually about: the flags became this request.
@@ -93,6 +109,12 @@ func (f *fakeLoader) Stream(_ context.Context, req binancedata.Request) iter.Seq
 		// fails mid-range is the streamErr case below, and both reach the
 		// command the same way.
 		if err, ok := f.streamErrs[req.Symbol]; ok {
+			yield(binancedata.Kline{}, err)
+
+			return
+		}
+
+		if err, ok := f.intervalErrs[req.Interval]; ok {
 			yield(binancedata.Kline{}, err)
 
 			return
@@ -150,6 +172,24 @@ func (f *fakeLoader) PruneArchives(
 
 		if f.pruneErr != nil {
 			yield(binancedata.PruneResult{}, f.pruneErr)
+		}
+	}
+}
+
+func (f *fakeLoader) EvictCache(
+	_ context.Context, opts binancedata.EvictOptions,
+) iter.Seq2[binancedata.EvictResult, error] {
+	f.gotEvict = opts
+
+	return func(yield func(binancedata.EvictResult, error) bool) {
+		for _, e := range f.evicted {
+			if !yield(e, nil) {
+				return
+			}
+		}
+
+		if f.evictErr != nil {
+			yield(binancedata.EvictResult{}, f.evictErr)
 		}
 	}
 }

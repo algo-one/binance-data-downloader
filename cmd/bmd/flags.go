@@ -1,8 +1,9 @@
 package main
 
-// Flag plumbing shared by the three commands: how a date on a command line
-// becomes a time.Time, and how the flags every command has in common become
-// options for binancedata.NewLoader.
+// Flag plumbing shared by the five commands: how a date on a command line
+// becomes a time.Time, how a repeatable list flag collects its values, and how
+// the flags every command has in common become options for
+// binancedata.NewLoader.
 
 import (
 	"context"
@@ -107,6 +108,7 @@ func parseInstant(field, value string) (t time.Time, dateOnly bool, err error) {
 //	download   -cache-dir  -concurrency  -quiet  -verbose
 //	verify     -cache-dir                -quiet  -verbose
 //	prune      -cache-dir                -quiet  -verbose
+//	evict      -cache-dir                -quiet  -verbose
 //	cache      -cache-dir                        -verbose
 //	list                                         -verbose
 //
@@ -241,6 +243,7 @@ type loader interface {
 	VerifyCache(ctx context.Context) iter.Seq2[binancedata.CacheEntry, error]
 	CacheUsage(ctx context.Context) (binancedata.CacheUsage, error)
 	PruneArchives(ctx context.Context, opts binancedata.PruneOptions) iter.Seq2[binancedata.PruneResult, error]
+	EvictCache(ctx context.Context, opts binancedata.EvictOptions) iter.Seq2[binancedata.EvictResult, error]
 }
 
 // parseSymbolInterval is the pair of flags every command that names data takes.
@@ -268,14 +271,14 @@ func parseSymbolInterval(symbol, interval string) (string, binancedata.Interval,
 	return normalized, iv, nil
 }
 
-// parseInterval resolves the -interval flag.
+// parseInterval resolves one -interval value.
 //
-// Split out of parseSymbolInterval because `bmd download` takes several symbols
-// against one interval, so the two are no longer parsed together there.
-// Validation is left to the library — ParseInterval knows the sixteen intervals
-// and both spellings of the monthly one — but the error is rewritten as a usage
-// error, because a bad flag value is a typing mistake and deserves the exit
-// status that says so.
+// Split out of parseSymbolInterval because `bmd download` takes lists of both
+// symbols and intervals, so neither is parsed alongside the other there any
+// more. Validation is left to the library — ParseInterval knows the sixteen
+// intervals and both spellings of the monthly one — but the error is rewritten
+// as a usage error, because a bad flag value is a typing mistake and deserves
+// the exit status that says so.
 func parseInterval(value string) (binancedata.Interval, error) {
 	if strings.TrimSpace(value) == "" {
 		return 0, usagef("-interval is required, for example 1h")
@@ -289,20 +292,70 @@ func parseInterval(value string) (binancedata.Interval, error) {
 	return iv, nil
 }
 
-// symbolList collects the -symbol flag, which may be given more than once and
-// may hold a comma-separated list each time. These two are equivalent:
+// parseIntervals resolves every -interval value and drops the duplicates.
+//
+// It is parseSymbols' counterpart, and the deduplication is there for the same
+// reason rather than for tidiness: an [binancedata.Interval] appears in the
+// generated output name, so two flag values that mean one interval would give
+// two downloads the same path, each writing its own temporary file, with the
+// second rename silently replacing the first's work.
+//
+// The duplicates are not hypothetical here the way "BTC/USDT versus BTCUSDT"
+// is. Binance itself spells the monthly interval two ways — "1mo" in an archive
+// path and "1M" in a REST parameter — ParseInterval accepts both on purpose,
+// and `-interval 1mo,1M` is one interval written the way each half of Binance
+// writes it. Deduplicating after parsing is the only point at which that is
+// visible; before it they are two different strings.
+func parseIntervals(values []string) ([]binancedata.Interval, error) {
+	// The same backstop parseSymbols carries, for the same reason: download()
+	// runs checkListFlag first and has a better message, and without this an
+	// empty slice would produce zero requests and a run that reports "0 of 0"
+	// and exits 0 — a silent success for a command that downloaded nothing.
+	if len(values) == 0 {
+		return nil, usagef("-interval is required, for example 1h")
+	}
+
+	var (
+		out  = make([]binancedata.Interval, 0, len(values))
+		seen = make(map[binancedata.Interval]bool, len(values))
+	)
+
+	for _, value := range values {
+		iv, err := parseInterval(value)
+		if err != nil {
+			return nil, err
+		}
+
+		if seen[iv] {
+			continue
+		}
+
+		seen[iv] = true
+
+		out = append(out, iv)
+	}
+
+	return out, nil
+}
+
+// listFlag collects a flag that may be given more than once and may hold a
+// comma-separated list each time. `bmd download` registers two of them, -symbol
+// and -interval, and all four of these spellings are equivalent:
 //
 //	bmd download -symbol BTC/USDT,ETH/USDT
 //	bmd download -symbol BTC/USDT -symbol ETH/USDT
+//	bmd download -interval 1h,1d
+//	bmd download -interval 1h -interval 1d
 //
 // Both spellings exist because both are what people already have. A list is
 // what somebody types by hand; repetition is what a shell loop building an
 // argument slice produces. Supporting one and not the other would send whoever
 // has the wrong one off to write a join or a split.
 //
-// A comma is safe as the separator because no symbol can contain one:
-// NormalizeSymbol accepts letters, digits and a single "/" or "-" separator,
-// and rejects everything else.
+// A comma is safe as the separator for both flags because neither value can
+// contain one: NormalizeSymbol accepts letters, digits and a single "/" or "-"
+// separator and rejects everything else, and the sixteen interval spellings are
+// a digit and a letter.
 //
 // # Why this is a flag.Value
 //
@@ -310,12 +363,21 @@ func parseInterval(value string) (binancedata.Interval, error) {
 // the last occurrence and silently discards the earlier ones, so
 // `-symbol BTC/USDT -symbol ETH/USDT` would download ETHUSDT alone and say
 // nothing about the symbol it dropped.
-type symbolList []string
+//
+// # Why one type for both flags
+//
+// Because the alternative is two types differing in nothing, and a second copy
+// of Set is a second place for the comma handling to drift. The values are
+// strings here and are parsed by the flag's own parser afterwards — parseSymbols
+// for one, parseIntervals for the other — so nothing about a symbol or an
+// interval is baked in at this level. What the two flags do share is the shape
+// of the mistake this guards: a flag given twice and silently honoured once.
+type listFlag []string
 
 // String is flag.Value's renderer, used in the default shown by -h. It is
 // deliberately the input spelling rather than Go syntax, so the help text reads
 // like something you could type.
-func (s *symbolList) String() string {
+func (s *listFlag) String() string {
 	if s == nil {
 		return ""
 	}
@@ -323,15 +385,15 @@ func (s *symbolList) String() string {
 	return strings.Join(*s, ",")
 }
 
-// Set appends one occurrence's worth of symbols, splitting it on commas.
+// Set appends one occurrence's worth of values, splitting it on commas.
 //
 // An occurrence that yields nothing appends nothing and is not reported here.
 // It is a usage error, and this is the wrong place to raise one: stdlib flag
 // renders a Set failure with %v rather than %w, so an error returned here
 // reaches the caller with its chain flattened, errors.Is cannot find errUsage in
 // it, and report gives it exit status 1 where every other bad flag value gets 2.
-// checkSymbolFlag below raises it instead, where the wrapping survives.
-func (s *symbolList) Set(value string) error {
+// checkListFlag below raises it instead, where the wrapping survives.
+func (s *listFlag) Set(value string) error {
 	for _, part := range strings.Split(value, ",") {
 		if part = strings.TrimSpace(part); part != "" {
 			*s = append(*s, part)
@@ -341,7 +403,7 @@ func (s *symbolList) Set(value string) error {
 	return nil
 }
 
-// checkSymbolFlag reports an absent -symbol and an empty one differently.
+// checkListFlag reports an absent list flag and an empty one differently.
 //
 // The distinction lives in the FlagSet rather than in the value, exactly as it
 // does in commonFlags.options: fs.Visit walks only the flags actually set on the
@@ -351,25 +413,27 @@ func (s *symbolList) Set(value string) error {
 // It is worth telling apart. `-symbol "$SYMBOLS"` with the variable unset is a
 // command that meant to name something, and answering it with "-symbol is
 // required" points at a flag that was given, which is the kind of message that
-// costs somebody ten minutes.
-func checkSymbolFlag(fs *flag.FlagSet, symbols symbolList) error {
-	if len(symbols) > 0 {
+// costs somebody ten minutes. The same shell mistake reaches -interval through
+// `-interval "$INTERVALS"`, which is why this takes the flag's name rather than
+// naming -symbol itself.
+func checkListFlag(fs *flag.FlagSet, name string, values listFlag, example string) error {
+	if len(values) > 0 {
 		return nil
 	}
 
 	given := false
 
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "symbol" {
+		if f.Name == name {
 			given = true
 		}
 	})
 
 	if given {
-		return usagef("-symbol was given but names no symbol")
+		return usagef("-%s was given but names no %s", name, name)
 	}
 
-	return usagef("-symbol is required, for example BTC/USDT")
+	return usagef("-%s is required, for example %s", name, example)
 }
 
 // parseSymbols normalises every symbol and drops the duplicates.
@@ -384,7 +448,7 @@ func checkSymbolFlag(fs *flag.FlagSet, symbols symbolList) error {
 // temporary file, with the second rename silently replacing the first's work.
 func parseSymbols(symbols []string) ([]string, error) {
 	// A backstop, and unreachable from the one caller there is today:
-	// download() runs checkSymbolFlag before buildRequests, and that returns an
+	// download() runs checkListFlag before buildRequests, and that returns an
 	// error for every empty case with a better message than this one — it can
 	// tell "never given" from "given and names nothing", which a slice cannot.
 	//

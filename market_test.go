@@ -157,25 +157,31 @@ func TestMarketTextMarshalling(t *testing.T) {
 func TestDataType(t *testing.T) {
 	t.Parallel()
 
-	// Same convention as Market and Interval: the zero value is invalid.
-	var unset DataType
-	if unset == DataTypeKlines {
-		t.Error("the zero value of DataType must not be DataTypeKlines")
-	}
-	if unset.IsValid() {
-		t.Error("the zero value of DataType must not be valid")
+	// Same convention as Market and Interval: the zero value is not the one
+	// valid member.
+	var unset dataType
+	if unset == dataTypeKlines {
+		t.Error("the zero value of dataType must not be dataTypeKlines")
 	}
 
 	// The string is also the path segment data.binance.vision uses, so a typo
 	// here would produce a 404 rather than a compile error.
-	if got, want := DataTypeKlines.String(), "klines"; got != want {
-		t.Errorf("DataTypeKlines.String() = %q, want %q", got, want)
+	if got, want := dataTypeKlines.String(), "klines"; got != want {
+		t.Errorf("dataTypeKlines.String() = %q, want %q", got, want)
 	}
 
-	if DataType(9).IsValid() {
-		t.Error("DataType(9) must not be valid")
+	// What the zero value renders as, which is the property that replaced
+	// IsValid when this type was unexported. A dataType is never validated
+	// because it is never supplied by a caller — it reaches a path builder or
+	// it does not exist. So the defence that matters is that an unset one
+	// cannot spell a working path: "dataType(0)" 404s, where a zero value
+	// falling through to "klines" would build a URL that quietly succeeds and
+	// cache it under a directory nobody asked for.
+	if got, want := dataType(0).String(), "dataType(0)"; got != want {
+		t.Errorf("dataType(0).String() = %q, want %q", got, want)
 	}
-	if got, want := DataType(9).String(), "DataType(9)"; got != want {
-		t.Errorf("DataType(9).String() = %q, want %q", got, want)
+
+	if got, want := dataType(9).String(), "dataType(9)"; got != want {
+		t.Errorf("dataType(9).String() = %q, want %q", got, want)
 	}
 }

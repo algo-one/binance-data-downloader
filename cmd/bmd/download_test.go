@@ -562,6 +562,11 @@ func TestCommandsOfferOnlyTheFlagsTheyHonour(t *testing.T) {
 		{command: "list", flag: "-cache-dir", want: false},
 		{command: "list", flag: "-concurrency", want: false},
 		{command: "list", flag: "-quiet", want: false},
+
+		{command: "evict", flag: "-cache-dir", want: true},
+		{command: "evict", flag: "-quiet", want: true},
+		{command: "evict", flag: "-verbose", want: true},
+		{command: "evict", flag: "-concurrency", want: false},
 	}
 
 	for _, tt := range tests {

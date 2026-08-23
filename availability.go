@@ -109,7 +109,7 @@ func archivePrefix(m Market, symbol string, iv Interval, agg aggregation) (strin
 	// path.Join, not filepath.Join. These are URL paths and always use forward
 	// slashes; filepath uses the host separator, which would silently produce
 	// backslashes on Windows and a 404 that only reproduces there.
-	return path.Join("data", mp, agg.String(), DataTypeKlines.String(), symbol, iv.String()) + "/", nil
+	return path.Join("data", mp, agg.String(), dataTypeKlines.String(), symbol, iv.String()) + "/", nil
 }
 
 // archiveDateLayouts are the time layouts Binance names archives with, one per

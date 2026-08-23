@@ -39,18 +39,21 @@ mise run build
 
 bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
 bmd download -symbol BTC/USDT,ETH/USDT -interval 1h -start 2024-01-01 -out ./data
+bmd download -symbol BTC/USDT -interval 1m,1h,1d -start 2024-01-01 -out ./data
 bmd list     -symbol BTC/USDT -interval 1mo      # what Binance actually publishes
 bmd cache                                        # what the cache holds
 bmd prune                                        # reclaim disk; -n to look first
+bmd evict    -symbol BTC/USDT -before 2023-01-01 # delete data you are done with
 bmd verify                                       # re-hash the cache
 ```
 
 `-start` and `-end` are both inclusive, and a bare `-end` date covers that whole
 day. Output is csv, json or parquet. See [docs/cli.md](docs/cli.md).
 
-Give `-symbol` a list rather than running one `bmd` per symbol: Binance's rate
-limit is per IP address and the limiter honouring it is per process, so several
-processes exceed it between them.
+Give `-symbol` and `-interval` lists rather than running one `bmd` per symbol or
+per interval: Binance's rate limit is per IP address and the limiter honouring it
+is per process, so several processes exceed it between them. Every pair of the
+two lists is downloaded, each to its own file.
 
 ## Why
 
@@ -78,8 +81,9 @@ text, the numbers in them are exact, and this library keeps them that way.
 alongside its `.CHECKSUM`. Tier 2 is a Parquet file derived from it, which is
 what reads actually hit. Each Parquet records the SHA-256 of the archive it was
 built from in its own footer, so a cached file can be trusted without re-hashing
-anything. In the steady state nothing is ever rebuilt. See
-[docs/caching.md](docs/caching.md).
+anything. In the steady state nothing is ever rebuilt. It never evicts on its
+own — `bmd prune` reclaims the archives reads no longer need, and `bmd evict`
+removes entries you name. See [docs/caching.md](docs/caching.md).
 
 **Embeddable first.** The library is designed to sit inside a backtesting
 framework, so the CLI is a thin shell over it rather than the other way round.

@@ -106,36 +106,59 @@ func (m *Market) UnmarshalText(text []byte) error {
 	return nil
 }
 
-// DataType selects which family of market data a request refers to.
+// dataType selects which family of market data a request refers to.
 //
-// Only [DataTypeKlines] is implemented, and klines are the only type this
-// library is scoped to. The type is here because it is the segment of every
-// archive URL that would change first — /data/spot/monthly/klines/ becomes
-// /data/spot/monthly/aggTrades/ — and because each other data type has a
-// different CSV schema, so a second value would arrive with its own parser
-// rather than by loosening this one.
-type DataType uint8
+// It is unexported, and that is a decision rather than an oversight — one worth
+// spelling out, because [Market] directly above is exported on reasoning this
+// rejects.
+//
+// Market is exported because callers *pass* one: it is a field of [Request] and
+// of [AvailabilityQuery], so a program has to be able to name MarketSpot. A data
+// type is not a field of anything. Klines are the only family this library
+// parses, both call sites that build a path hardcode the constant below, and no
+// exported function accepts one. Exporting it would publish a type a caller can
+// name and has nowhere to hand to — the type-level form of the rule
+// docs/architecture.md states for options: an accepted-and-ignored setting is a
+// defect, not a stub.
+//
+// Nothing is lost by waiting, because the two directions are not symmetrical.
+// Adding an exported type later is a backwards-compatible change, so the day a
+// second family arrives — aggTrades, trades, bookTicker, each with its own CSV
+// schema and therefore its own parser — this is re-exported and given a home on
+// Request. Adding a *required* field to Request later is the change that is not
+// backwards compatible, since every existing caller leaves it zero and this
+// package's whole enum convention is that zero is invalid. Deciding that now,
+// with one family to choose between, would be deciding it with no information.
+//
+// It stays a named type rather than becoming a bare string constant because it
+// is the segment of every archive URL that would change first —
+// /data/spot/monthly/klines/ becomes /data/spot/monthly/aggTrades/ — and a type
+// keeps the two places that build those paths from spelling it by hand.
+type dataType uint8
 
 // The supported data types. As with [Market] and [Interval], 0 is left
 // unassigned so the zero value is invalid — the same reasoning applies, and one
 // convention across every enum in this package is worth more than a convenience
 // saved on the one type that currently has a single member.
 const (
-	DataTypeKlines DataType = iota + 1 // candlesticks
+	dataTypeKlines dataType = iota + 1 // candlesticks
 )
-
-// IsValid reports whether d is a data type this library supports.
-func (d DataType) IsValid() bool {
-	return d == DataTypeKlines
-}
 
 // String returns the data type's name, which is also the path segment
 // data.binance.vision uses for it.
-func (d DataType) String() string {
+//
+// There is no IsValid beside it, unlike [Market] and [Interval]. Those two are
+// validated because they arrive from a caller and may be anything; a dataType
+// is only ever the constant above, so an IsValid here would have no call site
+// but its own test. What the zero value must not do is still pinned, and by the
+// property that actually matters: it renders as dataType(0), which builds a
+// path that 404s loudly, rather than as "klines", which would build a path that
+// silently works.
+func (d dataType) String() string {
 	switch d {
-	case DataTypeKlines:
+	case dataTypeKlines:
 		return "klines"
 	default:
-		return "DataType(" + strconv.Itoa(int(d)) + ")"
+		return "dataType(" + strconv.Itoa(int(d)) + ")"
 	}
 }

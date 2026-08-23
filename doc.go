@@ -39,7 +39,8 @@
 // interval, holes included — the archives have them, and no calendar predicts
 // which. [Loader.VerifyCache] re-hashes cached archives against the checksums
 // they were published with. [Loader.CacheUsage] measures what the cache holds,
-// and [Loader.PruneArchives] reclaims the part of it that reads no longer need.
+// [Loader.PruneArchives] reclaims the part of it that reads no longer need, and
+// [Loader.EvictCache] removes entries themselves when a window has moved on.
 // [WriteParquet] writes candles in the same format the cache stores its second
 // tier in, for a query engine to read.
 //
@@ -86,6 +87,13 @@
 // 40% of a cache, since the Parquet is the larger of the two files. That is what
 // [Loader.PruneArchives] does, and it costs a download rather than a decode on
 // the one path that still needs an archive: rebuilding.
+//
+// The other 60% is the data. [Loader.EvictCache] removes whole entries —
+// archive, sidecar and Parquet — selected by symbol, interval or the period
+// they cover, which is the one operation here that a later read pays for in
+// full. The cache never evicts on its own: file times say when an entry was
+// downloaded rather than when it was used, so there is no honest expiry rule to
+// apply without recording every read.
 //
 // # A note on numbers
 //

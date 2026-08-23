@@ -10,8 +10,8 @@
 //
 //	bmd [flags] <command> [command flags]
 //
-// The three commands are download, list and verify. Run `bmd help` for the
-// summary and `bmd <command> -h` for a command's own flags.
+// The six commands are download, list, cache, prune, evict and verify. Run
+// `bmd help` for the summary and `bmd <command> -h` for a command's own flags.
 package main
 
 // A directory under cmd/ that declares `package main` becomes an executable.
@@ -217,6 +217,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "prune":
 		return prune(ctx, args, stdout, stderr)
 
+	case "evict":
+		return evict(ctx, args, stdout, stderr)
+
 	case "help":
 		writeUsage(stdout)
 
@@ -244,10 +247,11 @@ Usage:
   bmd [flags] <command> [command flags]
 
 Commands:
-  download    Download candles for a symbol and time range
+  download    Download candles for symbols, intervals and a time range
   list        Show what Binance publishes for a symbol and interval
   cache       Show what the cache holds and what can be reclaimed
   prune       Delete cached archives the cache no longer reads
+  evict       Delete cached data you no longer want
   verify      Re-hash cached archives against their checksums
   help        Show this help
 
@@ -263,6 +267,7 @@ Examples:
   bmd list -symbol BTC/USDT -interval 1h
   bmd cache
   bmd prune -n
+  bmd evict -symbol BTC/USDT -before 2023-01-01
   bmd verify
 
 Dates are UTC. A bare -end date includes that whole day.

@@ -1,10 +1,14 @@
 # Architecture
 
-> **Status:** all eleven stages are complete — 0 (scaffolding), 1 (domain types),
-> 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache), 6 (REST
-> fetcher), 7 (loader orchestration), 8 (CLI), 9 (documentation and release),
-> 10 (cache management) and 11 (multi-symbol download). Everything described
-> below exists. The remaining step is the v0.1.0 tag itself.
+> **Status:** all thirteen stages are complete — 0 (scaffolding), 1 (domain
+> types), 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache),
+> 6 (REST fetcher), 7 (loader orchestration), 8 (CLI), 9 (documentation and
+> release), 10 (cache management), 11 (multi-symbol download), 12 (the pre-tag
+> pass) and 13 (cache retention).
+> Everything described below exists. The remaining step is publishing — the
+> v0.1.0 tag and what goes with it — which is deliberately not done yet; see
+> "goreleaser is configured but not wired to CI" below for the part of it that
+> is already prepared.
 
 ## What the library does
 
@@ -735,7 +739,7 @@ again, which is what it was always documented to be.
 ├── doc.go            package documentation (the pkg.go.dev landing page)
 ├── version.go        module version, read from the embedded build info
 ├── interval.go       Interval + which intervals exist at which aggregation
-├── market.go         Market, DataType
+├── market.go         Market, and the unexported dataType
 ├── symbol.go         symbol normalisation across three formats
 ├── kline.go          the Kline struct and column helpers
 ├── errors.go         sentinel errors
@@ -833,6 +837,36 @@ the root is a mechanical rename, not a redesign.
 The domain types exist as of Stage 1, `Request` as of Stage 2, and `Loader`
 with its options as of Stage 7. This is the whole surface.
 
+Two things are deliberately *not* in it, both settled in Stage 12 on the
+grounds that a tag makes an API permanent and the two directions are not
+symmetrical — **adding** an exported identifier later is backwards compatible,
+while removing one or adding a required struct field is not. So the rule the
+pass applied was: publish nothing that cannot be used yet.
+
+- **`DataType` is unexported.** It had been exported since Stage 1 and no
+  exported declaration ever accepted one: `Request` carries `Symbol`,
+  `Interval`, `Market`, `Start` and `End`, `AvailabilityQuery` carries four
+  fields of its own, and neither has ever had a data-type field. It was a type a
+  caller could name and had nowhere to hand to — the type-level form of the rule
+  below that an accepted-and-ignored setting is a defect, not a stub. Giving it a
+  home on `Request` instead was considered and rejected: `DataTypeKlines` is the
+  only legal value, so every call site would gain a required field with one
+  possible answer, and the day a second family arrives is the day to decide
+  whether the zero value means klines or the change costs a version. Deciding it
+  now, with one family to choose between, would be deciding it with no
+  information.
+- **There is no `ReadParquet`.** The asymmetry with `WriteParquet` is real and
+  is the answer rather than an omission. A Go program that wants candles has
+  `Loader.Fetch`, which reads the same format out of the cache in about 6 ms per
+  symbol-month; exporting and re-reading in one process would be a slower way to
+  do that. Exports exist for the tools that are not this program, the schema is
+  fixed and documented in `docs/caching.md`, and any parquet reader can open one.
+  Adding the function would also have meant either leaking `errCacheStale` — an
+  unexported sentinel whose text says "cached parquet is stale" — to a caller
+  holding a file that has nothing to do with the cache, or inventing a public
+  sentinel for it. The doc comment on `WriteParquet` now says all of this, which
+  is where the question actually gets asked.
+
 ```go
 type Request struct {
     Symbol   string    // "BTC/USDT", "BTC-USDT" or "BTCUSDT" — all normalised
@@ -865,6 +899,9 @@ func WriteParquet(ctx context.Context, w io.Writer, seq iter.Seq2[Kline, error])
 func (l *Loader) CacheUsage(ctx context.Context) (CacheUsage, error)
 func (l *Loader) PruneArchives(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error]
 
+// Retention, added in Stage 13. See "Retention" below.
+func (l *Loader) EvictCache(ctx context.Context, opts EvictOptions) iter.Seq2[EvictResult, error]
+
 type CacheUsage struct {
     Root                       string
     Archives, Sidecars         int64 // bytes, tier 1 and its .CHECKSUM files
@@ -879,6 +916,25 @@ func (u CacheUsage) Total() int64
 
 type PruneOptions struct {
     DryRun bool // reach every verdict, delete nothing
+}
+
+type EvictOptions struct {
+    Symbols   []string   // empty means every symbol
+    Intervals []Interval // empty means every interval
+    Before    time.Time  // entries ending at or before this; zero means every period
+    All       bool       // the only way to run with no filter; not combinable with one
+    DryRun    bool
+}
+
+type EvictResult struct {
+    Name     string    // e.g. "BTCUSDT-1h-2024-01"; the layout says monthly or daily
+    Symbol   string
+    Interval Interval
+    Period   time.Time // first instant the entry covers, UTC
+    Files    []string  // the entry's files that existed, absolute
+    Size     int64
+    Removed  bool
+    Err      error
 }
 
 type PruneResult struct {
@@ -996,10 +1052,11 @@ can consume candles without materialising the range.
 
 ## The command line
 
-`bmd` is five commands over the library, and the interesting part of building the
+`bmd` is six commands over the library, and the interesting part of building the
 first three was discovering that two of them had nothing to call. `download`
-takes a list of symbols; see "Several symbols in one process" below for why that
-is a rate-limit decision rather than a convenience.
+takes a list of symbols and a list of intervals and downloads every pair; see
+"Several symbols and intervals in one process" below for why that is a
+rate-limit decision rather than a convenience.
 
 ### The CLI needed public API before it could be a thin shell
 
@@ -1071,19 +1128,35 @@ archive's hash and the codec version, and rebuilt when either fails, so it is
 verified continuously by the code that uses it. Tier 1 is the only tier nothing
 re-reads, which is what makes it the one worth a command.
 
-## Several symbols in one process
+## Several symbols and intervals in one process
 
-`bmd download` takes a list of symbols, and the reason is the rate limit rather
-than convenience.
+`bmd download` takes a list of symbols **and** a list of intervals, and the
+reason is the rate limit rather than convenience.
 
 `REQUEST_WEIGHT` is enforced per IP address, and `internal/vision/limiter.go`
 says of its process-wide limiter that "sharing is not an optimisation here, it is
 the requirement": two limiters each allowing 40 weight per second permit 80
-against a ceiling of 100. Until now the only way to download several symbols at
-once was several `bmd` processes, which is several limiters — three of them are
-at 120 against that ceiling, and Binance answers persistent excess with an HTTP
-418 that bans the address for two minutes to three days. The tool's only
+against a ceiling of 100. Until Stage 11 the only way to download several symbols
+at once was several `bmd` processes, which is several limiters — three of them
+are at 120 against that ceiling, and Binance answers persistent excess with an
+HTTP 418 that bans the address for two minutes to three days. The tool's only
 multi-symbol shape was the shape that breaks its own limiter.
+
+**`-interval` became a list for the same reason, and that is the point worth
+recording.** The argument above is about *processes*; it says nothing about
+symbols. `for iv in 1m 1h 1d; do bmd download -interval $iv ...; done` is three
+limiters exactly as three symbols in three processes were, so Stage 11 fixed one
+spelling of a hazard and left its mirror image in place. Stage 12 closed it, and
+the flag it closed it with is the one Stage 11 already built: the same
+`flag.Value`, now a shared `listFlag` type registered twice, because two types
+differing in nothing is a second place for the comma handling to drift.
+
+Every pair of the two lists is downloaded — two symbols at three intervals is
+six downloads — since the alternative readings both lose data quietly. Pairing
+the lists off positionally would require them to be the same length, and would
+make `-symbol BTC/USDT,ETH/USDT -interval 1h` mean one download rather than two.
+The order is symbol-major, so a directory of results groups a symbol's intervals
+together and the progress display finishes one symbol before starting the next.
 
 **Streaming, not `FetchAll`.** `FetchAll` exists and is deliberately not used
 here. It returns `map[Request][]Kline` — every candle of every symbol resident at
@@ -1103,25 +1176,44 @@ the nested limit this document warns about under "Execute". Sequential keeps
 memory at one candle, the display readable, and one symbol's failure easy to
 describe.
 
-**One symbol failing does not abandon the rest**, and that is not a departure
+**One download failing does not abandon the rest**, and that is not a departure
 from the rule against returning less than was asked for. Nothing is silent: the
-failure is printed, counted, and reaches the exit status. A cancellation is
-treated differently and ends the run, since otherwise Ctrl-C would be reported as
-every remaining symbol having failed.
+failure is printed, counted, and reaches the exit status. The line naming it
+carries the symbol *and* the interval, matching the success line, because with
+three intervals of one symbol the symbol alone labels all three failures
+identically and the file that is missing is the one the pair identifies. A
+cancellation is treated differently and ends the run, since otherwise Ctrl-C
+would be reported as every remaining download having failed.
 
-**Everything but the symbol is parsed once**, and the clock is the reason. With
-`-end` left off the range ends "now"; reading that per symbol would give the
-symbols in one command different end instants, so their generated file names
-would disagree about the range.
+**Everything but the symbol and the interval is parsed once**, and the clock is
+the reason. With `-end` left off the range ends "now"; reading that per request
+would give the requests in one command different end instants, so their generated
+file names would disagree about the range.
 
-Two smaller decisions worth recording. `-symbol` is a `flag.Value`, because
-stdlib `flag` keeps only the last occurrence of a repeated flag — `-symbol
-BTC/USDT -symbol ETH/USDT` would otherwise download ETHUSDT alone and say nothing
-about the symbol it dropped. And the empty-value check lives in `checkSymbolFlag`
-rather than in `Set`: `flag` renders a `Set` failure with `%v` rather than `%w`,
-so an error returned from there arrives with its chain flattened, `errors.Is`
-cannot find `errUsage`, and it would exit 1 where every other bad flag value
-exits 2.
+**What the output names is whichever list varied.** The run summary counts in
+symbols, in intervals or — when both lists are plural and neither noun is right —
+in downloads, and the progress display labels its lines the same way, from two
+independent booleans rather than one. This is not decoration: two symbols at one
+interval and one symbol at two intervals are both *two requests*, so a count of
+requests cannot tell them apart, and the label a reader needs is the one that
+differs from line to line.
+
+Two smaller decisions worth recording, both inherited by `-interval` when it
+became a list. Each is a `flag.Value`, because stdlib `flag` keeps only the last
+occurrence of a repeated flag — `-symbol BTC/USDT -symbol ETH/USDT` would
+otherwise download ETHUSDT alone and say nothing about the symbol it dropped. And
+the empty-value check lives in `checkListFlag` rather than in `Set`: `flag`
+renders a `Set` failure with `%v` rather than `%w`, so an error returned from
+there arrives with its chain flattened, `errors.Is` cannot find `errUsage`, and
+it would exit 1 where every other bad flag value exits 2.
+
+Both lists are deduplicated after parsing rather than before, for the reason
+`bmd download`'s output names are generated: two entries meaning one thing would
+be two downloads writing one path, each through its own temporary file, with the
+second rename silently replacing the first's work. `BTC/USDT`, `BTC-USDT` and
+`btcusdt` are one symbol, and — less obviously — `1mo` and `1M` are one interval,
+because Binance itself spells the monthly archive one way and the monthly REST
+parameter the other, and `ParseInterval` accepts both on purpose.
 
 ## Reclaiming disk
 
@@ -1179,6 +1271,84 @@ named `prune` that declines to prune unless asked twice is worse, and `-n` is th
 spelling `make` and `rsync` already gave that job. The empty-`-cache-dir` guard
 matters more here than anywhere: `-cache-dir "$CACHE_DIR"` with the variable
 unset is a usage error rather than a silent fall back to the user's real cache.
+
+## Retention: removing the data itself
+
+Pruning reclaims about 40% of an entry and keeps every read working. The other
+60% is the data, and nothing removed it — the cache only ever grew. `Loader.
+EvictCache` and `bmd evict` close that, and the shape of them was decided by
+what signals actually exist.
+
+**Two commands, not one with a flag.** They differ in the only way that matters
+when a command deletes things: a prune cannot cost you data, and this is the
+removal of data. Folding them together would end the property that makes
+`bmd prune` safe to run without thinking, and a guarantee holding for half of a
+command's behaviour is not one anybody can lean on.
+
+**There is no automatic policy, and that is a measurement rather than an
+omission.** Both of the usual ones rest on a signal this cache does not have.
+
+- *Expire by age* keys on a file's modification time, which records when an entry
+  was **downloaded**, not when it was used. The symbol-month a backtest reads on
+  every run expires on schedule while one fetched yesterday and never opened
+  again survives.
+- *Least-recently-used under a size cap* needs a recency signal. Access times are
+  unreliable across the platforms this runs on — `noatime`, or `relatime`'s
+  once-a-day update — so the library would have to record reads itself: a write
+  on every cache hit, against a read path whose whole claim is that a hit opens
+  the sidecar and a Parquet footer and touches nothing else.
+
+What the caller has instead is knowledge of its own window, so eviction is a
+selection: symbols, intervals, and a bound on the period the data covers.
+
+**At least one selector is required, and `All` is a separate word.** A zero
+`EvictOptions` is an error rather than "everything". The zero value of a struct
+is what a caller gets by forgetting to fill one in, and this is the one place in
+the package where that mistake is unrecoverable. `All` cannot be combined with a
+filter either: a call saying both "everything" and "only these" has two readings
+and neither is safe to guess.
+
+**`Before` bounds the data, not the file.** An entry is evicted only when it
+*ends* at or before the instant given, so a bound of 2024-01-15 keeps January's
+monthly archive — half of it is still wanted and a file is not divisible.
+Comparing the period's start instead would delete those fifteen days and report
+success. The CLI's `-before` therefore takes a bare date as **midnight**, the
+opposite of `bmd download -end`, which stretches one to the end of that day:
+`-end` names the last instant you want and `-before` names the first one you do
+not.
+
+**The walk is over directories, and that is forced by pruning.** A prune leaves
+the sidecar and the Parquet, so every entry a prune has been over has no `.zip`
+— which is most of a long-lived cache, and precisely the entries retention
+exists to remove. An implementation anchored on archives would skip them and
+report success. Walking `market/klines/symbol/interval/granularity` instead
+solves a second problem in the same move: the symbol and the interval come from
+the path rather than from parsing a file name, which is the direction
+`archivePrunable` warns about, and one `ReadDir` hands over every file of every
+entry in the directory together so the three files of an entry can be grouped by
+their shared stem.
+
+One ordering detail inside that grouping is load-bearing and easy to reverse. A
+sidecar is named `<archive>.CHECKSUM`, so it ends in `.CHECKSUM` and *contains*
+`.zip`; testing the archive suffix first leaves a stem ending in `.zip`, the
+sidecar groups under a key of its own, and an eviction deletes the archive and
+the Parquet while leaving the sidecar behind.
+`TestEntryStemGroupsTheSidecarWithItsArchive` pins it.
+
+**Nothing this library did not write is touched**, at any level — a stray file in
+a data directory, a directory that is not part of the layout. The name has to be
+one `archiveName` would have produced for the symbol, interval and granularity of
+the directory it sits in, which is the same strictness `parseArchiveDate` applies
+to a bucket listing. Directories emptied by an eviction are removed along with
+the parents that leaves empty, up to but not including the root; `os.Remove`
+refuses a non-empty directory, so the failure is the guard and no emptiness test
+is needed.
+
+**The invariant is the mirror of pruning's, and is tested the same way.**
+`TestEvictedEntryIsFetchedAgain` evicts, reads, and counts requests — because an
+eviction returns the right candles either way, by downloading them. Pruning must
+not cost a request; evicting must. The pair of tests is what separates the two
+operations in fact rather than in prose.
 
 ## Documentation and release
 
@@ -1355,7 +1525,7 @@ setting is a defect, not a stub.
 | # | Stage | Status |
 | --- | --- | --- |
 | 0 | Scaffolding and tooling — mise, go.mod, linting, CI, docs skeleton | **done** |
-| 1 | Domain types — `Interval`, `Market`, `DataType`, symbol normalisation, `Kline`, `errors.go` | **done** |
+| 1 | Domain types — `Interval`, `Market`, `dataType`, symbol normalisation, `Kline`, `errors.go` | **done** |
 | 2 | Time and availability — month/day expansion, availability probing, UTC validation, S3 listing client | **done** |
 | 3 | Parsing — zip → csv → `[]Kline`; header sniffing, per-row ms/µs detection, `CodecVersion` | **done** |
 | 4 | Downloader — shared `http.Client`, retry with backoff, SHA-256 verification, typed 404 | **done** |
@@ -1366,13 +1536,29 @@ setting is a defect, not a stub.
 | 9 | Docs and release — runnable examples, `Option` as an interface, goreleaser | **done** |
 | 10 | Cache management — `Loader.CacheUsage`, `Loader.PruneArchives`, `bmd cache`, `bmd prune` | **done** |
 | 11 | Multi-symbol `bmd download` — one process, one rate limiter | **done** |
+| 12 | Pre-tag pass — `DataType` unexported, multi-interval `bmd download`, doc corrections | **done** |
+| 13 | Cache retention — `Loader.EvictCache`, `bmd evict` | **done** |
 
-Stages 10 and 11 were not in the original plan. Stage 10 is the capability
+Stages 10 to 13 were not in the original plan. Stage 10 is the capability
 `docs/caching.md` designed in Stage 5 and left unbuilt, added because the only
 cache management that shipped was `bmd verify -rm`, which deletes corrupt files
 and nothing else. Stage 11 closed the gap between the library's process-wide rate
 limiter and a CLI whose only multi-symbol shape was one process per symbol — the
-shape that breaks it. See "Reclaiming disk" and "Several symbols in one process"
+shape that breaks it.
+
+Stage 12 is the pass a tag makes worth doing, since a tag is what makes an API
+permanent. It settled the two surface questions recorded under "Public API"
+above, extended `-interval` into a list because Stage 11's own rate-limit
+argument turned out to say nothing about symbols and therefore applied unchanged
+to the other flag, and corrected two package doc comments that still described
+`bmd` as three commands.
+
+Stage 13 is the gap Stage 12 raised and deliberately did not fill: the cache
+only ever grew, since pruning reclaims the archives and nothing removed the data.
+It was left for its own stage because the policy was a decision rather than an
+implementation, and the decision was to have no policy — see "Retention" below
+for why the two automatic ones both rest on a signal this cache does not have.
+See also "Reclaiming disk" and "Several symbols and intervals in one process"
 above.
 
 ## Dependencies

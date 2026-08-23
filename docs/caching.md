@@ -227,6 +227,62 @@ decoding every cached file to answer a question about disk space.
 `bmd cache` reports what `bmd prune` would free, from the same predicate, so the
 number in the report is the number the command delivers.
 
+## Eviction: removing the data itself
+
+Pruning reclaims about 40% of an entry and keeps every read working. The other
+60% is the data, and there is a second command for it — `Loader.EvictCache` and
+`bmd evict`, which delete whole entries: the archive, its sidecar and the
+Parquet together.
+
+They are two operations and not one with a flag, because they differ in the only
+way that matters when a command deletes things. A prune cannot cost you data; an
+eviction is the removal of data, and every read of an evicted entry goes back to
+Binance. A guarantee that holds for half of a command's behaviour is not one
+anybody can lean on, so `bmd prune` stays the one that is always safe to run.
+
+**Nothing is evicted automatically.** No size cap, no expiry, and that is a
+conclusion rather than an omission — both of the usual policies rest on a signal
+this cache does not have.
+
+- *Expire by age* would key on a file's modification time, which records when an
+  entry was **downloaded** and not when it was last used. The symbol-month a
+  backtest reads on every run expires on schedule; the one fetched yesterday and
+  never opened again survives. The axis is wrong, and confidently so.
+- *Least-recently-used under a size cap* needs a recency signal. Access times
+  are unreliable across the platforms this runs on — `noatime`, or `relatime`'s
+  once-a-day update — so the library would have to record reads itself. That is
+  a write on every cache hit, against a read path whose whole claim is that a
+  hit opens the sidecar and a Parquet footer and touches nothing else. Paying
+  that on every read to answer a question asked once a month is the wrong trade.
+
+What a caller does have is knowledge of its own window. So eviction is a
+selection — symbols, intervals, and a bound on the period the data covers — and
+three properties follow from doing it that way.
+
+**At least one selector is required.** A zero `EvictOptions` is an error rather
+than "everything", because a zero struct is what a caller gets by forgetting to
+fill one in and the cost of that mistake here is the whole cache. `All` is the
+spelling for everything, and it may not be combined with a filter.
+
+**`Before` bounds the data, not the file.** An entry is evicted only when it
+*ends* at or before the instant given, so `-before 2024-01-15` keeps January's
+monthly archive — half of it is data the caller said they still want, and a file
+is not divisible. Comparing the period's start instead would delete those
+fifteen days and report success.
+
+**A pruned entry is still an entry.** A prune leaves the sidecar and the
+Parquet, so everything a prune has been over has no `.zip` — which is most of a
+long-lived cache. The walk is therefore over directories and groups files by
+their shared stem, rather than looking for archives and working outward from
+them. An implementation that anchored on the `.zip` would skip exactly the
+entries that accumulate.
+
+Files this library did not write are never touched, at any level: the name has
+to be one `archiveName` would have produced for the symbol, interval and
+granularity of the directory it sits in. A directory emptied by an eviction is
+removed, along with the parents that leaves empty, up to but not including the
+cache root.
+
 ## Integrity
 
 Tier 1 is verified against its `.CHECKSUM` **at download time**, and on demand

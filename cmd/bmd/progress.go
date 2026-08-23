@@ -43,6 +43,13 @@ type progress struct {
 	// chunk is noise; with several it is the only thing distinguishing one
 	// [3/12] from another.
 	showSymbol bool
+
+	// showInterval does the same for the interval, and is set independently:
+	// `-symbol BTC/USDT -interval 1h,1d` varies only the interval, so that is
+	// the column worth printing and the symbol is the noise. The two are
+	// separate booleans rather than one "label the lines" flag for exactly that
+	// case.
+	showInterval bool
 }
 
 // newProgress builds the reporter, or returns nil when there should not be one.
@@ -77,13 +84,17 @@ var newProgress = func(w io.Writer, quiet bool) *progress {
 // here out of habit: it would be harmless and it would also be a lie about
 // where the synchronisation lives.
 func (p *progress) report(ev binancedata.Progress) {
-	// The symbol comes from the event rather than from a field set per symbol,
+	// Both labels come from the event rather than from a field set per download,
 	// which is what makes this correct if the reporting ever stops being
 	// sequential: Progress carries the request the chunk belongs to, so a line
-	// cannot end up labelled with whichever symbol happened to start last.
+	// cannot end up labelled with whichever request happened to start last.
 	label := ""
 	if p.showSymbol {
 		label = ev.Request.Symbol + " "
+	}
+
+	if p.showInterval {
+		label += ev.Request.Interval.String() + " "
 	}
 
 	line := fmt.Sprintf("[%*d/%d] %s%s %s  %s",

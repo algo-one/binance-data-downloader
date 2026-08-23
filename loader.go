@@ -1288,3 +1288,84 @@ func (l *Loader) CacheUsage(ctx context.Context) (CacheUsage, error) {
 func (l *Loader) PruneArchives(ctx context.Context, opts PruneOptions) iter.Seq2[PruneResult, error] {
 	return l.cache.prune(ctx, opts)
 }
+
+// EvictCache deletes whole cache entries — archive, sidecar and parquet —
+// selected by [EvictOptions], yielding one [EvictResult] per entry considered:
+//
+//	opts := binancedata.EvictOptions{
+//	    Symbols: []string{"BTC/USDT"},
+//	    Before:  time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC),
+//	}
+//
+//	for result, err := range loader.EvictCache(ctx, opts) {
+//	    if err != nil {
+//	        return err
+//	    }
+//	    freed += result.Size
+//	}
+//
+// Pass DryRun to reach every verdict and delete nothing.
+//
+// # How this differs from PruneArchives, and why they are separate
+//
+// [Loader.PruneArchives] cannot cost you data. It removes only archives whose
+// parquet can already serve reads on its own, so every read that succeeded
+// before a prune succeeds after it, and the worst case is a download the day
+// [CodecVersion] moves. This is the opposite operation: it removes the data
+// itself, and every read of an evicted entry goes back to Binance.
+//
+// They are two methods rather than one with more options for exactly that
+// reason. A caller reaching for the safe one should not be one typo away from
+// the destructive one, and a guarantee that holds for half a function's
+// behaviour is not a guarantee anybody can rely on.
+//
+// # There is no automatic policy, and that is deliberate
+//
+// The cache never evicts on its own — no size cap, no expiry. [EvictOptions]
+// carries the measurements behind that: expiry by file age would key on when an
+// entry was downloaded rather than when it was used, and a least-recently-used
+// size cap needs a recency signal the filesystem does not reliably provide,
+// which the library could only supply by writing on every cache hit. What a
+// caller does have is knowledge of its own window — "the backtest starts at
+// 2023 now" — and that is what this takes.
+//
+// # An entry is the unit, and a pruned entry is still an entry
+//
+// The three files of an entry share a stem and are removed together, however
+// many of them are on disk. This matters more than it sounds: an entry that
+// `bmd prune` has already been over has no .zip left, and an implementation
+// looking for archives would walk straight past exactly the entries a cache
+// accumulates over time.
+//
+// Files this library did not write are never touched, at any level — a stray
+// file in a data directory, a directory that is not part of the layout. The
+// name has to be one [archiveName] would have produced for the symbol,
+// interval and granularity of the directory it sits in.
+//
+// # Empty directories go with the entries
+//
+// A data directory emptied by an eviction is removed, and so are the parents
+// that leaves empty, up to but not including the cache root. Nothing else
+// collects them, and a tree of empty directories is what makes `bmd cache`
+// report an empty cache while the layout is still visible in a file browser.
+//
+// # Two error channels, two meanings
+//
+// The yielded error ends the iteration: the options did not validate, the cache
+// directory could not be walked, or ctx was cancelled. A file that could not be
+// deleted is not that and stops nothing — it arrives in [EvictResult.Err] with
+// a nil error beside it, since reporting on every entry is the job.
+//
+// # It must not run while the same cache is being filled
+//
+// The same coordination rule [Loader.PruneArchives] carries, and nothing
+// enforces it here either. An entry deleted between a read establishing that
+// its parquet is present and that read opening it turns a cache hit into a
+// "no such file or directory" that the next call would not have. Nothing is
+// written wrongly and nothing is lost that a download cannot replace, but it is
+// a failure a caller did not have to have. Evict when the Loader is idle.
+//
+// A cache directory that does not exist yet yields nothing and no error.
+func (l *Loader) EvictCache(ctx context.Context, opts EvictOptions) iter.Seq2[EvictResult, error] {
+	return l.cache.evict(ctx, opts)
+}

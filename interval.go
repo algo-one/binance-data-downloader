@@ -64,8 +64,8 @@ type Interval uint8
 // an invalid interval rather than a silently plausible one. Go has no
 // constructors and cannot stop a caller from writing binancedata.Request{},
 // so "the zero value is detectably wrong" is the only defence available for a
-// field a caller must actually choose. [Market] and [DataType] are built the
-// same way, for the same reason.
+// field a caller must actually choose. [Market] is built the same way, for the
+// same reason, as is the unexported dataType beside it.
 //
 // The names are terse on purpose: Interval1h reads at a call site the way the
 // documentation reads, and the type name already supplies the noun.

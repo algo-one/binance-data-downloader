@@ -5,8 +5,9 @@
 CLI holds no logic of its own beyond turning text into those values and candles
 into a file. Anything you can do here you can do from Go code, and vice versa —
 `bmd verify` is `Loader.VerifyCache`, `bmd list` is `Loader.Available`,
-`bmd cache` is `Loader.CacheUsage`, `bmd prune` is `Loader.PruneArchives`, and
-`--format parquet` is `binancedata.WriteParquet`.
+`bmd cache` is `Loader.CacheUsage`, `bmd prune` is `Loader.PruneArchives`,
+`bmd evict` is `Loader.EvictCache`, and `--format parquet` is
+`binancedata.WriteParquet`.
 
 ## Build
 
@@ -38,7 +39,7 @@ bmd download \
 | Flag | Meaning |
 | --- | --- |
 | `-symbol` | `BTC/USDT`, `BTC-USDT` or `BTCUSDT` — all normalised. Repeat it or comma-separate for several |
-| `-interval` | `1s` … `1mo` (`1M` is accepted too); validated against what Binance publishes |
+| `-interval` | `1s` … `1mo` (`1M` is accepted too); validated against what Binance publishes. Repeat it or comma-separate for several |
 | `-start`, `-end` | `YYYY-MM-DD` or RFC 3339, UTC. **Both ends are included** |
 | `-market` | `spot` (the only implemented value today) |
 | `-out` | A file, a directory, or `-` for stdout. Default: a generated name here |
@@ -48,50 +49,70 @@ bmd download \
 | `-quiet` | Print nothing to stderr but errors — no progress, no summary |
 | `-verbose` | Log what the pipeline is doing to stderr |
 
-### Several symbols
+### Several symbols and intervals
 
 ```bash
 bmd download -symbol BTC/USDT,ETH/USDT,SOL/USDT \
   -interval 1h -start 2024-01-01 -end 2024-03-31 -out ./data
 
 bmd download -symbol BTC/USDT -symbol ETH/USDT -interval 1h -start 2024-01-01 -out ./data
+
+bmd download -symbol BTC/USDT -interval 1m,1h,1d \
+  -start 2024-01-01 -end 2024-03-31 -out ./data
 ```
 
-Both spellings work and mix freely. A list is what you type by hand; repetition
-is what a shell loop building an argument slice produces.
+Both flags take lists, both spellings work, and they mix freely. A list is what
+you type by hand; repetition is what a shell loop building an argument slice
+produces.
 
-**Do this rather than running one `bmd` per symbol, and the reason is the rate
-limit.** Binance enforces `REQUEST_WEIGHT` per IP address — 6000 per minute,
-which is 100 per second — and the limiter that respects it is built once per
-process and shared by everything in it. That is not an optimisation; it is the
-requirement, because two limiters each honouring the documented 40 weight per
-second permit 80 between them. Three `bmd download` processes started together
-are at 120 against a ceiling of 100, and Binance answers a client that keeps
-exceeding it with an HTTP 418: an IP ban of two minutes to three days, which
-locks out everything else on the machine and no retry undoes.
+**Every pair is downloaded.** Two symbols at three intervals is six downloads,
+in symbol order — a symbol's intervals stay together in the output directory.
+There is no positional pairing of the two lists: that would require them to be
+the same length, and would make `-symbol BTC/USDT,ETH/USDT -interval 1h` mean one
+download rather than two.
 
-One process, one limiter, however many symbols.
+**Do this rather than running one `bmd` per symbol or per interval, and the
+reason is the rate limit.** Binance enforces `REQUEST_WEIGHT` per IP address —
+6000 per minute, which is 100 per second — and the limiter that respects it is
+built once per process and shared by everything in it. That is not an
+optimisation; it is the requirement, because two limiters each honouring the
+documented 40 weight per second permit 80 between them. Three `bmd download`
+processes started together are at 120 against a ceiling of 100, and Binance
+answers a client that keeps exceeding it with an HTTP 418: an IP ban of two
+minutes to three days, which locks out everything else on the machine and no
+retry undoes.
 
-The symbols are fetched one after another. Each one's chunks still go out in
+A shell loop over intervals breaks this in exactly the way a shell loop over
+symbols does. The quota is counted per address, not per symbol, so nothing about
+varying the interval instead makes it cheaper.
+
+One process, one limiter, however many symbols and intervals.
+
+The pairs are fetched one after another. Each one's chunks still go out in
 parallel up to `-concurrency`, and the fetch pool is shared across the whole run,
 so a range worth downloading keeps it busy on its own.
 
-**Each symbol gets its own file**, so `-out` must name a directory or be left
-off. `-out -` and `-out somefile.csv` are refused for more than one symbol —
+**Each download gets its own file**, so `-out` must name a directory or be left
+off. `-out -` and `-out somefile.csv` are refused for more than one download —
 neither has a reading, and both failure modes are silent: one file would
-interleave headers into nonsense, and honouring one symbol would drop the rest
+interleave headers into nonsense, and honouring one download would drop the rest
 without a word. A directory that does not exist is refused rather than created.
+This counts downloads and not symbols: one symbol at two intervals is two files
+and needs a directory exactly as two symbols at one interval do.
 
-Duplicates are dropped after normalising, so `-symbol BTC/USDT,BTCUSDT` is one
-download. Without that, two downloads would write the same generated file name
-and the second would silently replace the first.
+Duplicates are dropped from both lists, after parsing rather than before, since
+that is the only point at which they are visible. `-symbol BTC/USDT,BTCUSDT` is
+one symbol, and `-interval 1mo,1M` is one interval — Binance spells the monthly
+archive `1mo` and the monthly REST parameter `1M`, and both are accepted on
+purpose. Without this, two downloads would write the same generated file name and
+the second would silently replace the first.
 
-**One symbol failing does not abandon the rest.** A delisted pair among four good
-ones is reported, counted, and the other three are still written:
+**One failure does not abandon the rest.** A delisted pair among four good ones
+is reported, counted, and the other three are still written:
 
 ```
 BTCUSDT 1h: wrote 2184 candles to ./data/BTCUSDT-1h-2024-01-01_2024-03-31.csv
-NOSUCHPAIR: klines NOSUCHPAIR 1h: 400 Bad Request: Invalid symbol. (code -1121)
+NOSUCHPAIR 1h: klines NOSUCHPAIR 1h: 400 Bad Request: Invalid symbol. (code -1121)
 SOLUSDT 1h: wrote 2184 candles to ./data/SOLUSDT-1h-2024-01-01_2024-03-31.csv
 2 of 3 symbols, 4368 candles in total
 bmd: 1 of 3 symbols failed
@@ -100,13 +121,20 @@ bmd: 1 of 3 symbols failed
 2184 is what the range above actually holds: 2024-01-01 to 2024-03-31 inclusive
 is 91 days, and 91 × 24 hourly candles is 2184 per symbol.
 
-The exit status is 1. A failed symbol leaves no file behind, because output is
+The summary counts in whatever varied — symbols, intervals, or "downloads" when
+both lists are plural and neither noun fits — and the progress display labels its
+lines the same way. Two symbols at one interval and one symbol at two intervals
+are both two downloads, so a count alone could not tell you which run you were
+looking at.
+
+The exit status is 1. A failed download leaves no file behind, because output is
 written through a temporary file and renamed only once the encoder finishes.
 Ctrl-C is different from a failure: it stops the run rather than moving on to the
-next symbol.
+next download.
 
-With one symbol nothing above changes. There is no run summary, the error is
-reported as it always was, and `-out -` works.
+With one symbol and one interval nothing above changes. There is no run summary,
+no label on the progress lines, the error is reported as it always was, and
+`-out -` works.
 
 ### Both ends are included
 
@@ -330,6 +358,85 @@ sidecar's hash and the codec version, and Parquet checksums each data page as it
 is decoded — so damage surfaces as a read error on the range that touches it,
 continuously, rather than on demand across the whole cache. There is no command
 that sweeps tier 2 the way `bmd verify` sweeps tier 1.
+
+## `bmd evict`
+
+```bash
+bmd evict -before 2023-01-01                    # drop everything ending before 2023
+bmd evict -symbol BTC/USDT,ETH/USDT             # drop two pairs entirely
+bmd evict -symbol BTC/USDT -interval 1s         # one pair at one interval
+bmd evict -all -n                               # what removing everything would free
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `-symbol` | Limit to these pairs. Repeat it or comma-separate for several |
+| `-interval` | Limit to these intervals. Repeat it or comma-separate for several |
+| `-before` | Limit to entries ending at or before this instant. `YYYY-MM-DD` or RFC 3339, UTC |
+| `-all` | Evict the whole cache. Cannot be combined with the three above |
+| `-n` | Say what would be evicted and delete nothing |
+| `-cache-dir` | Where the cache lives |
+| `-quiet` | Suppress the summary on stderr; the receipt on stdout is unaffected |
+
+**This deletes data, and `bmd prune` does not.** That is the whole reason they
+are two commands. A prune removes archives whose parquet already answers reads,
+so everything that worked before it works after it. An eviction removes the
+entry — archive, sidecar and parquet together — and every read of it goes back
+to Binance.
+
+**At least one selector is required.** A bare `bmd evict` is a usage error
+rather than "evict everything", because the cost of reading it the other way is
+a cache somebody did not mean to delete. `-all` is the spelling for everything,
+and it cannot be combined with a filter: a command that says both "everything"
+and "only these" has two readings and neither is safe to guess.
+
+**`-before` bounds the data, not the files.** An entry goes only if it *ends* at
+or before the instant given:
+
+```
+-before 2024-01-15   keeps BTCUSDT-1h-2024-01.zip   (January is not over yet)
+                     removes BTCUSDT-1h-2023-12.zip
+                     removes BTCUSDT-1h-2024-01-14.zip
+
+-before 2024-02-01   removes all of January, monthly and daily
+```
+
+A bare date means midnight UTC, which is the opposite treatment from
+`bmd download -end`, and deliberately. `-end` names the last instant you want,
+so a bare date there covers that whole day. `-before` names the first instant
+you do *not* want, so `-before 2024-01-01` keeps every candle of 2024.
+
+The output is a receipt: one line per entry on stdout, and the summary on
+stderr.
+
+```
+BTCUSDT 1h BTCUSDT-1h-2023-11
+BTCUSDT 1h BTCUSDT-1h-2023-12
+ETHUSDT 1d ETHUSDT-1d-2023-06
+evicted 3 entries, freed 48.0 MB
+```
+
+The receipt is on stdout rather than stderr because it is the part worth
+keeping, and `-quiet` leaves it there — it takes away the summary, not the
+record of what was deleted. This is where `bmd evict` differs from `bmd prune`,
+which prints only its exceptions: a prune's removals cost nothing, and each line
+here is data that is gone.
+
+**Nothing is evicted automatically.** There is no size cap and no expiry, and
+that is a conclusion rather than a missing feature. Expiring by file age would
+key on when an entry was downloaded rather than when it was used, so the
+symbol-month your backtest reads every day would expire on schedule. A
+least-recently-used cap needs a recency signal the filesystem does not reliably
+give — access times are off or coarse on most Linux setups — so `bmd` would have
+to write to disk on every cache hit to record one. What you have that the tool
+does not is knowledge of your own window, which is what the flags above take.
+
+Entries this library did not write are left alone, at every level: a stray file
+in a data directory, a directory that is not part of the cache layout. A
+directory emptied by an eviction is removed, and so are the parents that leaves
+empty, up to but not including the cache root.
+
+Run `bmd cache` first to see what is there, or `-n` to see what would go.
 
 ## `bmd verify`
 

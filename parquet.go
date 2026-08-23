@@ -358,6 +358,22 @@ func writeRows(
 // being one. The codec version and the row count are written, because both are
 // true of any file this function produces.
 //
+// # Reading one back
+//
+// With whatever already reads parquet, which is the point of writing one. There
+// is deliberately no ReadParquet in this package, and the asymmetry is the
+// answer rather than an omission: a Go program that wants candles has
+// [Loader.Fetch], which reads the same format out of the cache in about 6 ms
+// per symbol-month and hands back [Kline] values — exporting and re-reading in
+// the same process would be a slower way to do that. Exports exist for the
+// tools that are not this program.
+//
+// The schema is fixed and documented in docs/caching.md, so a reader needs
+// nothing from here: eleven columns in [Kline]'s own order, open_time and
+// close_time as TIMESTAMP(MICROS), the eight money columns as DECIMAL(38,8) in
+// a FIXED_LEN_BYTE_ARRAY(16), and trades as an INT64. The footer carries
+// bmd.codec.version and bmd.rows.
+//
 // # Errors
 //
 // Nothing is written to w after an error, but what was already written stays

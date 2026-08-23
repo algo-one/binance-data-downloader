@@ -809,6 +809,36 @@
         <li><strong>What stays open:</strong> the gates read the footer, not the pages. Bit rot inside a data page surfaces on a later read, through Parquet's own per-page CRC. Closing that means decoding every cached file to answer a question about disk space.</li>
       </ul>
     </div>
+
+    <h3>The other 60% is the data, and that is a second command</h3>
+    <div class="prose">
+      <p>Pruning gives back the archives. Nothing gave back the data, so the cache
+      only ever grew. <code>bmd evict</code> removes whole entries — archive,
+      sidecar and Parquet together — and it is deliberately <em>not</em> a flag on
+      <code>prune</code>: a prune cannot cost you data, an eviction is the removal
+      of data, and a guarantee that holds for half of a command's behaviour is not
+      one anybody can lean on.</p>
+
+      <p><strong>There is no automatic expiry, and that is a finding rather than a
+      gap.</strong> Expiring by file age keys on when an entry was
+      <em>downloaded</em>, not when it was used — so the symbol-month a backtest
+      reads on every run expires on schedule while one fetched yesterday and never
+      opened again survives. A least-recently-used size cap needs a recency signal
+      the filesystem does not reliably give: access times are off or coarse on most
+      Linux setups, so the library would have to write on every cache hit to record
+      one, against a read path whose whole claim is that a hit touches the sidecar
+      and a footer and nothing else. What the caller has instead is knowledge of its
+      own window, so eviction takes a selection.</p>
+    </div>
+
+    <div class="callout">
+      <h4>Three things the selection had to get right</h4>
+      <ul>
+        <li><strong>A zero <code>EvictOptions</code> is an error, not "everything".</strong> The zero value is what a caller gets by forgetting to fill the struct in, and this is the one place in the package where that mistake cannot be undone. <code>All</code> is a separate word, and cannot be combined with a filter.</li>
+        <li><strong><code>Before</code> bounds the data, not the file.</strong> An entry goes only if it <em>ends</em> at or before the instant given, so a bound of 2024-01-15 keeps January's monthly archive: half of it is still wanted and a file is not divisible. This is why <code>-before</code> reads a bare date as midnight where <code>-end</code> stretches one to the end of the day.</li>
+        <li><strong>A pruned entry is still an entry.</strong> Everything a prune has been over has no <code>.zip</code>, which is most of an old cache — so the walk is over directories, grouping files by their shared stem, rather than looking for archives. Anchoring on the archive would skip exactly the entries retention exists to remove, and report success.</li>
+      </ul>
+    </div>
   </section>
 
   <section id="rest">
@@ -1043,10 +1073,10 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
 
   <section id="cli">
     <div class="kicker"><span class="num">§12</span></div>
-    <h2>Five commands, and one of them is a rate-limit decision</h2>
+    <h2>Six commands, and one of them is a rate-limit decision</h2>
     <div class="prose">
       <p><code>bmd</code> holds no logic of its own. Every command is a thin rendering
-      of a library call, which is the constraint that drove five small additions to
+      of a library call, which is the constraint that drove six small additions to
       the public API rather than a second implementation inside the tool.</p>
     </div>
 
@@ -1054,16 +1084,17 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
       <table>
         <thead><tr><th>Command</th><th>Does</th></tr></thead>
         <tbody>
-          <tr><td class="mono">bmd download</td><td>Candles for one or more symbols → csv, json or parquet</td></tr>
+          <tr><td class="mono">bmd download</td><td>Candles for one or more symbols and intervals → csv, json or parquet</td></tr>
           <tr><td class="mono">bmd list</td><td>What Binance publishes for a symbol and interval</td></tr>
           <tr><td class="mono">bmd cache</td><td>What the cache holds, and what pruning would reclaim</td></tr>
           <tr><td class="mono">bmd prune</td><td>Delete the archives tier 2 no longer needs (<code>-n</code> to look first)</td></tr>
+          <tr><td class="mono">bmd evict</td><td>Delete cached data itself, by symbol, interval or period</td></tr>
           <tr><td class="mono">bmd verify</td><td>Re-hash tier 1 against the published checksums</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h3>Why one process downloads many symbols</h3>
+    <h3>Why one process downloads many symbols — and many intervals</h3>
     <div class="prose">
       <p>Binance enforces <code>REQUEST_WEIGHT</code> <strong>per IP address</strong>,
       and the library's limiter is process-wide for exactly that reason: two limiters
@@ -1073,19 +1104,29 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
       them sit at 120 against that ceiling, and Binance answers persistent excess
       with an HTTP 418: an address ban lasting two minutes to three days. The tool's
       only multi-symbol shape was the shape that breaks its own limiter.</p>
+
+      <p>That argument is about <em>processes</em>. It says nothing about symbols —
+      which is why <code>-interval</code> is a list too. A shell loop over intervals
+      is three limiters exactly as three symbols in three processes were, so fixing
+      only the symbol spelling left the same hazard standing behind the other flag.
+      Both flags now take a list, and <strong>every pair of the two is
+      downloaded</strong>: two symbols at three intervals is six downloads, in symbol
+      order, each to its own file. Pairing the lists off positionally instead would
+      require them to be the same length, and would quietly turn two symbols at one
+      interval into one download.</p>
     </div>
 
-    <div class="code">bmd download -symbol BTC/USDT -symbol ETH/USDT -symbol SOL/USDT \
-     -interval 1h -start <span class="tp">2024-01-01</span> -end <span class="tp">2024-03-31</span> -out ./data
+    <div class="code">bmd download -symbol BTC/USDT,ETH/USDT,SOL/USDT -interval 1h,1d \
+     -start <span class="tp">2024-01-01</span> -end <span class="tp">2024-03-31</span> -out ./data
 
-<span class="cm"># one process, one limiter, one symbol at a time</span></div>
+<span class="cm"># one process, one limiter, one (symbol, interval) pair at a time</span></div>
 
     <div class="callout">
       <h4>Three decisions inside that loop</h4>
       <ul>
         <li><strong>Streaming, not <code>FetchAll</code>.</strong> <code>FetchAll</code> returns every candle of every symbol resident at once; five years of minute candles for one symbol is already about 820 MB. And a list of distinct symbols has nothing to deduplicate, which is all <code>FetchAll</code> would add. The limiter comes from being one process, not from which method it calls.</li>
         <li><strong>Sequential, not concurrent.</strong> The loader's semaphore already spans calls, so one symbol's chunks saturate the pool for any range worth downloading. Running symbols in parallel would need a second bound outside the library's — the nested limit §8 exists to warn about.</li>
-        <li><strong>One symbol failing does not abandon the rest</strong>, and nothing is silent: the failure is printed, counted, and reaches the exit status. A cancellation is the exception and ends the run, or Ctrl-C would be reported as every remaining symbol having failed.</li>
+        <li><strong>One download failing does not abandon the rest</strong>, and nothing is silent: the failure is printed, counted, and reaches the exit status. A cancellation is the exception and ends the run, or Ctrl-C would be reported as every remaining download having failed.</li>
       </ul>
     </div>
 

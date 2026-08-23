@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	binancedata "github.com/algo-one/binance-data-downloader"
 )
@@ -241,6 +242,16 @@ func humanBytes(n int64) string {
 func plural(n int, word string) string {
 	if n == 1 {
 		return word
+	}
+
+	// The one irregular form this tool needs: "entry" is what `bmd evict`
+	// counts, and "entrys" reads as a bug in the program rather than a slip in
+	// its grammar. The rule is the real one rather than a special case for that
+	// word — a consonant before the y takes "ies", a vowel keeps "s" — so
+	// "day" would still pluralise correctly if a caller ever passed it.
+	if before, ok := strings.CutSuffix(word, "y"); ok && before != "" &&
+		!strings.ContainsRune("aeiou", rune(before[len(before)-1])) {
+		return before + "ies"
 	}
 
 	return word + "s"

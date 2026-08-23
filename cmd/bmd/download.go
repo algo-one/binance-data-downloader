@@ -22,19 +22,21 @@ func download(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.SetOutput(stderr)
 
 	var (
-		symbols  symbolList
-		interval = fs.String("interval", "", "candle interval: 1s, 1m, 1h, 1d, 1w, 1mo ...")
-		start    = fs.String("start", "", "first day or instant to include (YYYY-MM-DD or RFC 3339, UTC)")
-		end      = fs.String("end", "", "last day or instant to include, inclusive (default: now)")
-		market   = fs.String("market", "spot", "market to read: spot")
-		out      = fs.String("out", "", `where to write: a file, a directory, or "-" for stdout`)
-		format   = fs.String("format", formatCSV, "output format: csv, json or parquet")
+		symbols   listFlag
+		intervals listFlag
+		start     = fs.String("start", "", "first day or instant to include (YYYY-MM-DD or RFC 3339, UTC)")
+		end       = fs.String("end", "", "last day or instant to include, inclusive (default: now)")
+		market    = fs.String("market", "spot", "market to read: spot")
+		out       = fs.String("out", "", `where to write: a file, a directory, or "-" for stdout`)
+		format    = fs.String("format", formatCSV, "output format: csv, json or parquet")
 
 		common commonFlags
 	)
 
 	fs.Var(&symbols, "symbol",
 		"trading pair: BTC/USDT, BTC-USDT or BTCUSDT; repeat or comma-separate for several")
+	fs.Var(&intervals, "interval",
+		"candle interval: 1s, 1m, 1h, 1d, 1w, 1mo ...; repeat or comma-separate for several")
 
 	common.registerCacheDir(fs)
 	common.registerConcurrency(fs)
@@ -42,11 +44,12 @@ func download(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	common.registerVerbose(fs)
 
 	fs.Usage = func() {
-		_, _ = fmt.Fprint(stderr, `bmd download - fetch candles for one or more symbols and a time range
+		_, _ = fmt.Fprint(stderr, `bmd download - fetch candles for symbols, intervals and a time range
 
 Usage:
   bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 [-end 2024-03-31]
   bmd download -symbol BTC/USDT,ETH/USDT -interval 1h -start 2024-01-01 -out ./data
+  bmd download -symbol BTC/USDT -interval 1h,1d -start 2024-01-01 -out ./data
 
 Both -start and -end are inclusive, and both are UTC. A bare -end date covers
 that whole day, so -end 2024-03-31 includes every candle of the 31st.
@@ -54,9 +57,11 @@ that whole day, so -end 2024-03-31 includes every candle of the 31st.
 With no -out, the candles are written to a generated file name in the current
 directory. Use -out - to write them to stdout instead.
 
-Several symbols are downloaded by one process, which is what keeps them inside
-Binance's per-IP rate limit — one bmd per symbol does not. Each symbol gets its
-own file, so -out must then name a directory, or be left off.
+-symbol and -interval both take lists, and every pair of them is downloaded:
+two symbols at three intervals is six downloads. One process does the lot,
+which is what keeps them inside Binance's per-IP rate limit — one bmd per
+symbol or per interval does not. Each download gets its own file, so -out must
+then name a directory, or be left off.
 
 Flags:
 `)
@@ -71,11 +76,15 @@ Flags:
 		return usagef("unexpected argument %q; every value is given with a flag", fs.Arg(0))
 	}
 
-	if err := checkSymbolFlag(fs, symbols); err != nil {
+	if err := checkListFlag(fs, "symbol", symbols, "BTC/USDT"); err != nil {
 		return err
 	}
 
-	reqs, err := buildRequests(symbols, *interval, *market, *start, *end)
+	if err := checkListFlag(fs, "interval", intervals, "1h"); err != nil {
+		return err
+	}
+
+	reqs, unit, err := buildRequests(symbols, intervals, *market, *start, *end)
 	if err != nil {
 		return err
 	}
@@ -94,8 +103,8 @@ Flags:
 	// this only catches the case where the bytes would be scribbled into a
 	// session, which is both useless and unpleasant to recover from.
 	//
-	// Only one symbol can reach stdout — checkOutForSeveral has already refused
-	// -out - for more — so this needs no loop.
+	// Only one download can reach stdout — checkOutForSeveral has already
+	// refused -out - for more — so this needs no loop.
 	if *format == formatParquet && *out == stdoutPath && isTerminal(stdout) {
 		return usagef("-format parquet writes binary; give -out a file, or redirect stdout")
 	}
@@ -107,11 +116,17 @@ Flags:
 
 	progress := newProgress(stderr, common.quiet)
 	if progress != nil {
-		// Which symbol an event belongs to is worth a column only when there is
-		// more than one of them. Adding it unconditionally would widen every
-		// line of the ordinary single-symbol run to say something the summary
-		// already says once.
-		progress.showSymbol = len(reqs) > 1
+		// Which symbol and which interval an event belongs to are each worth a
+		// column only when more than one of them was asked for. Adding either
+		// unconditionally would widen every line of the ordinary single
+		// download to say something the summary line already says once.
+		//
+		// The two are decided separately rather than from len(reqs), because
+		// the pair that varies is what a reader needs: one symbol at three
+		// intervals wants the interval on every line and the symbol on none of
+		// them, and a single count cannot tell that case from its mirror.
+		progress.showSymbol = len(symbols) > 1
+		progress.showInterval = len(intervals) > 1
 
 		opts = append(opts, binancedata.WithProgress(progress.report))
 
@@ -132,6 +147,7 @@ Flags:
 		out:      *out,
 		format:   *format,
 		quiet:    common.quiet,
+		unit:     unit,
 		encode:   encode,
 		progress: progress,
 	}, stdout, stderr)
@@ -143,9 +159,15 @@ Flags:
 // bools and a call site listing them positionally is one transposition away from
 // writing the format into the path.
 type downloadOpts struct {
-	out      string
-	format   string
-	quiet    bool
+	out    string
+	format string
+	quiet  bool
+
+	// unit is the noun the summary counts in: "symbol", "interval" or
+	// "download". See [buildRequests], which picks it from whichever of the two
+	// lists actually has more than one entry.
+	unit string
+
 	encode   encoder
 	progress *progress
 }
@@ -157,33 +179,38 @@ type downloadOpts struct {
 //
 // # Why one process, and why in turn
 //
-// One process is the entire reason this command takes more than one symbol.
-// Binance's REQUEST_WEIGHT quota is enforced per IP address, and the limiter
-// that respects it is process-wide — see internal/vision/limiter.go, where
-// sharing is called "not an optimisation, it is the requirement". Two limiters
-// each honouring 40 weight per second permit 80 against a ceiling of 100, so
-// three `bmd download` processes started together are over it. Before this,
-// running several symbols at once was only possible the way that breaks the
-// limit.
+// One process is the entire reason this command takes lists at all. Binance's
+// REQUEST_WEIGHT quota is enforced per IP address, and the limiter that
+// respects it is process-wide — see internal/vision/limiter.go, where sharing
+// is called "not an optimisation, it is the requirement". Two limiters each
+// honouring 40 weight per second permit 80 against a ceiling of 100, so three
+// `bmd download` processes started together are over it, and the penalty is
+// HTTP 418 against the whole IP for anything from two minutes to three days.
+//
+// That argument is about processes and says nothing about symbols, which is why
+// -interval takes a list too. A shell loop over intervals breaks the limit in
+// exactly the way a shell loop over symbols does, and the fix is the same one:
+// the pairs become requests inside one process rather than processes.
 //
 // In turn rather than concurrently, and that is a smaller decision than it
 // looks. The Loader's own semaphore already spans calls, so the chunks of one
-// symbol saturate the fetch pool for any range worth downloading; running
-// symbols in parallel would fill the pool only for the narrow case of many
-// symbols each wanting one or two chunks. Against that it would interleave the
-// progress display, which redraws a single line, and it would need a second
-// concurrency bound outside the library's — the nested limit
-// docs/architecture.md warns about. Sequential keeps memory at one candle, the
-// display readable, and the failure of one symbol easy to describe.
+// request saturate the fetch pool for any range worth downloading; running them
+// in parallel would fill the pool only for the narrow case of many requests
+// each wanting one or two chunks. Against that it would interleave the progress
+// display, which redraws a single line, and it would need a second concurrency
+// bound outside the library's — the nested limit docs/architecture.md warns
+// about. Sequential keeps memory at one candle, the display readable, and the
+// failure of one request easy to describe.
 //
 // # Streaming, not FetchAll
 //
 // FetchAll exists and is deliberately not used. It returns
-// map[Request][]Kline — every candle of every symbol resident at once — and
+// map[Request][]Kline — every candle of every request resident at once — and
 // this command streams precisely so that a range's size does not become the
 // process's memory. Five years of minute candles is about 820 MB for one
-// symbol. FetchAll's advantage is deduplicating overlapping requests, and a
-// list of distinct symbols has nothing to deduplicate.
+// symbol. FetchAll's advantage is deduplicating overlapping requests, and the
+// requests built here are distinct by construction: both lists are
+// deduplicated before they are crossed.
 func runDownload(
 	ctx context.Context,
 	l loader,
@@ -198,40 +225,45 @@ func runDownload(
 	)
 
 	for _, req := range reqs {
-		// Checked before each symbol rather than only inside the stream: a
-		// Ctrl-C between two symbols should stop the run, not start the next
-		// download and let the library discover the cancellation.
+		// Checked before each request rather than only inside the stream: a
+		// Ctrl-C between two downloads should stop the run, not start the next
+		// one and let the library discover the cancellation.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
 		rows, err := downloadOne(ctx, l, req, opts, stdout, stderr)
 		if err != nil {
-			// A cancellation is not this symbol's fault and is not a partial
+			// A cancellation is not this request's fault and is not a partial
 			// failure to report at the end — it ends the run. Without this the
-			// loop would carry on and report every remaining symbol as failed.
+			// loop would carry on and report every remaining one as failed.
 			if ctx.Err() != nil {
 				return err
 			}
 
-			// Stored as it came back, with no symbol prefix wrapped around
-			// it. Two things read this slice and neither wants one: the
-			// multi-symbol branch reads only its length, and prints its own
-			// "SYMBOL: ..." line just below, so a wrapped copy would be
-			// allocated and thrown away — and the single-symbol branch returns
-			// failed[0] to main, where a prefix naming the only symbol the user
-			// typed is noise that was not there in Stage 8.
+			// Stored as it came back, with no prefix wrapped around it. Two
+			// things read this slice and neither wants one: the batch branch
+			// reads only its length, and prints its own "SYMBOL 1h: ..." line
+			// just below, so a wrapped copy would be allocated and thrown away
+			// — and the single-request branch returns failed[0] to main, where a
+			// prefix naming the only thing the user asked for is noise that was
+			// not there in Stage 8.
 			failed = append(failed, err)
 
-			// One symbol failing does not abandon the rest. The user named
-			// these symbols in one command and the ones that work are still
-			// worth having; the error is printed, counted, and reaches the exit
-			// status below, so nothing is lost quietly. The single-symbol case
-			// keeps its old behaviour — see the return at the end.
+			// One failure does not abandon the rest. The user named these
+			// symbols and intervals in one command and the ones that work are
+			// still worth having; the error is printed, counted, and reaches the
+			// exit status below, so nothing is lost quietly. The single-request
+			// case keeps its old behaviour — see the return at the end.
+			//
+			// Symbol and interval both, matching the success line below. With
+			// several intervals of one symbol the symbol alone would name three
+			// failures identically, and the file that is missing is the one the
+			// pair identifies.
 			if len(reqs) > 1 {
 				opts.progress.done()
 
-				_, _ = fmt.Fprintf(stderr, "%s: %v\n", req.Symbol, err)
+				_, _ = fmt.Fprintf(stderr, "%s %s: %v\n", req.Symbol, req.Interval, err)
 			}
 
 			continue
@@ -243,7 +275,7 @@ func runDownload(
 
 	if len(reqs) > 1 && !opts.quiet {
 		_, _ = fmt.Fprintf(stderr, "%d of %d %s, %d %s in total\n",
-			written, len(reqs), plural(len(reqs), "symbol"), total, plural(total, "candle"))
+			written, len(reqs), plural(len(reqs), opts.unit), total, plural(total, "candle"))
 	}
 
 	switch {
@@ -251,12 +283,13 @@ func runDownload(
 		return nil
 
 	case len(reqs) == 1:
-		// Unchanged from when this command took one symbol: the error goes back
-		// for main to print, rather than being printed here and summarised.
+		// Unchanged from when this command took one symbol at one interval: the
+		// error goes back for main to print, rather than being printed here and
+		// summarised.
 		return failed[0]
 
 	default:
-		return fmt.Errorf("%d of %d symbols failed", len(failed), len(reqs))
+		return fmt.Errorf("%d of %d %s failed", len(failed), len(reqs), plural(len(reqs), opts.unit))
 	}
 }
 
@@ -268,7 +301,8 @@ func downloadOne(
 	opts downloadOpts,
 	stdout, stderr io.Writer,
 ) (int, error) {
-	// Resolved per symbol, because the generated name carries the symbol in it.
+	// Resolved per request, because the generated name carries both the symbol
+	// and the interval in it.
 	dest, err := resolveDestination(opts.out, outputName(req, opts.format))
 	if err != nil {
 		return 0, err
@@ -307,24 +341,29 @@ func downloadOne(
 }
 
 // checkOutForSeveral refuses the -out spellings that cannot hold more than one
-// symbol.
+// download.
 //
-// Each symbol is written to its own file, so the two spellings that name a
+// Each download is written to its own file, so the two spellings that name a
 // single stream — "-" and a path that is not an existing directory — have no
 // reading when several were asked for. Both are refused rather than resolved
-// somehow: writing every symbol to one file would interleave headers into
-// nonsense, and picking one symbol to honour would silently drop the others.
+// somehow: writing everything to one file would interleave headers into
+// nonsense, and picking one download to honour would silently drop the others.
 //
 // A directory that does not exist is refused too, rather than created. Nothing
 // else in this tool creates a directory, and a mistyped -out that silently
 // produces one is how a download ends up somewhere nobody looks.
-func checkOutForSeveral(out string, symbols int) error {
-	if symbols < 2 {
+//
+// The count is of requests rather than of symbols, which is the whole of what
+// changed when -interval became a list: one symbol at two intervals is two
+// files and needs a directory exactly as two symbols at one interval do.
+func checkOutForSeveral(out string, downloads int) error {
+	if downloads < 2 {
 		return nil
 	}
 
 	if out == stdoutPath {
-		return usagef("-out - writes one stream; %d symbols need one file each, so give -out a directory", symbols)
+		return usagef("-out - writes one stream; %d downloads need one file each, so give -out a directory",
+			downloads)
 	}
 
 	if out == "" {
@@ -333,44 +372,67 @@ func checkOutForSeveral(out string, symbols int) error {
 
 	info, err := os.Stat(out)
 	if err != nil || !info.IsDir() {
-		return usagef("-out %q must be an existing directory when several symbols are given", out)
+		return usagef("-out %q must be an existing directory when several symbols or intervals are given", out)
 	}
 
 	return nil
 }
 
-// buildRequests turns the flag strings into requests the library will accept,
-// one per symbol.
+// buildRequests turns the flag strings into requests the library will accept:
+// one per (symbol, interval) pair.
 //
-// Everything except the symbol is parsed once and shared, which is not merely
-// tidier. The clock below is the important one: reading it per symbol would give
-// the symbols in a single command different end instants, so their generated
-// file names would disagree about the range and a directory of them would no
-// longer describe one download.
+// Everything except those two is parsed once and shared, which is not merely
+// tidier. The clock below is the important one: reading it per request would
+// give the requests in a single command different end instants, so their
+// generated file names would disagree about the range and a directory of them
+// would no longer describe one download.
 //
-// It validates before returning, so a mistyped symbol fails here rather than
-// after a loader has been built and a listing has been fetched — and it fails
-// before *any* symbol is downloaded, rather than after the first three
+// It validates before returning, so a mistyped symbol or interval fails here
+// rather than after a loader has been built and a listing has been fetched —
+// and it fails before *any* download runs, rather than after the first three
 // succeeded.
-func buildRequests(symbols []string, interval, market, start, end string) ([]binancedata.Request, error) {
+//
+// # The cross product, and the order of it
+//
+// Every symbol is downloaded at every interval, because that is the only
+// reading of two lists that does not silently drop something: pairing them off
+// positionally would need them to be the same length, and would make
+// `-symbol BTC/USDT,ETH/USDT -interval 1h` mean one download rather than two.
+//
+// Symbol-major, so a directory of output files groups a symbol's intervals
+// together and the progress display works through one symbol before moving on.
+// The alternative is not wrong, only less useful to read.
+//
+// # The unit it returns
+//
+// The second return value is the noun the run summary counts in, and it comes
+// from here because here is where both lists are still in scope. "2 of 2
+// symbols" is the right sentence for two symbols at one interval and the wrong
+// one for one symbol at two intervals, and a count of requests cannot tell
+// those apart — they are both 2. When both lists are plural neither noun is
+// right, and the pairs are what is being counted, so it is "downloads".
+func buildRequests(
+	symbols, intervals []string,
+	market, start, end string,
+) (reqs []binancedata.Request, unit string, err error) {
 	normalized, err := parseSymbols(symbols)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	iv, err := parseInterval(interval)
+	ivs, err := parseIntervals(intervals)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	m, err := parseMarket(market)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	from, err := parseStart(start)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// An omitted -end means "up to now", and the clock is read here rather
@@ -393,27 +455,49 @@ func buildRequests(symbols []string, interval, market, start, end string) ([]bin
 
 	if end != "" {
 		if to, err = parseEnd(end); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 
-	reqs := make([]binancedata.Request, 0, len(normalized))
+	reqs = make([]binancedata.Request, 0, len(normalized)*len(ivs))
 
 	for _, symbol := range normalized {
-		req := binancedata.Request{
-			Symbol:   symbol,
-			Interval: iv,
-			Market:   m,
-			Start:    from,
-			End:      to,
-		}
+		for _, iv := range ivs {
+			req := binancedata.Request{
+				Symbol:   symbol,
+				Interval: iv,
+				Market:   m,
+				Start:    from,
+				End:      to,
+			}
 
-		if err := req.Validate(); err != nil {
-			return nil, usagef("%v", err)
-		}
+			if err := req.Validate(); err != nil {
+				return nil, "", usagef("%v", err)
+			}
 
-		reqs = append(reqs, req)
+			reqs = append(reqs, req)
+		}
 	}
 
-	return reqs, nil
+	return reqs, summaryUnit(len(normalized), len(ivs)), nil
+}
+
+// summaryUnit names what a run of several downloads is counting.
+//
+// Split out of buildRequests so that the choice can be tested directly against
+// the four shapes rather than inferred from a rendered summary line.
+func summaryUnit(symbols, intervals int) string {
+	switch {
+	case symbols > 1 && intervals > 1:
+		return "download"
+
+	case intervals > 1:
+		return "interval"
+
+	default:
+		// Including the single-request case, where nothing is summarised at
+		// all: runDownload prints the summary only for more than one request,
+		// so the value is unused rather than wrong.
+		return "symbol"
+	}
 }
