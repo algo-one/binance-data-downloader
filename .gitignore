@@ -30,4 +30,5 @@ mise.local.toml
 
 # Claude Code local settings are gitignored globally (~/.gitignore_global),
 # but this project commits them so the questions.md deny rule is shared.
-!.claude/settings.local.json
+# !.claude/settings.local.json
+questions.md
