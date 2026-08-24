@@ -35,7 +35,6 @@ update that table *and* the one in the plan file.
 
 ## Conventions
 
-- Module `github.com/algo-one/binance-data-downloader`, package `binancedata`.
 - Public API in the root package; everything else under `internal/`, which the
   compiler forbids other modules from importing.
 - **Prices and volumes are `udecimal.Decimal`, never `float64`.** Binance quote
@@ -63,15 +62,7 @@ update that table *and* the one in the plan file.
 ## Commands
 
 Tooling is managed with [mise](https://mise.jdx.dev/). Run `mise tasks` for the
-full list.
-
-```bash
-mise run ci      # fmt:check + lint + test (-race) + build — must be green before finishing a stage
-mise run test    # tests only
-mise run lint    # golangci-lint
-mise run build   # ./bin/bmd
-mise run audit   # govulncheck
-```
+full list. `mise run ci` must be green before finishing a stage.
 
 Prefer fixing a lint finding in the code over adding an exclusion to
 `.golangci.yml`. When an error genuinely should be ignored, use an explicit
