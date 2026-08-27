@@ -213,6 +213,13 @@ func (c loaderConfig) validate() error {
 // spellings would be indistinguishable at the call site, and a configuration
 // file with a missing key would silently write to somewhere its author did not
 // choose.
+//
+// No environment variable is consulted here, and that is deliberate rather than
+// an omission. This package is imported by other programs, and one that read the
+// environment on its own would let a variable exported for some unrelated reason
+// redirect where its caller writes files. The bmd command does read one —
+// BMD_CACHE_DIR, which its -cache-dir flag overrides — because a tool a person
+// runs is the layer where that is the expected behaviour rather than a surprise.
 func WithCacheDir(dir string) Option {
 	return optionFunc(func(c *loaderConfig) error {
 		if dir == "" {

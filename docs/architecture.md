@@ -1207,6 +1207,28 @@ archive's hash and the codec version, and rebuilt when either fails, so it is
 verified continuously by the code that uses it. Tier 1 is the only tier nothing
 re-reads, which is what makes it the one worth a command.
 
+**`BMD_CACHE_DIR` is read by the CLI and not by the library.** The variable
+names the cache directory when `-cache-dir` is not given, in the usual order:
+flag, then variable, then `os.UserCacheDir`. It stops at `cmd/bmd` because
+`binancedata` is a package other programs import, and a package that reads the
+environment on its own lets a variable exported for an unrelated reason redirect
+where its caller's program writes files. Code says where its cache lives by
+calling `WithCacheDir`; a person says it by exporting this.
+
+Two properties are worth recording because they are what keep the variable
+honest. It is held to the same accepted-and-ignored rule as the flags, and
+enforced by the same mechanism: `resolveCacheDir` asks the command's own
+`FlagSet` whether `-cache-dir` was registered, so `bmd list` — which opens no
+cache and registers no such flag — cannot see it, and neither can a future
+command that does not take the flag. And a variable that is set but empty is a
+usage error rather than a fall back to the default, for exactly the reason
+`-cache-dir ""` is: `export BMD_CACHE_DIR="$CACHE_DIR"` with `CACHE_DIR` unset
+exports an empty string silently, and defaulting there aims `bmd evict -all` at
+the user's real cache. The lookup itself is a package variable, `lookupEnv`, so
+the tests never edit the real process environment — `os.UserCacheDir` reads
+`XDG_CACHE_HOME` out of it, so a test that wrote there could move the default it
+was asserting against.
+
 ## Several symbols and intervals in one process
 
 `bmd download` takes a list of symbols **and** a list of intervals, and the

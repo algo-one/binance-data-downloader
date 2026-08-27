@@ -44,7 +44,7 @@ bmd download \
 | `-market` | `spot` (the only implemented value today) |
 | `-out` | A file, a directory, or `-` for stdout. Default: a generated name here |
 | `-format` | `csv`, `json` or `parquet` |
-| `-cache-dir` | Where the two-tier cache lives. Rejected if given as an empty string |
+| `-cache-dir` | Where the two-tier cache lives. Defaults to `$BMD_CACHE_DIR` — see [Environment](#environment). Rejected if given as an empty string |
 | `-concurrency` | Parallel chunk fetches (default 8). Must be at least 1 |
 | `-quiet` | Print nothing to stderr but errors — no progress, no summary |
 | `-verbose` | Log what the pipeline is doing to stderr |
@@ -235,7 +235,7 @@ the REST API, because no archive covers it yet.
 `bmd list` takes no `-cache-dir` or `-concurrency`, because it opens no cache
 and makes no parallel fetches. A flag a command advertises and then ignores
 costs a debugging session to discover, so each command registers only what it
-honours.
+honours. `BMD_CACHE_DIR` is held to the same rule and is not read here either.
 
 The same rule applies to a flag's *value*. `-concurrency -4` and `-concurrency 0`
 are usage errors rather than silent falls back to the default, and so is
@@ -375,7 +375,7 @@ bmd evict -all -n                               # what removing everything would
 | `-before` | Limit to entries ending at or before this instant. `YYYY-MM-DD` or RFC 3339, UTC |
 | `-all` | Evict the whole cache. Cannot be combined with the three above |
 | `-n` | Say what would be evicted and delete nothing |
-| `-cache-dir` | Where the cache lives |
+| `-cache-dir` | Where the cache lives. Defaults to `$BMD_CACHE_DIR` — see [Environment](#environment) |
 | `-quiet` | Suppress the summary on stderr; the receipt on stdout is unaffected |
 
 **This deletes data, and `bmd prune` does not.** That is the whole reason they
@@ -486,6 +486,49 @@ Tier 2 is not walked, because it does not need to be. Every read checks the
 parquet footer against the archive's hash and the codec version and rebuilds
 when either fails, so tier 2 is verified continuously by the code that uses it.
 Tier 1 is the only tier nothing re-reads.
+
+## Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `BMD_CACHE_DIR` | Where the two-tier cache lives, when `-cache-dir` is not given |
+
+```bash
+export BMD_CACHE_DIR=/mnt/big-disk/bmd
+
+bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -out ./data
+bmd cache
+bmd prune -n
+```
+
+**The flag wins, then the variable, then the default.** What you typed for one
+run beats what you exported once into a shell, and the default underneath both
+is the operating system's own cache location — `~/Library/Caches/bmd` on macOS,
+`$XDG_CACHE_HOME/bmd` or `~/.cache/bmd` on Linux, `%LocalAppData%\bmd` on
+Windows.
+
+**Read by the five commands that take `-cache-dir`:** `download`, `cache`,
+`prune`, `evict` and `verify`. Not by `bmd list`, which opens no cache. This is
+the same rule the flags follow — a setting a command reads and never acts on
+costs a debugging session to discover — and it is enforced in one place: the
+lookup asks the command's own `FlagSet` whether `-cache-dir` was registered at
+all, so a future command that does not take the flag cannot start honouring the
+variable by accident.
+
+**Set but empty is a usage error, not the default.** `export
+BMD_CACHE_DIR="$CACHE_DIR"` with `CACHE_DIR` unset exports an empty string and
+the shell says nothing about it. This is the same trap as `-cache-dir ""` and
+gets the same answer, for the same reason: falling back quietly aims `bmd evict
+-all` and `bmd verify -rm` at the real cache while whoever wrote the export
+believes it points at a scratch directory. A value that is only spaces is
+rejected too. A path that genuinely ends in a space is passed through as
+written — the whitespace decides emptiness, it never edits the value.
+
+**The CLI reads this, the library does not.** `binancedata` is a package other
+programs import, and a package that reads the environment on its own lets a
+variable exported for an entirely unrelated reason redirect where its caller's
+program writes files. Go code says where its cache lives by calling
+`binancedata.WithCacheDir`. A person says it by exporting this.
 
 ## Conventions
 

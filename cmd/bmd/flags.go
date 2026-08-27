@@ -11,6 +11,7 @@ import (
 	"io"
 	"iter"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -125,8 +126,38 @@ type commonFlags struct {
 // registerCacheDir is for the commands that read or write the cache.
 func (c *commonFlags) registerCacheDir(fs *flag.FlagSet) {
 	fs.StringVar(&c.cacheDir, "cache-dir", "",
-		"where the two-tier cache lives (default: the user cache directory)")
+		"where the two-tier cache lives (default: $BMD_CACHE_DIR, else the user cache directory)")
 }
+
+// cacheDirEnv names the cache directory when no -cache-dir flag is given.
+//
+// It carries the command's own name as a prefix, which is the convention that
+// keeps environment variables apart: the environment is one flat namespace
+// shared by every process in a shell, so a bare CACHE_DIR would be read by this
+// tool and by anything else that happened to guess the same name.
+//
+// It is the CLI that reads this and not the library. binancedata is a package
+// other programs import, and a package that reads the environment on its own
+// can have a variable exported for some entirely unrelated reason silently
+// redirect where its caller's program writes files. Code says where its cache
+// lives by calling WithCacheDir. A person says it by exporting this.
+const cacheDirEnv = "BMD_CACHE_DIR"
+
+// lookupEnv reads one environment variable. It is a package-level variable
+// rather than a direct call, for the same reason newLoader below is one: a test
+// replaces it.
+//
+// The obvious alternative, testing.T.Setenv, edits the real process
+// environment, and that is worse here than it first sounds. The default this
+// setting falls back to is os.UserCacheDir, which itself reads XDG_CACHE_HOME
+// on Linux — so a test that writes to the process environment is a test that
+// can move the very default it is trying to assert against. Swapping the lookup
+// leaves the real environment untouched.
+//
+// os.LookupEnv rather than os.Getenv, and the second return value is the whole
+// reason: Getenv answers "" both for a variable that was never set and for one
+// set to the empty string, and those two need different answers below.
+var lookupEnv = os.LookupEnv
 
 // registerConcurrency is for the commands that fetch in parallel, which is
 // download alone: the listing behind `list` is two requests the library already
@@ -174,6 +205,12 @@ func (c *commonFlags) registerVerbose(fs *flag.FlagSet) {
 // Visit also only ever sees flags this command registered, so the switch below
 // needs no guard for `bmd verify` having no -concurrency: it was never
 // registered, so it can never have been set.
+//
+// The cache directory has a third source beyond the flag and the default — the
+// BMD_CACHE_DIR environment variable — and resolveCacheDir below settles the
+// three against each other. It runs after the Visit walk on purpose: the walk
+// is what rejects -cache-dir "", and the environment may only speak for a flag
+// that was genuinely absent.
 func (c *commonFlags) options(fs *flag.FlagSet, stderr io.Writer) ([]binancedata.Option, error) {
 	// Visit takes a func with no error return and cannot be stopped early, so
 	// the first failure is captured here and the rest of the walk is skipped.
@@ -201,10 +238,15 @@ func (c *commonFlags) options(fs *flag.FlagSet, stderr io.Writer) ([]binancedata
 		return nil, bad
 	}
 
+	cacheDir, err := c.resolveCacheDir(fs)
+	if err != nil {
+		return nil, err
+	}
+
 	var opts []binancedata.Option
 
-	if c.cacheDir != "" {
-		opts = append(opts, binancedata.WithCacheDir(c.cacheDir))
+	if cacheDir != "" {
+		opts = append(opts, binancedata.WithCacheDir(cacheDir))
 	}
 
 	if c.concurrency > 0 {
@@ -218,6 +260,71 @@ func (c *commonFlags) options(fs *flag.FlagSet, stderr io.Writer) ([]binancedata
 	}
 
 	return opts, nil
+}
+
+// resolveCacheDir decides which cache directory this command should use.
+//
+// The order is the one every command-line tool uses, and it is worth stating
+// because people rely on it without reading anything: the flag wins, then the
+// environment variable, then the library's own default. The more specific
+// instruction beats the less specific one — what was typed for this single run
+// beats what was exported once into a shell.
+//
+// An empty return means "say nothing and let the library choose". WithCacheDir
+// rejects an empty directory, correctly, so "no preference" cannot be expressed
+// by handing the option a zero value; it is expressed by not appending the
+// option at all, which is what the caller above does.
+//
+// # Why the FlagSet is consulted and not the value alone
+//
+// Two different questions are being answered here, and neither one is visible
+// in c.cacheDir.
+//
+// The first is whether this command honours a cache directory at all. fs.Lookup
+// returns nil for a flag that was never registered, and `bmd list` never
+// registers -cache-dir because it opens no cache. Reading the environment there
+// would hand that command a setting it advertises nowhere and acts on never —
+// the accepted-and-ignored setting docs/architecture.md calls a defect rather
+// than a stub. The environment is held to exactly the same rule as the flags,
+// so `BMD_CACHE_DIR=/tmp/x bmd list` changes nothing, the way -cache-dir cannot.
+//
+// The second is whether the flag was given. options has already rejected
+// -cache-dir "" by the time this runs, so an empty c.cacheDir can only mean the
+// flag was absent — and absent is the single case in which the environment
+// gets a turn.
+func (c *commonFlags) resolveCacheDir(fs *flag.FlagSet) (string, error) {
+	if c.cacheDir != "" {
+		return c.cacheDir, nil
+	}
+
+	if fs.Lookup("cache-dir") == nil {
+		return "", nil
+	}
+
+	dir, ok := lookupEnv(cacheDirEnv)
+	if !ok {
+		return "", nil
+	}
+
+	// Set but empty is a mistake, not a request for the default, and it is the
+	// same mistake the -cache-dir "" guard above exists for wearing different
+	// clothes: `export BMD_CACHE_DIR="$CACHE_DIR"` with CACHE_DIR unset exports
+	// an empty string, and the shell reports nothing. Falling back quietly there
+	// aims a deleting command — `bmd evict -all`, `bmd verify -rm` — at the
+	// user's real cache while whoever wrote the export believes it is pointed at
+	// a scratch directory.
+	//
+	// TrimSpace is used for the test and not for the value. A directory name may
+	// legally begin or end with a space on Unix, so trimming what is returned
+	// would silently rewrite somebody's path; trimming only the emptiness check
+	// still catches BMD_CACHE_DIR=" ", which is that same shell mistake with a
+	// stray quote in it.
+	if strings.TrimSpace(dir) == "" {
+		return "", usagef(
+			"%s is set but empty; unset it entirely for the default cache directory", cacheDirEnv)
+	}
+
+	return dir, nil
 }
 
 // newLoader builds the real loader. It is a variable rather than a function so

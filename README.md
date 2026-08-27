@@ -50,6 +50,11 @@ bmd verify                                       # re-hash the cache
 `-start` and `-end` are both inclusive, and a bare `-end` date covers that whole
 day. Output is csv, json or parquet. See [docs/cli.md](docs/cli.md).
 
+`export BMD_CACHE_DIR=/mnt/big-disk/bmd` moves the cache for every command that
+takes `-cache-dir`, and the flag overrides it. The library itself reads no
+environment variables — Go code says where its cache lives by calling
+`binancedata.WithCacheDir`.
+
 Give `-symbol` and `-interval` lists rather than running one `bmd` per symbol or
 per interval: Binance's rate limit is per IP address and the limiter honouring it
 is per process, so several processes exceed it between them. Every pair of the

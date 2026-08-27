@@ -12,6 +12,12 @@
 //
 // The six commands are download, list, cache, prune, evict and verify. Run
 // `bmd help` for the summary and `bmd <command> -h` for a command's own flags.
+//
+// One setting can also come from the environment: BMD_CACHE_DIR names the cache
+// directory for the five commands that take -cache-dir, and the flag overrides
+// it. That lookup lives here and not in the library, because a library that
+// reads the environment lets a variable exported for an unrelated reason
+// redirect where its caller's program writes.
 package main
 
 // A directory under cmd/ that declares `package main` becomes an executable.
@@ -258,6 +264,11 @@ Commands:
 Flags:
   -version    Print the version and exit
   -h, -help   Show this help
+
+Environment:
+  BMD_CACHE_DIR   Where the two-tier cache lives. Read by download, cache,
+                  prune, evict and verify — the commands taking -cache-dir,
+                  which overrides it. Not by list, which opens no cache.
 
 Run 'bmd <command> -h' for a command's own flags.
 
