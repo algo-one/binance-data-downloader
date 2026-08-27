@@ -3,11 +3,8 @@
 Download and cache historical Binance market data — as a Go library and as a
 command-line tool.
 
-> **Status: complete and private.** The library and the `bmd` tool both work,
-> and the repository is not public — so `go get` needs a little setup, and there
-> is no pkg.go.dev page. See [Install](#install) for the former and
-> `go doc` for the latter. The version is v0.x: the API is settled but not
-> promised.
+> **Status: complete.** The library and the `bmd` tool both work. The version
+> is v0.x: the API is settled but not promised.
 
 ```go
 // No options needed: the cache lands in the OS cache directory.
@@ -97,26 +94,7 @@ framework, so the CLI is a thin shell over it rather than the other way round.
 
 Requires Go 1.25.0 or newer.
 
-The repository is private, so two things have to be arranged first. Go defaults
-to fetching modules through `proxy.golang.org` and checking them against
-`sum.golang.org`, neither of which can see a private repository; and it fetches
-over HTTPS, where a private repository asks for credentials Go cannot supply.
-Both are one-time settings:
-
-```bash
-# Fetch anything under this org straight from the source, skipping the public
-# proxy and checksum database. See `go help private`. The value is quoted
-# because zsh — the default shell on macOS — treats an unmatched `*` as an error
-# rather than passing it through the way bash does.
-go env -w 'GOPRIVATE=github.com/algo-one/*'
-
-# Use the SSH key you already push with, instead of HTTPS. Scoped to this org so
-# it does not rewrite every other GitHub URL on the machine, and so it matches
-# the GOPRIVATE line above rather than reaching past it.
-git config --global url."git@github.com:algo-one/".insteadOf "https://github.com/algo-one/"
-```
-
-Then, as a library:
+As a library:
 
 ```bash
 go get github.com/algo-one/binance-data-downloader
@@ -127,9 +105,6 @@ Or as a CLI:
 ```bash
 go install github.com/algo-one/binance-data-downloader/cmd/bmd@latest
 ```
-
-Neither line changes if the repository is made public later — the two settings
-above simply stop being necessary.
 
 ## Development
 
@@ -158,17 +133,13 @@ mise tasks      # list everything below
 
 ## Documentation
 
-**API reference.** A private module gets no pkg.go.dev page, so read it from the
-source instead — the doc comments are the same ones pkg.go.dev would render:
+**API reference:**
+[pkg.go.dev/github.com/algo-one/binance-data-downloader](https://pkg.go.dev/github.com/algo-one/binance-data-downloader).
+The same reference is available offline, straight from the source:
 
 ```bash
 go doc github.com/algo-one/binance-data-downloader          # the package overview
 go doc github.com/algo-one/binance-data-downloader.Loader   # one type
-
-# pkg.go.dev itself, served from this directory. It is not part of the
-# toolchain, so `go run` fetches it on demand rather than it being a
-# dependency of this module.
-go run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
 ```
 
 `example_test.go` holds sixteen worked examples, and they are the fastest way in
