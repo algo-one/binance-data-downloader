@@ -62,6 +62,11 @@ becomes a download.
 Run 'bmd cache' first to see how much there is to reclaim, or -n to see what
 this would do.
 
+This never deletes parquet files, so it does not reduce what a read can reach.
+To delete parquet files too, use 'bmd evict' instead: it removes the whole
+entry — archive, sidecar and parquet together — and the data has to be
+downloaded again afterwards.
+
 Flags:
 `)
 		fs.PrintDefaults()
