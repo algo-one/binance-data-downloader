@@ -32,3 +32,4 @@ mise.local.toml
 # but this project commits them so the questions.md deny rule is shared.
 # !.claude/settings.local.json
 questions.md
+/docs/study-guide.md
