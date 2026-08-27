@@ -81,7 +81,8 @@
 //
 // Tier 2 records the SHA-256 of the tier-1 archive it was built from in its
 // Parquet footer, so a cached Parquet can be trusted without re-hashing the
-// ZIP. In the steady state nothing is ever rebuilt. See docs/caching.md.
+// ZIP. In the steady state nothing is ever rebuilt. The caching.md document,
+// linked under Documentation below, gives the full invariants.
 //
 // A read never opens tier 1, so tier 1 can be deleted to reclaim disk — about
 // 40% of a cache, since the Parquet is the larger of the two files. That is what
@@ -109,9 +110,16 @@
 //
 // # Documentation
 //
-// The docs directory carries the longer-form material: architecture.md for how
-// the pieces fit together, caching.md for the cache design and its invariants,
-// numbers.md for why prices are decimals and what the alternatives measured,
-// cli.md for the bmd tool, and go-notes.md, which explains the Go idioms this
-// codebase leans on.
+// The repository carries the longer-form material, one file per concern:
+//
+//   - https://github.com/algo-one/binance-data-downloader/blob/main/docs/architecture.md
+//     for how the pieces fit together
+//   - https://github.com/algo-one/binance-data-downloader/blob/main/docs/caching.md
+//     for the cache design and its invariants
+//   - https://github.com/algo-one/binance-data-downloader/blob/main/docs/numbers.md
+//     for why prices are decimals and what the alternatives measured
+//   - https://github.com/algo-one/binance-data-downloader/blob/main/docs/cli.md
+//     for the bmd command-line tool
+//   - https://github.com/algo-one/binance-data-downloader/blob/main/docs/go-notes.md
+//     for the Go idioms this codebase leans on
 package binancedata
