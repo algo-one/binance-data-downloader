@@ -474,6 +474,7 @@
       <a class="pill" href="#correctness">Correctness</a>
       <a class="pill" href="#api">API</a>
       <a class="pill" href="#cli">The CLI</a>
+      <a class="pill" href="#feedback">Terminal feedback</a>
     </div>
   </div>
 </nav>
@@ -485,7 +486,7 @@
     <h1>One clean stack of candles, out of three sources that each lie a little.</h1>
     <p class="dek">A Go library that turns a symbol, an interval and a time range into a
     verified, gap-free slice of Binance kline data — fast on the first run, ten times
-    faster on the second. This page walks through how the eleven finished stages fit
+    faster on the second. This page walks through how the fifteen finished stages fit
     together, with the numbers that shaped each decision.</p>
 
     <div class="statbar">
@@ -904,6 +905,71 @@
         <li><strong>The forming candle is always dropped.</strong> REST returns the interval currently in progress; its volume is still moving, so it's held back until <code>intervalEnd(OpenTime)</code> has actually passed.</li>
       </ul>
     </div>
+
+    <h3>The quota reading is reported, not acted on</h3>
+    <div class="prose">
+      <p><code>X-MBX-USED-WEIGHT-1M</code> says how much of the 6000 this IP has spent
+      in the current minute. It is the only visibility this library has into a budget
+      metered <em>per address</em> rather than per process — which makes it the one
+      measurement that can see what no amount of local accounting can: a second
+      backtest, another copy of this library, or a live trading bot drawing on the
+      same quota. The limiter's job is to keep that number low; this is how you find
+      out when that is not working.</p>
+
+      <p>It was decoded onto <code>vision.KlinesPage</code>, tested, and read by
+      nobody, with a comment saying a later stage would make it visible. That is this
+      document's own accepted-and-ignored defect, in the one place where the ignored
+      value is the only evidence there is. <code>restFetcher.klines</code> now logs it
+      at debug for every page, and once per fetch at warn past four fifths of the
+      quota.</p>
+    </div>
+
+    <div class="callout">
+      <h4>Three decisions inside that</h4>
+      <ul>
+        <li><strong>4800 is sized against what this library can produce, not as a round fraction.</strong> A minute of the loader running flat out at the default pace accounts for 2400 of the 6000. A reading of 4800 therefore means a burst worth knowing about or — far likelier — company on the address.</li>
+        <li><strong>The warning is per fetch, not per page.</strong> The condition is a property of the minute rather than of the page that observed it, so a range crossing the threshold on its first page crosses it on all of them. A warning repeated ninety-nine times is a warning nobody reads.</li>
+        <li><strong>Zero is not a measurement.</strong> The field is zero when the header was absent or unreadable, and one request always costs <code>KlinesWeight</code> — so a zero is reported as nothing at all rather than as "nothing has been spent".</li>
+      </ul>
+    </div>
+
+    <div class="prose">
+      <p><strong>Reporting rather than reacting is the same division of labour the rest
+      of the package keeps.</strong> A page knows what one request cost; only the layer
+      owning the pipeline can decide the pipeline should slow down, and that layer
+      already has the server's own word for it in the 429 handling. This is the
+      diagnostic that explains why that fired, or that it is about to.</p>
+    </div>
+
+    <h3>The rate is settable, and only downwards</h3>
+    <div class="prose">
+      <p><code>WithRateLimit(weightPerSecond)</code> replaces the sustained rate for
+      one loader. The unit is Binance's own — REQUEST_WEIGHT, of which a klines call
+      costs <code>KlinesWeight</code> — rather than requests per second, so the number
+      in the option is the number in the quota and neither has to be re-derived when
+      the other changes.</p>
+
+      <p>The argument for having it is the argument that sets the default low. The
+      quota is per IP, everything on the machine draws from the same 6000, and the
+      default cannot know how much company it has: 40 is a guess that leaves room, not
+      a measurement. A caller who <em>does</em> know — because the history download
+      shares an address with something latency-sensitive — is the only one who can say
+      so.</p>
+
+      <p><strong>Rates above the quota's own 100 per second are rejected, not
+      clamped.</strong> There is no rate above it Binance permits, so accepting one
+      would accept a setting that cannot be honoured, and clamping silently would have
+      the option report success for a policy it did not apply. The ceiling is the
+      quota rather than the default, so raising toward it stays possible.</p>
+
+      <p><code>vision.BurstFor</code> pairs the burst to the rate — half a second's
+      worth, floored at one klines call, which yields exactly <code>DefaultBurst</code>
+      at the default rate. The floor has teeth: <code>WaitN</code> errors rather than
+      waits when the weight exceeds the burst, so a smaller bucket would refuse every
+      request forever instead of pacing it. The option opts out of the process-wide
+      limiter, and that is documented at the call site, because two buckets each
+      honouring the rate permit twice it.</p>
+    </div>
   </section>
 
   <section id="orchestration">
@@ -1130,6 +1196,41 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
       </ul>
     </div>
 
+    <h3>Every setting is honoured, or it is not offered</h3>
+    <div class="prose">
+      <p>A flag a command advertises and then ignores costs a debugging session to
+      discover, so each command registers only what it acts on: <code>bmd list</code>
+      takes no <code>-cache-dir</code>, because it opens no cache, and no
+      <code>-concurrency</code>, because it makes no parallel fetches. The same rule
+      governs a flag's <em>value</em>. <code>-concurrency 0</code> is a usage error
+      rather than a silent fall back to 8, and so is <code>-cache-dir ""</code> — which
+      is what <code>-cache-dir "$CACHE_DIR"</code> becomes when the variable is unset.
+      Defaulting quietly there is the dangerous reading: the caller believes they named
+      a directory, and the default is the user's real cache.</p>
+
+      <p><strong>The cache directory can also come from the environment, and the same
+      rule follows it there.</strong> <code>BMD_CACHE_DIR</code> names it when the flag
+      is absent — flag, then variable, then <code>os.UserCacheDir</code> — and the
+      lookup asks the command's own <code>FlagSet</code> whether
+      <code>-cache-dir</code> was registered at all. So <code>bmd list</code> cannot see
+      the variable either, and neither can a future command that does not take the
+      flag. A variable set but empty is a usage error for the reason the flag's empty
+      string is one: <code>export BMD_CACHE_DIR="$CACHE_DIR"</code> with
+      <code>CACHE_DIR</code> unset exports an empty string and the shell says nothing.</p>
+
+      <p><strong>The CLI reads it; the library does not.</strong>
+      <code>binancedata</code> is imported by other programs, and a package that reads
+      the environment on its own lets a variable exported for an unrelated reason
+      redirect where its caller writes files. Go code says where its cache lives by
+      calling <code>WithCacheDir</code>. A person says it by exporting this.</p>
+    </div>
+
+    <div class="code">bmd cache                                   <span class="cm"># ~/Library/Caches/bmd</span>
+BMD_CACHE_DIR=<span class="tp">/mnt/big-disk/bmd</span> bmd cache     <span class="cm"># the variable</span>
+BMD_CACHE_DIR=<span class="tp">/mnt/big-disk/bmd</span> bmd cache -cache-dir <span class="tp">/tmp/x</span>
+                                            <span class="cm"># /tmp/x — the flag wins</span>
+BMD_CACHE_DIR=<span class="tp">""</span> bmd cache                <span class="cm"># usage error, exit 2</span></div>
+
     <h3>Four exit codes, because a shell can only see the number</h3>
     <div class="tblwrap">
       <table>
@@ -1144,9 +1245,75 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
     </div>
   </section>
 
+  <section id="feedback">
+    <div class="kicker"><span class="num">§13</span></div>
+    <h2>Two displays, and only one of them is a dependency</h2>
+    <div class="prose">
+      <p>Every slow command used to print nothing until it finished.
+      <code>progress.go</code> draws a <strong>progress bar</strong> for
+      <code>bmd download</code>; <code>spinner.go</code> draws an
+      <strong>indeterminate spinner</strong> for everything else slow. Both write to
+      stderr, both draw only on a terminal, and both erase themselves — so a piped or
+      redirected run is byte-for-byte what it was before either existed.</p>
+    </div>
+
+    <div class="code"><span class="cm"># on a terminal — a real fraction, because Progress carries Done and Total</span>
+BTCUSDT 1h [########        ]  50%  archive <span class="tp">2024-06-01</span>  44640 candles
+
+<span class="cm"># redirected — unchanged since the CLI shipped, so stderr stays greppable</span>
+[ 6/12] BTCUSDT 1h archive <span class="tp">2024-06-01</span>  44640 candles
+
+<span class="cm"># nothing here reports a total, so: a spinner with a count that has no ceiling</span>
+⠹ verifying cached archives — 341 checked (852.5 MB)</div>
+
+    <div class="callout">
+      <h4>Why the bar is hand-rolled and the spinner is not</h4>
+      <ul>
+        <li><strong>The library's redraw does not erase to end of line.</strong> <code>fortio.org/progressbar</code> was tried for the bar first. It writes a carriage return and the new frame, so a frame narrower than the one before it — 44640 candles this month, 24 the next — leaves the wider frame's tail on screen: <code>24 candleses</code>.</li>
+        <li><strong>The fix was already in the file.</strong> Padding every frame out to the widest seen so far is what a <code>width</code> field does, and this file had one. A <code>[####    ]</code> string plus that field was less code than working around the erase.</li>
+        <li><strong>The spinner keeps the library, because its glyph never shrinks.</strong> One column wide, always. Its <em>label</em> can shrink — <code>verify</code> and <code>prune</code> carry a byte total that turns <code>1023.9 MB</code> into <code>1.0 GB</code> — so <code>setPrefix</code> pads the label the same way the bar pads its frame.</li>
+      </ul>
+    </div>
+
+    <h3>A spinner, not a bar, and that is an honesty argument</h3>
+    <div class="prose">
+      <p><code>bmd list</code> makes up to seven bucket listings back to back.
+      <code>verify</code>, <code>cache</code>, <code>prune</code> and <code>evict</code>
+      each walk the whole cache directory — <code>verify</code> re-hashing every
+      archive, the longest thing this tool does. A download's planning phase, before
+      the first chunk event, is the same kind of gap. <strong>None of them reports a
+      total before it starts</strong>, so a percentage would be invented, and an
+      invented "70%" that then sits still is worse than an honest spinner.
+      <code>verify</code> and <code>prune</code> do put a running count on the label —
+      a true number that happens to have no ceiling.</p>
+
+      <p><strong>Gated on <code>-verbose</code> on every command</strong>, because that
+      flag routes the loader's <code>slog</code> stream to stderr and a spinner
+      redrawing the same stream would scribble over the log lines it was asked for.
+      <code>list</code> and <code>cache</code> have no <code>-quiet</code> to gate it
+      against and need none: a spinner that erases itself is not something a redirected
+      run ever sees.</p>
+
+      <p><strong>The animation is a goroutine, and every write to the stream is
+      serialised.</strong> <code>list</code> and <code>cache</code> have no loop to
+      drive a spinner from, so it ticks on its own goroutine — and that goroutine is
+      the only thing writing the stream while the spinner runs. <code>stop</code> waits
+      for it before writing the erase, and a command that must print a real line
+      mid-walk — a <code>verify</code> failure, a <code>prune</code> "kept" — stops,
+      prints, and starts a fresh spinner rather than writing around a live one. No data
+      race, which <code>-race</code> confirms against a forced-on spinner in the tests.</p>
+
+      <p><strong>One dependency, and only for the spinner.</strong>
+      <code>fortio.org/progressbar</code> has no dependencies of its own and a
+      <code>go 1.18</code> floor, so it adds a single line to the module graph and does
+      not move the Go floor. Those are the two things that got a cosmetic dependency
+      past the small-module-graph rule.</p>
+    </div>
+  </section>
+
   <footer>
     <p>Built from scratch in Go · module <code style="font-family: var(--font-mono);">github.com/algo-one/binance-data-downloader</code></p>
-    <p class="status">11 of 11 stages complete — remaining step is the v0.1.0 tag</p>
+    <p class="status">Stages 0–14 complete — remaining step is the v0.1.0 tag</p>
   </footer>
 
 </div>
