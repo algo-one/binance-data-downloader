@@ -1,14 +1,65 @@
 # binance-data-downloader
 
-Download and cache historical Binance market data — as a Go library and as a
-command-line tool.
+[![Go Reference](https://pkg.go.dev/badge/github.com/algo-one/binance-data-downloader.svg)](https://pkg.go.dev/github.com/algo-one/binance-data-downloader)
+[![CI](https://github.com/algo-one/binance-data-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/algo-one/binance-data-downloader/actions/workflows/ci.yml)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
-> **Status: complete.** The library and the `bmd` tool both work. The version
-> is v0.x: the API is settled but not promised.
+**Historical Binance candles, downloaded once and cached properly.** A Go
+library, plus a `bmd` command-line tool built on it.
+
+Ask for a date range. You get back every candle in it, verified against
+Binance's published checksums. Ask again tomorrow and it comes from disk — no
+network, no re-parsing. A backtest can re-read five years of one-minute data on
+every run without paying for it twice.
+
+Binance splits its history across two sources: bulk ZIP archives that lag about
+a day behind, and a REST endpoint for everything newer. This library stitches
+them together so you never have to think about the seam.
+
+**Scope:** spot klines only. Not futures, not order books, not trades.
+
+## Install
+
+Requires Go 1.25 or newer.
+
+```bash
+# As a library
+go get github.com/algo-one/binance-data-downloader
+
+# As a CLI
+go install github.com/algo-one/binance-data-downloader/cmd/bmd@latest
+```
+
+## Try it
+
+```bash
+bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
+```
+
+That writes a CSV to the current directory. Run it a second time and it
+finishes almost instantly — everything is already cached.
+
+The other commands:
+
+```bash
+bmd list   -symbol BTC/USDT -interval 1mo      # what Binance actually publishes
+bmd cache                                      # what your cache holds
+bmd prune                                      # reclaim disk; -n to preview
+bmd evict  -symbol BTC/USDT -before 2023-01-01 # delete data you are done with
+bmd verify                                     # re-hash the cache
+```
+
+Output is `csv`, `json` or `parquet`. Full flag reference in
+[docs/cli.md](docs/cli.md), or run `bmd help`.
+
+## Use it from Go
 
 ```go
-// No options needed: the cache lands in the OS cache directory.
+// No options needed — the cache lands in your OS cache directory.
 loader, err := binancedata.NewLoader()
+if err != nil {
+    return err
+}
 
 klines, err := loader.Fetch(ctx, binancedata.Request{
     Symbol:   "BTC/USDT",
@@ -19,92 +70,85 @@ klines, err := loader.Fetch(ctx, binancedata.Request{
 })
 ```
 
-Ranges are closed — a candle is returned when `Start <= OpenTime <= End` — so a
-full year of 2024 is `Start` 2024-01-01 and `End` 2024-12-31T23:59:59.999999999Z.
-`End` reads most naturally as *the open time of the last candle you want*.
-Writing `End` 2025-01-01 is legal and asks for the candle that opens at midnight
-on New Year's Day, which costs January's archive to fetch.
+Each `Kline` carries open/high/low/close, both volumes, the taker-buy split and
+the trade count.
 
-For a range too large to hold in memory, `loader.Stream(ctx, req)` yields the
-same candles one at a time; `loader.FetchAll(ctx, reqs)` runs several requests
-under one concurrency budget and deduplicates the archives they share.
+Two variants for bigger jobs:
 
-## Command line
+- `loader.Stream(ctx, req)` yields candles one at a time, for ranges too large
+  to hold in memory.
+- `loader.FetchAll(ctx, reqs)` runs several requests under one concurrency
+  budget and downloads shared archives only once.
 
-```bash
-mise run build
+## Things worth knowing
 
-bmd download -symbol BTC/USDT -interval 1h -start 2024-01-01 -end 2024-03-31
-bmd download -symbol BTC/USDT,ETH/USDT -interval 1h -start 2024-01-01 -out ./data
-bmd download -symbol BTC/USDT -interval 1m,1h,1d -start 2024-01-01 -out ./data
-bmd list     -symbol BTC/USDT -interval 1mo      # what Binance actually publishes
-bmd cache                                        # what the cache holds
-bmd prune                                        # reclaim disk; -n to look first
-bmd evict    -symbol BTC/USDT -before 2023-01-01 # delete data you are done with
-bmd verify                                       # re-hash the cache
-```
+**Ranges are inclusive at both ends.** A candle comes back when
+`Start <= OpenTime <= End`. So a full year of 2024 is `Start` 2024-01-01 and
+`End` 2024-12-31T23:59:59.999999999Z. Read `End` as *the open time of the last
+candle you want* — writing `End` 2025-01-01 is legal, but it asks for the candle
+opening on New Year's Day and costs you January's archive to fetch.
 
-`-start` and `-end` are both inclusive, and a bare `-end` date covers that whole
-day. Output is csv, json or parquet. See [docs/cli.md](docs/cli.md).
+**Batch your symbols, don't batch your processes.** Pass lists —
+`-symbol BTC/USDT,ETH/USDT -interval 1m,1h` — rather than running one `bmd` per
+pair. Binance rate-limits per IP address, and the limiter enforcing it lives in
+one process, so parallel processes will blow through the limit between them.
+Every pair gets its own output file.
 
-`export BMD_CACHE_DIR=/mnt/big-disk/bmd` moves the cache for every command that
-takes `-cache-dir`, and the flag overrides it. The library itself reads no
-environment variables — Go code says where its cache lives by calling
-`binancedata.WithCacheDir`.
+**Moving the cache.** `export BMD_CACHE_DIR=/mnt/big-disk/bmd` redirects every
+command that takes `-cache-dir`; the flag wins if both are set. The library
+reads no environment variables at all — Go callers pass
+`binancedata.WithCacheDir` instead, so an unrelated env var can never redirect
+where your program writes.
 
-Give `-symbol` and `-interval` lists rather than running one `bmd` per symbol or
-per interval: Binance's rate limit is per IP address and the limiter honouring it
-is per process, so several processes exceed it between them. Every pair of the
-two lists is downloaded, each to its own file.
+## How it works
 
-## Why
+**Numbers are exact.** Prices and volumes are
+[`udecimal.Decimal`](https://github.com/quagmt/udecimal), never `float64`.
+Binance quote volumes reach 20 significant digits; `float64` holds 15.95. No
+`int64` fixed-point scale saves you either — real PEPE daily volume overflows
+`int64` at 1e8 scaling, silently and negatively. The archives are text, the
+numbers in them are exact, and they stay that way. Details in
+[docs/numbers.md](docs/numbers.md).
 
-Binance publishes bulk historical klines as ZIP archives at
-[data.binance.vision](https://data.binance.vision), each with a SHA-256
-`.CHECKSUM` sidecar. The archives lag real time by about a day, so the newest
-candles have to come from the REST mirror instead. Getting a clean, contiguous,
-verified range of candles means stitching those two sources together, handling
-the calendar rules for which archives exist, and caching aggressively enough
-that a backtest can re-read five years of one-minute data on every run without
-paying for it twice.
+**The cache has two tiers.** Tier 1 is the raw ZIP exactly as Binance served it,
+next to its `.CHECKSUM`. Tier 2 is a Parquet file derived from it — that's what
+reads actually hit. Each Parquet stores the SHA-256 of the archive it came from
+in its own footer, so a cached file is trusted without re-hashing anything. In
+the steady state nothing is ever rebuilt. Details in
+[docs/caching.md](docs/caching.md).
 
-That is what this does.
+**Nothing is evicted automatically.** File timestamps record when data was
+*downloaded*, not when it was *used*, so there's no honest expiry rule to apply.
+You decide: `bmd prune` drops archives that reads no longer need (~40% of the
+cache), `bmd evict` removes entries you name.
 
-## Design notes
+**Library first.** This is built to sit inside a backtesting framework. The CLI
+is a thin shell over the library, not the other way round — anything `bmd` can
+do, your Go code can do.
 
-**Exact numbers.** Prices and volumes are
-[`udecimal.Decimal`](https://github.com/quagmt/udecimal), not `float64`.
-Binance quote volumes reach 20 significant digits; `float64` carries 15.95, and
-no `int64` fixed-point scale spans the range either — real PEPE daily volume
-overflows `int64` at 1e8 scaling, silently and negatively. The archives are
-text, the numbers in them are exact, and this library keeps them that way.
+## Documentation
 
-**Two-tier cache.** Tier 1 is the raw ZIP exactly as Binance served it, kept
-alongside its `.CHECKSUM`. Tier 2 is a Parquet file derived from it, which is
-what reads actually hit. Each Parquet records the SHA-256 of the archive it was
-built from in its own footer, so a cached file can be trusted without re-hashing
-anything. In the steady state nothing is ever rebuilt. It never evicts on its
-own — `bmd prune` reclaims the archives reads no longer need, and `bmd evict`
-removes entries you name. See [docs/caching.md](docs/caching.md).
+Start with the [API reference on
+pkg.go.dev](https://pkg.go.dev/github.com/algo-one/binance-data-downloader), or
+read the same thing offline with `go doc github.com/algo-one/binance-data-downloader`.
 
-**Embeddable first.** The library is designed to sit inside a backtesting
-framework, so the CLI is a thin shell over it rather than the other way round.
+[`example_test.go`](example_test.go) holds sixteen worked examples and is
+probably the fastest way in. Seven of them run on every test run with their
+output checked, so they can't quietly go stale.
 
-## Install
+Longer form:
 
-Requires Go 1.25.0 or newer.
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | How the pieces fit together, and the staged build plan |
+| [docs/caching.md](docs/caching.md) | The two-tier cache, its invariants, and why it exists |
+| [docs/cli.md](docs/cli.md) | The `bmd` command-line tool |
+| [docs/numbers.md](docs/numbers.md) | Why prices are decimals, and what the alternatives measured |
+| [docs/go-notes.md](docs/go-notes.md) | The Go idioms this codebase leans on, in one place |
 
-As a library:
-
-```bash
-go get github.com/algo-one/binance-data-downloader
-```
-
-Or as a CLI:
-
-```bash
-go install github.com/algo-one/binance-data-downloader/cmd/bmd@latest
-```
+The code is commented far more heavily than typical Go. That's deliberate — this
+repository doubles as a way to learn the language, so comments explain *why* a
+construct is used, not just what it does.
 
 ## Development
 
@@ -131,34 +175,14 @@ mise tasks      # list everything below
 | `mise run release:snapshot` | Build the release artefacts locally, publishing nothing |
 | `mise run ci` | Everything CI runs, in order |
 
-## Documentation
+No test in this repository touches Binance. Network paths run against
+`httptest` servers with committed fixtures.
 
-**API reference:**
-[pkg.go.dev/github.com/algo-one/binance-data-downloader](https://pkg.go.dev/github.com/algo-one/binance-data-downloader).
-The same reference is available offline, straight from the source:
+## Versioning
 
-```bash
-go doc github.com/algo-one/binance-data-downloader          # the package overview
-go doc github.com/algo-one/binance-data-downloader.Loader   # one type
-```
-
-`example_test.go` holds sixteen worked examples, and they are the fastest way in
-— seven of them execute on every test run with their output checked, so they
-cannot quietly become wrong.
-
-**Longer form:**
-
-| Document | Contents |
-| --- | --- |
-| [docs/architecture.md](docs/architecture.md) | How the pieces fit together, and the staged build plan |
-| [docs/caching.md](docs/caching.md) | The two-tier cache, its invariants, and why it exists |
-| [docs/cli.md](docs/cli.md) | The `bmd` command-line tool |
-| [docs/numbers.md](docs/numbers.md) | Why prices are decimals, and what the alternatives measured |
-| [docs/go-notes.md](docs/go-notes.md) | The Go idioms this codebase leans on, in one place |
-
-The code itself is commented far more heavily than typical Go. That is
-deliberate: this repository doubles as a way to learn the language, so the
-comments explain *why* a construct is used, not just what it does.
+`v0.x`. Everything documented here works and is covered by tests, but the API
+can still change between minor versions — `v0.2.0` may rename something
+`v0.1.0` used. Pin an exact version if that matters to you.
 
 ## License
 
