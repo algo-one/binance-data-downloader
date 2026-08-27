@@ -37,9 +37,10 @@ func list(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 Usage:
   bmd list -symbol BTC/USDT -interval 1h [-since 2024-01-01]
 
-Nothing is downloaded. -since bounds the cost as well as the answer: the bucket
-listing is seeked to it, so asking about one year is one round trip where asking
-about a pair's whole history can be seven.
+Nothing is downloaded. -since makes this faster too: the tool jumps straight
+to that date in Binance's file list, instead of reading through every year
+before it. Asking about one year costs one network request. Asking about a
+pair's whole history can cost seven.
 
 Flags:
 `)
