@@ -1,7 +1,15 @@
 package main
 
-// The progress display, which is one line on a terminal and one line per chunk
-// anywhere else.
+// The download progress display: a redrawn bar on a terminal, one line per
+// chunk anywhere else.
+//
+// It is hand-drawn rather than handed to fortio.org/progressbar (which
+// spinner.go uses) for one reason found the hard way: that library's redraw
+// writes a carriage return and the new frame, but does not erase to end of
+// line, so a frame narrower than the one before it — 44,640 candles this month,
+// 24 the next — leaves the tail of the wider frame on screen ("24 candleses").
+// The fix is to pad every frame to the width of the widest so far, which is a
+// few lines here and was already how this file worked before the bar existed.
 
 import (
 	"fmt"
@@ -10,6 +18,11 @@ import (
 
 	binancedata "github.com/algo-one/binance-data-downloader"
 )
+
+// barWidth is how many cells the bar itself occupies, between its brackets. Kept
+// short so the whole line — label, bar, percentage and the per-chunk detail —
+// fits an 80-column terminal without wrapping.
+const barWidth = 16
 
 // progress renders binancedata.Progress events onto a stream.
 //
@@ -26,9 +39,10 @@ type progress struct {
 	// turns the same output into one enormous line with no newlines in it.
 	tty bool
 
-	// width is the length of the last line written, so the next redraw can
-	// pad over it. Without this, a short line leaves the tail of a longer
-	// predecessor on screen and the result reads as corrupted output.
+	// width is the length of the last line written, so the next redraw can pad
+	// over it. Without this, a shorter line leaves the tail of a longer
+	// predecessor on screen and the result reads as corrupted output — see the
+	// note at the top of this file.
 	width int
 
 	// active records whether anything has been drawn, so done knows whether it
@@ -40,8 +54,8 @@ type progress struct {
 	//
 	// Conditional rather than always on. With one symbol the name is already in
 	// the summary line and in the file name, so a column repeating it on every
-	// chunk is noise; with several it is the only thing distinguishing one
-	// [3/12] from another.
+	// chunk is noise; with several it is the only thing distinguishing one bar
+	// from another.
 	showSymbol bool
 
 	// showInterval does the same for the interval, and is set independently:
@@ -50,6 +64,13 @@ type progress struct {
 	// separate booleans rather than one "label the lines" flag for exactly that
 	// case.
 	showInterval bool
+
+	// plan is the spinner that covers the gap before the first chunk: the
+	// bucket listing and routing the library does inside Stream, which is
+	// otherwise dead air on the terminal. downloadOne sets it per request; the
+	// first report() below stops it, because the bar is now ready to take over.
+	// nil off a terminal and under -quiet, and every spinner method is nil-safe.
+	plan *spinner
 }
 
 // newProgress builds the reporter, or returns nil when there should not be one.
@@ -84,6 +105,12 @@ var newProgress = func(w io.Writer, quiet bool) *progress {
 // here out of habit: it would be harmless and it would also be a lie about
 // where the synchronisation lives.
 func (p *progress) report(ev binancedata.Progress) {
+	// The first event means the plan is done and a chunk has finished, so the
+	// preparing spinner has served its purpose. Stop it before the line below
+	// is drawn, or the two fight for the same row. Idempotent and nil-safe, so
+	// the later events and the non-terminal case cost nothing.
+	p.stopPlan()
+
 	// Both labels come from the event rather than from a field set per download,
 	// which is what makes this correct if the reporting ever stops being
 	// sequential: Progress carries the request the chunk belongs to, so a line
@@ -97,20 +124,25 @@ func (p *progress) report(ev binancedata.Progress) {
 		label += ev.Request.Interval.String() + " "
 	}
 
-	line := fmt.Sprintf("[%*d/%d] %s%s %s  %s",
-		digits(ev.Total), ev.Done, ev.Total,
-		label,
-		ev.Source,
-		ev.Start.Format(dateLayout),
-		outcome(ev))
+	// The per-chunk detail, the same text in both forms: which source answered,
+	// which period, and how the chunk went.
+	detail := fmt.Sprintf("%s %s  %s", ev.Source, ev.Start.Format(dateLayout), outcome(ev))
 
 	if !p.tty {
 		// One line per chunk, with a newline, so a redirected stderr stays
-		// readable and greppable.
-		_, _ = fmt.Fprintln(p.w, line)
+		// readable and greppable. The count is padded so [ 1/60] and [60/60]
+		// line up and the column does not jitter as the number grows.
+		_, _ = fmt.Fprintf(p.w, "[%*d/%d] %s%s\n",
+			digits(ev.Total), ev.Done, ev.Total, label, detail)
 
 		return
 	}
+
+	// On a terminal, a bar. Its fill is Done/Total — units of work, which is
+	// what the library reports; see the type comment on why there is no
+	// byte-level number.
+	line := fmt.Sprintf("%s%s %3d%%  %s",
+		label, drawBar(ev.Done, ev.Total), percent(ev.Done, ev.Total), detail)
 
 	// Pad to cover whatever was there before, then return to the start of the
 	// line without ending it, so the next event overwrites this one.
@@ -122,6 +154,28 @@ func (p *progress) report(ev binancedata.Progress) {
 	p.active = true
 
 	_, _ = fmt.Fprintf(p.w, "\r%s", line)
+}
+
+// stopPlan ends the preparing spinner if it is still running.
+//
+// report() stops it on the first progress event, but a request that produces no
+// event at all — an empty range, where Stream yields nothing — never reaches
+// report(), and then the spinner is still animating on stderr when downloadOne
+// prints its summary to the same stream. So downloadOne also calls this
+// explicitly on the way out, the way every other command stops its spinner by
+// hand before it prints.
+//
+// Nil-safe on the receiver, because -quiet leaves the whole *progress nil and
+// downloadOne still calls this unconditionally, exactly as it does done().
+// Idempotent, because spinner.stop is. The three call sites — report(), here,
+// and the defer in downloadOne — overlap on purpose: none of them is guaranteed
+// to be the one that fires first.
+func (p *progress) stopPlan() {
+	if p == nil {
+		return
+	}
+
+	p.plan.stop()
 }
 
 // done releases the line the display was drawing on.
@@ -139,11 +193,48 @@ func (p *progress) done() {
 	p.active = false
 
 	// The width goes with the line it measured. It exists to overwrite what is
-	// still on screen, and after the newline above there is nothing there —
-	// so leaving it set would pad the first line of the next symbol out to the
-	// width of the last line of the previous one, on a line that is already
-	// empty.
+	// still on screen, and after the newline above there is nothing there — so
+	// leaving it set would pad the first line of the next request out to the
+	// width of the last line of this one, on a line that is already empty.
 	p.width = 0
+}
+
+// drawBar renders the [####    ] bar for a done/total pair.
+//
+// ASCII on purpose: the line is measured with len() for the padding above, so a
+// multi-byte block glyph would make the measurement disagree with the display
+// and the padding drift. A zero total cannot happen — a request is at least one
+// chunk — but it renders as an empty bar rather than dividing by zero.
+func drawBar(done, total int) string {
+	filled := 0
+	if total > 0 {
+		filled = done * barWidth / total
+	}
+
+	if filled > barWidth {
+		filled = barWidth
+	}
+
+	return "[" + strings.Repeat("#", filled) + strings.Repeat(" ", barWidth-filled) + "]"
+}
+
+// percent is the whole-number percentage for the bar's label.
+//
+// Clamped to 100, the same guard drawBar puts on its cell count. The library
+// reports Done in 1..Total, so this cannot fire today — but the two helpers
+// take the same pair and are read side by side, so a "150%" next to a full bar
+// is a state one of them should not be able to show while the other cannot.
+func percent(done, total int) int {
+	if total <= 0 {
+		return 0
+	}
+
+	p := done * 100 / total
+	if p > 100 {
+		p = 100
+	}
+
+	return p
 }
 
 // outcome renders the part of an event that says how the chunk went.

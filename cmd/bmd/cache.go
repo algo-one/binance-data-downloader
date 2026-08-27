@@ -58,13 +58,27 @@ Flags:
 		return err
 	}
 
-	return runCacheReport(ctx, l, stdout)
+	return runCacheReport(ctx, l, stdout, stderr, common.verbose)
 }
 
 // runCacheReport asks for the measurement and renders it. It is separate from
 // flag parsing so a test can drive it with a cache it built itself.
-func runCacheReport(ctx context.Context, l loader, stdout io.Writer) error {
+//
+// It takes stderr only for the spinner: CacheUsage opens every parquet footer
+// under the root to reach the prunable figure, which on a large cache is a
+// visible pause, and the report is silent until it returns.
+func runCacheReport(ctx context.Context, l loader, stdout, stderr io.Writer, verbose bool) error {
+	// stderr, so the table on stdout stays clean; stopped before the table is
+	// written, so the two never share a line. `bmd cache` has no -quiet — its
+	// report is its output (see commonFlags) — but it has -verbose, and a
+	// spinner must not redraw over the log stream that flag turns on. Off a
+	// terminal newSpinner returns nil and the run is byte-for-byte unchanged.
+	sp := newSpinner(stderr, false, verbose, "measuring the cache")
+	defer sp.stop()
+
 	usage, err := l.CacheUsage(ctx)
+	sp.stop()
+
 	if err != nil {
 		return err
 	}

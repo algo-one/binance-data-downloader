@@ -1,10 +1,10 @@
 # Architecture
 
-> **Status:** all thirteen stages are complete — 0 (scaffolding), 1 (domain
+> **Status:** all fourteen stages are complete — 0 (scaffolding), 1 (domain
 > types), 2 (time and availability), 3 (parsing), 4 (downloader), 5 (cache),
 > 6 (REST fetcher), 7 (loader orchestration), 8 (CLI), 9 (documentation and
 > release), 10 (cache management), 11 (multi-symbol download), 12 (the pre-tag
-> pass) and 13 (cache retention).
+> pass), 13 (cache retention) and 14 (terminal feedback).
 > Everything described below exists. The remaining step is publishing — the
 > v0.1.0 tag and what goes with it — which is deliberately not done yet; see
 > "goreleaser is configured but not wired to CI" below for the part of it that
@@ -848,8 +848,10 @@ again, which is what it was always documented to be.
 │   ├── verify.go     Loader.VerifyCache, rendered
 │   ├── cache.go      Loader.CacheUsage, rendered
 │   ├── prune.go      Loader.PruneArchives, rendered
+│   ├── evict.go      Loader.EvictCache, rendered
 │   ├── output.go     csv/json/parquet encoders; destinations; atomic writes
-│   └── progress.go   the one-line terminal display
+│   ├── progress.go   the download progress bar; one line per chunk off a tty
+│   └── spinner.go    the indeterminate spinner the other slow commands share
 ├── testdata/         real archives, byte-untouched (see its README)
 └── docs/
 ```
@@ -1427,6 +1429,88 @@ eviction returns the right candles either way, by downloading them. Pruning must
 not cost a request; evicting must. The pair of tests is what separates the two
 operations in fact rather than in prose.
 
+## Terminal feedback
+
+Two displays. `progress.go` draws a **progress bar** for `bmd download`;
+`spinner.go` draws an **indeterminate spinner** for everything else slow. Both
+write to stderr, both draw only on a terminal, and both erase themselves. The
+spinner is `fortio.org/progressbar`; the bar is a dozen lines of hand-rolled
+carriage returns, for a reason given below.
+
+### The download bar
+
+The library hands the CLI a `Progress` value for every chunk that finishes — a
+`Done`, a `Total`, a source and a count — so a download has a real fraction to
+fill a bar with. On a terminal `progress.go` draws `[####    ]` with the
+percentage, the symbol and interval in front (only when a run has more than one
+of each — one download names itself in the summary) and the per-chunk detail
+after. Off a terminal it is unchanged from Stage 8: one line per chunk,
+`[3/12] source period outcome`, with a newline, so a redirected stderr stays
+greppable.
+
+**Why it is hand-rolled and the spinner is not.** `fortio.org/progressbar` was
+tried here first. Its redraw writes a carriage return and the new frame but does
+*not* erase to end of line, so a frame narrower than the one before it — 44,640
+candles this month, 24 the next — leaves the wider frame's tail on screen:
+`24 candleses`. The fix is to pad every frame to the widest seen so far, which
+this file already did before the bar, with a `width` field. Each request
+measures its own width; `done()` ends the line with a newline and zeroes the
+width, so the next request in a multi-download run starts clean.
+
+The spinner keeps the library because its glyph is one column wide and never
+shrinks — but the label `verify` and `prune` put in front of it can, when the
+byte total it carries crosses a unit and `1023.9 MB` becomes `1.0 GB`. So
+`spinner.go` pads the label the same way the bar pads its frame: `setPrefix`
+holds a `width`, and every label — the first and each `setLabel` — is padded
+back out to the widest handed to that spinner so far.
+
+### The spinner
+
+`bmd list` is one `Available` call that makes up to seven bucket listings back to
+back. `bmd verify`, `bmd cache`, `bmd prune` and `bmd evict` each walk the whole
+cache directory — `verify` re-hashing every archive, the longest thing this tool
+does. And a download's planning phase, before the first chunk event, is the same
+kind of gap. None of these has a total to fill a bar with, and four decisions
+shape the spinner they share.
+
+**A spinner, not a bar.** `Available`, `CacheUsage` and the `VerifyCache` /
+`PruneArchives` / `EvictCache` iterators none of them say, before they begin, how
+many archives exist or how many requests a listing will take. A percentage would
+be invented, and an invented "70%" that then sits still is worse than an honest
+spinner. `verify` and `prune` do carry a running count on the spinner's label —
+"341 checked" — which is a true number that happens to have no ceiling.
+
+**stderr only, terminal only, and self-erasing.** Like the bar and the
+summaries, so `bmd` output that is piped or redirected is byte-for-byte what it
+was before this existed. It is not created at all when stderr is not a terminal —
+the same `isTerminal` seam `progress.go` uses — and `stop` erases the line rather than
+ending it with a newline, so a completed spinner leaves no trace above the
+result. `bmd list` and `bmd cache` have no `-quiet` to gate it (their report *is*
+their output; see `commonFlags`), and need none: an indeterminate spinner that
+vanishes is not something a redirected run ever sees. Every command does gate it
+on `-verbose`, though: that flag routes the loader's `slog` stream to stderr,
+and a spinner redrawing the same stream would scribble over the log lines it
+was asked for.
+
+**The animation is a goroutine, and every write to the stream is serialised.**
+The spinner ticks on its own goroutine because `list` and `cache` have no loop to
+drive it from. That goroutine is the only thing that writes the stream while the
+spinner runs; `stop` waits for it to return before it writes the erase, and a
+command that must print a real line mid-walk — a `verify` failure, a `prune`
+"kept" — calls `stop`, prints, and starts a fresh spinner rather than writing
+around a live one. The result has no data race, which `-race` confirms against
+the forced-on spinner in `spinner_test.go`.
+
+**One dependency, and only for the spinner.** `fortio.org/progressbar` supplies
+the spinner's carriage-return redraw and its ~100 ms frame timing — a spinner
+the CLI had nowhere else, where hand-rolling the animation loop and the glyph
+cycle would have been the larger thing to own. It has no dependencies of its own
+and a `go 1.18` floor, so it adds a single line to the module graph and does not
+move the Go floor — the two things that got a cosmetic dependency past the
+"small module graph" rule in "Dependencies" above. The download bar does not use
+it, for the erase reason above; a `[####    ]` string and the `width` field this
+file already had were less code than working around that.
+
 ## Documentation and release
 
 Stage 9 found most of its own deliverables already built — `doc.go`, the README
@@ -1615,8 +1699,9 @@ setting is a defect, not a stub.
 | 11 | Multi-symbol `bmd download` — one process, one rate limiter | **done** |
 | 12 | Pre-tag pass — `DataType` unexported, multi-interval `bmd download`, doc corrections | **done** |
 | 13 | Cache retention — `Loader.EvictCache`, `bmd evict` | **done** |
+| 14 | Terminal feedback — a hand-rolled progress bar for `bmd download` (`progress.go`), and an indeterminate spinner over `fortio.org/progressbar` for `list`, `cache`, `verify`, `prune`, `evict` and the download planning phase (`spinner.go`) | **done** |
 
-Stages 10 to 13 were not in the original plan. Stage 10 is the capability
+Stages 10 to 14 were not in the original plan. Stage 10 is the capability
 `docs/caching.md` designed in Stage 5 and left unbuilt, added because the only
 cache management that shipped was `bmd verify -rm`, which deletes corrupt files
 and nothing else. Stage 11 closed the gap between the library's process-wide rate
@@ -1638,6 +1723,23 @@ for why the two automatic ones both rest on a signal this cache does not have.
 See also "Reclaiming disk" and "Several symbols and intervals in one process"
 above.
 
+Stage 14 is the rest of what Stage 8 started. `bmd download` had a per-chunk
+counter line; on a terminal it now draws a real progress bar, because the
+library's `Progress` events carry a `Done` and a `Total` and that is a fraction.
+The bar is hand-rolled — `fortio.org/progressbar` was tried and its redraw does
+not erase to end of line, so a narrowing frame smears ("24 candleses"). The five
+commands that do one slow thing before they print — two bucket listings for
+`list`, a re-hash of every archive for `verify`, a full cache walk for `cache`,
+`prune` and `evict` — and the planning phase of a download showed nothing until
+the result landed; they share one indeterminate spinner, which *is* the library:
+its glyph never narrows, and the running count `verify` and `prune` put on its
+label is padded to its widest so the label does not either. None of those calls
+reports a total before it starts, so a spinner rather than a bar. Bar and
+spinner are both on stderr, terminal-only, self-erasing, and off under
+`-verbose`, so a redirected or logging run is byte-for-byte what it was. One new
+dependency, no dependencies of its own. See "Terminal
+feedback" below.
+
 ## Dependencies
 
 | Dependency | Purpose | Stage |
@@ -1646,6 +1748,7 @@ above.
 | `golang.org/x/sync` | `errgroup` (the two availability listings in parallel; in Stage 7 the loader's error collection and cancellation, with the concurrency bound itself a semaphore so it can span calls), `singleflight` (dedup) | 4 |
 | `github.com/parquet-go/parquet-go` | Tier-2 cache and CLI export; pure Go. Raised the module's floor from Go 1.24.0 to 1.24.9, which it declares from v0.26.0 onward — accepted deliberately as a patch-level bump; see `go.mod` | 5 |
 | `golang.org/x/time` | `rate.Limiter`, the token bucket pacing the REST endpoint | 6 |
+| `fortio.org/progressbar` | The spinner in `cmd/bmd/spinner.go` — its redraw and ~100 ms frame timing (`list`, `cache`, `verify`, `prune`, `evict`, and a download's planning phase). Not the download bar, which is hand-rolled; see "Terminal feedback". Zero dependencies of its own, and a `go 1.18` floor, so it adds one line to the graph and does not move ours — the two properties that got a cosmetic dependency past the rule below | 14 |
 
 The module's floor is **Go 1.25.0**, and it has moved twice. parquet-go pushed
 it from 1.24.0 to 1.24.9 in Stage 5, because a module's floor cannot sit below

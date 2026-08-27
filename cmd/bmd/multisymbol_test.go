@@ -525,11 +525,10 @@ func TestProgressDoesNotPadTheNextSymbolsFirstLine(t *testing.T) {
 
 	p := &progress{w: &buf, tty: true, showSymbol: true}
 
-	// A long line, from a symbol with many chunks: the count is padded to the
-	// width of the total, so [  1/100] is wider than [1/1].
+	// A long line, from a symbol with many chunks and a wide candle count.
 	p.report(binancedata.Progress{
 		Request: binancedata.Request{Symbol: "1000SATSUSDT"},
-		Done:    1, Total: 100, Source: binancedata.SourceMonthlyArchive,
+		Done:    50, Total: 100, Source: binancedata.SourceMonthlyArchive,
 		Start:  mustDate(t, "2024-01-01"),
 		Klines: 44640,
 	})

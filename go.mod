@@ -63,6 +63,23 @@ go 1.25.0
 // becomes a constraint on everybody who imports us — so this list is meant to
 // stay short. Everything not named here is the standard library.
 require (
+	// fortio.org/progressbar draws the indeterminate spinner in cmd/bmd
+	// (spinner.go) — list, verify, cache, prune, evict, and the planning phase
+	// of a download. Not the download bar in progress.go: that one is
+	// hand-rolled, because this library's redraw does not erase to end of line
+	// and a narrowing frame smears. The spinner keeps the library: its glyph is
+	// one column wide and never narrows, and the running label some commands
+	// add — a byte total that shrinks from "1023.9 MB" to "1.0 GB" — spinner.go
+	// pads back to its widest, the same fix progress.go uses for the bar.
+	//
+	// It is the one dependency here that is not load-bearing for the library:
+	// nothing under the root imports it, and `bmd` works without a spinner. It
+	// cleared the "dependencies are a liability" bar on two facts — it has no
+	// dependencies of its own, so it adds a single line to the module graph,
+	// and it declares `go 1.18`, so it cannot move the floor above. Owning the
+	// animation loop and the glyph cycle by hand was the larger thing to avoid.
+	fortio.org/progressbar v1.2.0
+
 	// parquet-go writes and reads tier 2 of the cache: the columnar form of an
 	// archive, which is what a backtest's repeat reads actually hit. It is pure
 	// Go, so the library still cross-compiles and links statically — DuckDB was

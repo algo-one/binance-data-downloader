@@ -84,7 +84,22 @@ Flags:
 		return err
 	}
 
+	// A whole-history Available is up to seven serial round trips and shows
+	// nothing until the table lands. The spinner fills that gap. It goes to
+	// stderr, so the table on stdout is untouched; it is stopped before the
+	// table is written, so the two never share a line.
+	//
+	// No -quiet to consult: `bmd list` has none, because its report is its
+	// output and goes to stdout (see commonFlags in flags.go). -verbose it does
+	// have, and that one matters: it points stderr at the loader's log stream,
+	// which the spinner must not redraw over. Off a terminal newSpinner returns
+	// nil anyway and a redirected run is byte-for-byte unchanged.
+	sp := newSpinner(stderr, false, common.verbose, "listing what Binance publishes")
+	defer sp.stop()
+
 	available, err := l.Available(ctx, query)
+	sp.stop()
+
 	if err != nil {
 		return err
 	}

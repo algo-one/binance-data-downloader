@@ -69,17 +69,29 @@ Flags:
 		return err
 	}
 
-	return runVerify(ctx, l, stdout, stderr, *remove, common.quiet)
+	return runVerify(ctx, l, stdout, stderr, *remove, common.quiet, common.verbose)
 }
 
 // runVerify walks the cache and reports. It is separate from flag parsing so a
 // test can drive it with a cache it built itself.
-func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, quiet bool) error {
+func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, quiet, verbose bool) error {
 	var (
 		checked int
 		bytes   int64
 		bad     int
 	)
+
+	// Re-hashing every archive is the slowest thing this tool does — minutes on
+	// a cache measured in gigabytes — and it prints nothing but failures, which
+	// a healthy cache has none of. The spinner is the sign of life, and its
+	// label carries the running count; there is no total to make a bar from,
+	// because VerifyCache does not say how many archives it will find.
+	//
+	// sp is reassigned when a failure interrupts the walk (stop, print, start a
+	// fresh one), so the defer reads the variable rather than binding today's
+	// value of it.
+	sp := newSpinner(stderr, quiet, verbose, "verifying cached archives")
+	defer func() { sp.stop() }()
 
 	for entry, err := range l.VerifyCache(ctx) {
 		// The iterator's own error is the one that ends the walk: the cache
@@ -93,6 +105,17 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 		checked++
 		bytes += entry.Size
 
+		// Only build the label when a spinner is showing it. Off a terminal, or
+		// under -quiet or -verbose, sp is nil for the whole walk, and on a
+		// cache of hundreds of thousands of archives this fmt.Sprintf plus
+		// humanBytes per archive is a lot of allocation nothing reads. label
+		// stays "" on that path and is handed on unused below.
+		label := ""
+		if sp != nil {
+			label = fmt.Sprintf("verifying cached archives — %d checked (%s)", checked, humanBytes(bytes))
+			sp.setLabel(label)
+		}
+
 		if entry.Err == nil {
 			continue
 		}
@@ -101,7 +124,12 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 
 		// Failures go to stdout, not stderr. They are this command's output —
 		// the answer it was run to produce — and a caller piping it into a
-		// file wants them in the file.
+		// file wants them in the file. The spinner is stopped around the print
+		// rather than written past: it holds a line on stderr, the failure
+		// takes a line on stdout, and on a shared terminal the two would
+		// otherwise collide.
+		sp.stop()
+
 		_, _ = fmt.Fprintf(stdout, "%s: %v\n", entry.Path, entry.Err)
 
 		if remove {
@@ -116,7 +144,16 @@ func runVerify(ctx context.Context, l loader, stdout, stderr io.Writer, remove, 
 					filepath.Base(entry.Path))
 			}
 		}
+
+		// label is "" when sp was nil; newSpinner returns nil again regardless,
+		// so the fresh spinner picks up the running text only on a terminal.
+		sp = newSpinner(stderr, quiet, verbose, label)
 	}
+
+	// Release the spinner line before the summary, so the summary starts on a
+	// clean one. The deferred stop above is for the early return on an iterator
+	// error; here the walk finished, so it is done explicitly.
+	sp.stop()
 
 	// The failures themselves are stdout and are printed either way; this is
 	// the reassurance line, which is exactly what -quiet is for.

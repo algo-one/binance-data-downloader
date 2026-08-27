@@ -117,7 +117,7 @@ Flags:
 		return err
 	}
 
-	return runEvict(ctx, l, evictOpts, stdout, stderr, common.quiet)
+	return runEvict(ctx, l, evictOpts, stdout, stderr, common.quiet, common.verbose)
 }
 
 // buildEvictOptions turns the flags into the library's options, and refuses the
@@ -231,13 +231,22 @@ func wasGiven(fs *flag.FlagSet, name string) bool {
 // nothing. Here each line is data that is gone, so the list is the receipt —
 // and it is on stdout because it is the thing worth keeping.
 func runEvict(
-	ctx context.Context, l loader, opts binancedata.EvictOptions, stdout, stderr io.Writer, quiet bool,
+	ctx context.Context, l loader, opts binancedata.EvictOptions, stdout, stderr io.Writer, quiet, verbose bool,
 ) error {
 	var (
 		evicted int
 		freed   int64
 		failed  int
 	)
+
+	// The walk is over every directory in the cache and can be a visible pause
+	// before the first line — most of all when a filter matches nothing, which
+	// prints only "nothing matched" at the end. Unlike verify and prune, this
+	// command prints a line for every entry it does touch, so a running spinner
+	// would fight its own receipt: the spinner covers the gap before output
+	// starts and is stopped by the first result, whichever kind it is.
+	sp := newSpinner(stderr, quiet, verbose, "scanning the cache")
+	defer sp.stop()
 
 	for result, err := range l.EvictCache(ctx, opts) {
 		// The iterator's own error ends the walk: bad options, an unreadable
@@ -247,6 +256,10 @@ func runEvict(
 		if err != nil {
 			return err
 		}
+
+		// The first result of any kind hands the screen to the receipt lines.
+		// Idempotent, so calling it every iteration costs nothing.
+		sp.stop()
 
 		if result.Err != nil {
 			failed++
@@ -263,6 +276,9 @@ func runEvict(
 
 		_, _ = fmt.Fprintf(stdout, "%s %s %s\n", result.Symbol, result.Interval, result.Name)
 	}
+
+	// For the match-nothing case, where the loop above never ran.
+	sp.stop()
 
 	if !quiet {
 		writeEvictSummary(stderr, opts.DryRun, evicted, freed, failed)

@@ -147,6 +147,7 @@ Flags:
 		out:      *out,
 		format:   *format,
 		quiet:    common.quiet,
+		verbose:  common.verbose,
 		unit:     unit,
 		encode:   encode,
 		progress: progress,
@@ -162,6 +163,12 @@ type downloadOpts struct {
 	out    string
 	format string
 	quiet  bool
+
+	// verbose is here for one reason: it decides, along with quiet, whether the
+	// planning spinner is created. -verbose points stderr at the loader's log
+	// stream, and a spinner redrawing that stream would scribble over it — the
+	// same collision newSpinner guards every other command against.
+	verbose bool
 
 	// unit is the noun the summary counts in: "symbol", "interval" or
 	// "download". See [buildRequests], which picks it from whichever of the two
@@ -308,6 +315,30 @@ func downloadOne(
 		return 0, err
 	}
 
+	// A spinner for the gap before the first chunk. Stream does the bucket
+	// listing and routing on the first pull, and for a wide range that is
+	// several serial requests with nothing on screen.
+	//
+	// Three things stop it, because none of them always fires first: report()
+	// on the first progress event, the explicit stopPlan() below just before
+	// the summary is printed, and this defer for the error return between here
+	// and there. The empty-range path is why the explicit stop is needed —
+	// writeTo returns (0, nil) with no event, so report() never runs, and
+	// without stopPlan() the summary would land on a still-animating spinner
+	// and the too-late defer would then erase part of the summary.
+	//
+	// Wired onto the reporter only when there is one: -quiet leaves
+	// opts.progress nil, and newSpinner would return nil for -quiet anyway, so
+	// this is belt and braces. Off a terminal, or under -verbose, newSpinner
+	// returns nil and the per-chunk lines are unchanged.
+	if opts.progress != nil {
+		sp := newSpinner(stderr, opts.quiet, opts.verbose,
+			"preparing "+req.Symbol+" "+req.Interval.String())
+		opts.progress.plan = sp
+
+		defer sp.stop()
+	}
+
 	// Stream, not Fetch. The candles go straight into an encoder, so there is
 	// no reason for the whole range to exist at once — five years of minute
 	// candles is about 820 MB of Kline, and this way the CLI's memory use is
@@ -316,6 +347,13 @@ func downloadOne(
 	if err != nil {
 		return 0, err
 	}
+
+	// Stop the planning spinner before anything is printed below. On the normal
+	// path report() already did, from the first chunk event; this is for the
+	// request that produced no event — an empty range — where the spinner would
+	// otherwise still be animating when the summary lands on the same stream,
+	// and the deferred sp.stop() only fires after it. Nil-safe and idempotent.
+	opts.progress.stopPlan()
 
 	// The progress display owns the last line on the terminal until this point.
 	// On a terminal its last redraw ended with \r and the line, and no newline,

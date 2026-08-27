@@ -90,7 +90,7 @@ Flags:
 		return err
 	}
 
-	return runPrune(ctx, l, stdout, stderr, *dryRun, common.quiet)
+	return runPrune(ctx, l, stdout, stderr, *dryRun, common.quiet, common.verbose)
 }
 
 // runPrune walks the cache and reports. It is separate from flag parsing so a
@@ -104,13 +104,24 @@ Flags:
 // into a file, and in a healthy cache there are none of them. The removals
 // themselves are not printed. They are the expected outcome, there can be
 // thousands, and the summary counts them.
-func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, quiet bool) error {
+func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, quiet, verbose bool) error {
 	var (
 		pruned int
 		freed  int64
 		kept   int
 		failed int
 	)
+
+	// Walking the cache opens every parquet footer to reach a verdict, and
+	// prints only its exceptions — a healthy cache produces none until the
+	// summary. The spinner is the sign of life; its label carries the running
+	// count and the bytes freed so far. No total, so no bar: PruneArchives does
+	// not say how many archives it will find.
+	//
+	// sp is reassigned when an exception interrupts the walk, so the defer
+	// reads the variable rather than binding today's value of it.
+	sp := newSpinner(stderr, quiet, verbose, "scanning cached archives")
+	defer func() { sp.stop() }()
 
 	for result, err := range l.PruneArchives(ctx, binancedata.PruneOptions{DryRun: dryRun}) {
 		// The iterator's own error is the one that ends the walk: the cache
@@ -125,6 +136,11 @@ func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, q
 		case result.Err != nil:
 			failed++
 
+			// Stop the spinner around the line, not write past it: it holds a
+			// line on stderr, this takes one on stdout, and a shared terminal
+			// would otherwise show them collided. A fresh spinner starts below.
+			sp.stop()
+
 			_, _ = fmt.Fprintf(stdout, "%s: %v\n", result.Path, result.Err)
 
 		case result.Kept != nil:
@@ -135,6 +151,8 @@ func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, q
 			// exactly like one that failed to, and the reason — no parquet yet,
 			// or one built by an older codec — is what tells the reader whether
 			// to care.
+			sp.stop()
+
 			_, _ = fmt.Fprintf(stdout, "kept %s: %v\n", filepath.Base(result.Path), result.Kept)
 
 		default:
@@ -144,7 +162,27 @@ func runPrune(ctx context.Context, l loader, stdout, stderr io.Writer, dryRun, q
 			pruned++
 			freed += result.Size
 		}
+
+		// Only when a spinner is showing it. Off a terminal, or under -quiet or
+		// -verbose, sp is nil for the whole walk, and this fmt.Sprintf plus
+		// humanBytes per archive is allocation nothing reads.
+		if sp != nil {
+			label := fmt.Sprintf("scanning cached archives — %d checked, %s freed",
+				pruned+kept+failed, humanBytes(freed))
+
+			// An exception above stopped the spinner, so start a fresh one;
+			// otherwise it is still running and only its label changes.
+			if result.Err != nil || result.Kept != nil {
+				sp = newSpinner(stderr, quiet, verbose, label)
+			} else {
+				sp.setLabel(label)
+			}
+		}
 	}
+
+	// Release the spinner line before the summary. The deferred stop is for the
+	// early return on an iterator error above.
+	sp.stop()
 
 	if !quiet {
 		writePruneSummary(stderr, dryRun, pruned, freed, kept, failed)

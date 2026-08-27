@@ -501,10 +501,22 @@ csv > out.csv` produces a clean file. There is a test asserting it.
 The one exception is `bmd verify`, whose failures *are* its output and go to
 stdout, so piping them into a file works.
 
-**Progress** is one redrawn line on a terminal and one line per chunk anywhere
-else, so a redirected stderr stays readable. It counts chunks rather than bytes,
-because that is what the library reports — see `Progress` in
+**Progress** for `bmd download` is a bar on a terminal and one line per chunk
+anywhere else, so a redirected stderr stays readable. It fills by chunks of work,
+not bytes, because that is what the library reports — see `Progress` in
 [architecture.md](architecture.md) for why there is no byte counter.
+
+**A spinner** covers the slow commands that produce nothing until they finish:
+`bmd list` (up to seven bucket listings), `bmd verify` (re-hashes every archive),
+`bmd cache`, `bmd prune` and `bmd evict` (each walks the whole cache), and the
+planning phase of a download. It is a spinner rather than a bar because none of
+those reports a total in advance; `verify` and `prune` show a running count
+beside it. It draws only on a terminal and erases itself, so a piped or
+redirected run is exactly what it was without it. `-quiet` removes it along with
+the summary on the commands that have that flag, and `-verbose` removes it on
+every command, because that flag routes the pipeline's log to stderr and the
+spinner must not draw over it. See "Terminal feedback" in
+[architecture.md](architecture.md).
 
 **Exit status**
 
