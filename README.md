@@ -84,8 +84,8 @@ Two variants for bigger jobs:
 
 **Ranges are inclusive at both ends.** A candle comes back when
 `Start <= OpenTime <= End`. So a full year of 2024 is `Start` 2024-01-01 and
-`End` 2024-12-31T23:59:59.999999999Z. Read `End` as *the open time of the last
-candle you want* — writing `End` 2025-01-01 is legal, but it asks for the candle
+`End` 2024-12-31T23:59:59.999999999Z. Read `End` as _the open time of the last
+candle you want_ — writing `End` 2025-01-01 is legal, but it asks for the candle
 opening on New Year's Day and costs you January's archive to fetch.
 
 **Batch your symbols, don't batch your processes.** Pass lists —
@@ -118,7 +118,7 @@ the steady state nothing is ever rebuilt. Details in
 [docs/caching.md](docs/caching.md).
 
 **Nothing is evicted automatically.** File timestamps record when data was
-*downloaded*, not when it was *used*, so there's no honest expiry rule to apply.
+_downloaded_, not when it was _used_, so there's no honest expiry rule to apply.
 You decide: `bmd prune` drops archives that reads no longer need (~40% of the
 cache), `bmd evict` removes entries you name.
 
@@ -138,16 +138,16 @@ output checked, so they can't quietly go stale.
 
 Longer form:
 
-| Document | Contents |
-| --- | --- |
-| [docs/architecture.md](docs/architecture.md) | How the pieces fit together, and the staged build plan |
-| [docs/caching.md](docs/caching.md) | The two-tier cache, its invariants, and why it exists |
-| [docs/cli.md](docs/cli.md) | The `bmd` command-line tool |
-| [docs/numbers.md](docs/numbers.md) | Why prices are decimals, and what the alternatives measured |
-| [docs/go-notes.md](docs/go-notes.md) | The Go idioms this codebase leans on, in one place |
+| Document                                     | Contents                                                    |
+| -------------------------------------------- | ----------------------------------------------------------- |
+| [docs/architecture.md](docs/architecture.md) | How the pieces fit together, and the staged build plan      |
+| [docs/caching.md](docs/caching.md)           | The two-tier cache, its invariants, and why it exists       |
+| [docs/cli.md](docs/cli.md)                   | The `bmd` command-line tool                                 |
+| [docs/numbers.md](docs/numbers.md)           | Why prices are decimals, and what the alternatives measured |
+| [docs/go-notes.md](docs/go-notes.md)         | The Go idioms this codebase leans on, in one place          |
 
 The code is commented far more heavily than typical Go. That's deliberate — this
-repository doubles as a way to learn the language, so comments explain *why* a
+repository doubles as a way to learn the language, so comments explain _why_ a
 construct is used, not just what it does.
 
 ## Development
@@ -162,18 +162,18 @@ mise install    # fetch the pinned toolchain
 mise tasks      # list everything below
 ```
 
-| Task | What it does |
-| --- | --- |
-| `mise run build` | Compile the `bmd` CLI into `./bin` |
-| `mise run test` | Run all tests with the race detector |
-| `mise run lint` | Run golangci-lint |
-| `mise run fmt` | Format all Go code in place |
-| `mise run fmt:check` | Fail if anything is unformatted (CI uses this) |
-| `mise run cover` | Test with coverage and open the HTML report |
-| `mise run tidy` | Sync `go.mod` with the imports in the code |
-| `mise run audit` | Check dependencies against the Go vulnerability database |
-| `mise run release:snapshot` | Build the release artefacts locally, publishing nothing |
-| `mise run ci` | Everything CI runs, in order |
+| Task                        | What it does                                             |
+| --------------------------- | -------------------------------------------------------- |
+| `mise run build`            | Compile the `bmd` CLI into `./bin`                       |
+| `mise run test`             | Run all tests with the race detector                     |
+| `mise run lint`             | Run golangci-lint                                        |
+| `mise run fmt`              | Format all Go code in place                              |
+| `mise run fmt:check`        | Fail if anything is unformatted (CI uses this)           |
+| `mise run cover`            | Test with coverage and open the HTML report              |
+| `mise run tidy`             | Sync `go.mod` with the imports in the code               |
+| `mise run audit`            | Check dependencies against the Go vulnerability database |
+| `mise run release:snapshot` | Build the release artefacts locally, publishing nothing  |
+| `mise run ci`               | Everything CI runs, in order                             |
 
 No test in this repository touches Binance. Network paths run against
 `httptest` servers with committed fixtures.
